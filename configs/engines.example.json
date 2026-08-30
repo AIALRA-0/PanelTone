@@ -1,0 +1,10 @@
+{
+  "engines": [
+    {
+      "name": "flux2-klein-service",
+      "kind": "http_image",
+      "base_url": "http://127.0.0.1:8781",
+      "timeout_seconds": 1800
+    }
+  ]
+}

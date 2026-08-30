@@ -1,0 +1,62 @@
+# Python environments and caches
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Frontend dependencies and local browser evidence
+node_modules/
+*.tsbuildinfo
+.generated/
+.playwright-cli/
+output/playwright/
+docs/audits/
+
+# Runtime data, generated books, models, logs, and databases
+jobs/
+output/
+models/
+.test-data/
+.test-models/
+.private/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+configs/engines.json
+configs/settings.json
+*.local.json
+
+# Model weights, adapters, and common caches
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.onnx
+*.bin
+*.lora
+huggingface/
+vendor/
+
+# User archives and exported comic containers
+*.cbz
+*.cbr
+*.rar
+*.7z
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

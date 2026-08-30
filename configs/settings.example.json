@@ -1,0 +1,13 @@
+{
+  "data_root": "jobs",
+  "model_root": "models",
+  "comfyui_url": "http://127.0.0.1:8188",
+  "max_upload_mib": 4096,
+  "qa_line_f1_min": 0.98,
+  "qa_luminance_mae_max": 2.0,
+  "panel_min_area_ratio": 0.02,
+  "panel_padding": 32,
+  "max_archive_members": 5000,
+  "max_archive_ratio": 200,
+  "allowed_roots": []
+}
