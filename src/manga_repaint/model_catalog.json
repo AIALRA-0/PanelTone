@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "flux2-klein-4b",
+      "name": "FLUX.2 Klein 4B",
+      "repository": "black-forest-labs/FLUX.2-klein-4B",
+      "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+      "allow_patterns": [
+        "*.json",
+        "*.safetensors",
+        "*.txt",
+        "*.model"
+      ],
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+      "memory": "建议 16GB 显存并启用 CPU 卸载",
+      "download_size": "确认下载前请在模型页面核对当前文件大小",
+      "storage": "Hugging Face 缓存目录，可在启动脚本中自定义",
+      "purpose": "快速画风编辑和多参考图编辑"
+    },
+    {
+      "id": "semantic-manga-v1",
+      "name": "语义分层接口（未发布权重）",
+      "repository": "未指定（项目预留插槽）",
+      "revision": "unreleased",
+      "allow_patterns": [
+        "*.json",
+        "*.safetensors",
+        "*.onnx",
+        "*.txt"
+      ],
+      "license": "未发布，待候选模型审查",
+      "license_url": "",
+      "memory": "候选模型确定后评估",
+      "download_size": "暂无，未发布权重",
+      "storage": "PanelTone 模型目录",
+      "purpose": "预留皮肤、头发、服装和身体部位分层接口；当前使用基础保护模式",
+      "downloadable": false,
+      "unavailable_reason": "这不是已发布模型，不对应可下载权重；完成来源、固定版本、许可证、哈希和基准审查后才会开放安装"
+    }
+  ]
+}
