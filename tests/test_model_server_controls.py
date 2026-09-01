@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import time
 
-from manga_repaint.model_server import Flux2Runtime
+from manga_repaint import __version__
+from manga_repaint.model_server import Flux2Runtime, app
+
+
+def test_model_service_reports_package_version() -> None:
+    assert app.version == __version__
 
 
 def test_runtime_interrupt_marks_active_request() -> None:

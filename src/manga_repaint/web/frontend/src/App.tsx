@@ -1000,7 +1000,7 @@ function App() {
               <div className="filmstrip-viewport">
                 <div className="filmstrip-pages">
                   {pages.map(page => <button key={page.page_index} className={page.page_index === pageIndex ? 'active' : ''} onClick={() => { manualPageSelectionRef.current.add(selected.id); pageSelectionRef.current.set(selected.id, page.page_index); setPageIndex(page.page_index); if (readyNotice === page.page_index) setReadyNotice(null) }}>
-                    <img src={page.thumbnail_url || page.source_url} alt={`第 ${page.page_index + 1} 页`} /><span>{page.page_index + 1}</span>{page.final_url ? <i><Icon name="check" /></i> : page.preview_url ? <i className="preview-mark" title="已有预览，尚未通过整页检查">◌</i> : null}
+                    <img loading="lazy" decoding="async" src={page.thumbnail_url || page.source_url} alt={`第 ${page.page_index + 1} 页`} /><span>{page.page_index + 1}</span>{page.final_url ? <i><Icon name="check" /></i> : page.preview_url ? <i className="preview-mark" title="已有预览，尚未通过整页检查">◌</i> : null}
                   </button>)}
                 </div>
               </div>

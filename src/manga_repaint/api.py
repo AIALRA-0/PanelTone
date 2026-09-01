@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from . import __version__
 from .catalog import Catalog
 from .config import Settings
 from .engines import EngineRegistry
@@ -628,7 +629,7 @@ def create_app(
         ingest_executor.shutdown(wait=False, cancel_futures=False)
         scheduler.stop()
 
-    app = FastAPI(title="PanelTone", version="0.2.0-alpha.1", lifespan=lifespan)
+    app = FastAPI(title="PanelTone", version=__version__, lifespan=lifespan)
 
     @app.middleware("http")
     async def request_logging(request: Request, call_next):

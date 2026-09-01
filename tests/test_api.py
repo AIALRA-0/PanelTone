@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from manga_repaint import __version__
 from manga_repaint.api import create_app
 from manga_repaint.config import Settings
 from manga_repaint.engines import EngineRegistry
@@ -24,6 +25,12 @@ class OfflineEngine:
 
     def healthcheck(self):
         return {"ok": False, "engine": self.name, "error": "模型服务未连接"}
+
+
+def test_api_reports_package_version(tmp_path: Path) -> None:
+    app = create_app(Settings(data_root=tmp_path / "jobs"), EngineRegistry())
+
+    assert app.version == __version__
 
 
 def wait_operation(client: TestClient, operation_url: str, timeout: int = 200) -> dict:

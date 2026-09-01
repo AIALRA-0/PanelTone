@@ -14,6 +14,8 @@ from fastapi import Depends, FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
+from . import __version__
+
 logger = logging.getLogger("paneltone.model")
 
 
@@ -235,7 +237,7 @@ class Flux2Runtime:
 
 
 runtime = Flux2Runtime()
-app = FastAPI(title="PanelTone Model Service", version="0.2.0-alpha.1")
+app = FastAPI(title="PanelTone Model Service", version=__version__)
 
 
 @asynccontextmanager
