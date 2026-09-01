@@ -21,6 +21,21 @@ def pure_black_ink_mask(image: Image.Image, threshold: int = 8) -> np.ndarray:
     return gray <= threshold
 
 
+def ink_detail_mask(image: Image.Image, threshold: int = 64) -> np.ndarray:
+    """Return dark print detail while leaving gray screentone colorable.
+
+    Manga scans often contain large gray screentone fields. A threshold near
+    white treats those fields as line art and prevents any color from reaching
+    them, while a very low threshold loses antialiased text and fine ink. The
+    middle threshold is intentionally conservative and is used only for strict
+    detail protection; speech bubbles and text regions are protected separately.
+    """
+    if not 0 <= threshold <= 255:
+        raise ValueError("Ink threshold must be between 0 and 255")
+    gray = np.asarray(image.convert("L"))
+    return gray <= threshold
+
+
 def bubble_mask(image: Image.Image) -> np.ndarray:
     gray = np.asarray(image.convert("L"))
     height, width = gray.shape
@@ -132,6 +147,9 @@ def text_region_mask(image: Image.Image) -> np.ndarray:
 def deterministic_protection_mask(image: Image.Image, preserve_text: bool = True) -> np.ndarray:
     mask = border_mask(image)
     if preserve_text:
+        # Protect the full bubble as well as glyphs. This prevents the model
+        # from tinting or redrawing the white field around dialogue text.
+        mask = np.logical_or(mask, bubble_mask(image))
         mask = np.logical_or(mask, text_region_mask(image))
     return mask
 
@@ -147,3 +165,39 @@ def protection_mask(image: Image.Image, mode: ProtectionMode) -> np.ndarray:
 
 def save_mask(mask: np.ndarray, path: str) -> None:
     Image.fromarray(mask.astype(np.uint8) * 255, mode="L").save(path, format="PNG")
+
+
+def apply_mask_corrections(
+    mask: np.ndarray,
+    corrections: list[dict[str, object]],
+    *,
+    offset: tuple[int, int] = (0, 0),
+) -> np.ndarray:
+    """Apply non-destructive page-coordinate brush corrections to a mask.
+
+    A correction uses ``op`` (``protect`` or ``release``), ``x``, ``y`` and
+    ``radius`` in page pixels. Unknown or malformed records are ignored so a
+    partially edited page can still be processed safely.
+    """
+    if not corrections:
+        return mask
+    result = mask.astype(bool, copy=True)
+    height, width = result.shape
+    offset_x, offset_y = offset
+    yy, xx = np.ogrid[:height, :width]
+    for correction in corrections:
+        try:
+            operation = str(correction.get("op", correction.get("action", ""))).casefold()
+            x = float(correction["x"]) - offset_x
+            y = float(correction["y"]) - offset_y
+            radius = max(1.0, min(512.0, float(correction.get("radius", 12))))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if operation not in {"protect", "release", "add", "remove", "lock", "unlock"}:
+            continue
+        brush = (xx - x) ** 2 + (yy - y) ** 2 <= radius**2
+        if operation in {"protect", "add", "lock"}:
+            result[brush] = True
+        else:
+            result[brush] = False
+    return result

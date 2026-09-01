@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -109,6 +110,35 @@ def composite_protected(
     return Image.fromarray(result, mode="RGB")
 
 
+def composite_strict_colorization(
+    source: Image.Image,
+    generated: Image.Image,
+    protected_mask: np.ndarray,
+    chroma_strength: float = 1.0,
+    ink_core_threshold: int = 64,
+) -> Image.Image:
+    """Keep source luminance while retaining generated color outside protected pixels.
+
+    Only high-confidence dark ink cores are copied verbatim. Treating every gray
+    screentone pixel as line art would overwrite nearly the entire colorized page.
+    """
+    if not 0 <= ink_core_threshold <= 255:
+        raise ValueError("Ink core threshold must be between 0 and 255")
+    colorized = preserve_luminance_lab(source, generated, chroma_strength)
+    source_gray = np.asarray(source.convert("L"))
+    strict_mask = np.logical_or(protected_mask, source_gray <= ink_core_threshold)
+    # Scanned manga lines often have antialiased gray pixels above the ink
+    # threshold.  Preserve a narrow edge guard as well, otherwise generated
+    # chroma can bridge a light gray clothing/skin boundary and create a
+    # visible color block on the neighboring region.
+    edge_low = max(8, ink_core_threshold // 2)
+    edge_high = min(255, max(edge_low + 1, ink_core_threshold * 2))
+    edges = cv2.Canny(source_gray, edge_low, edge_high)
+    edge_guard = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    strict_mask = np.logical_or(strict_mask, edge_guard.astype(bool))
+    return composite_protected(source, colorized, strict_mask)
+
+
 def preserve_ink_overlay(
     source: Image.Image,
     generated: Image.Image,
@@ -126,6 +156,8 @@ def preserve_ink_overlay(
     source_gray = np.asarray(source.convert("L"), dtype=np.float32) / 255.0
     ink_factor = np.power(source_gray, gamma)[..., None]
     result = np.clip(generated_rgb * ink_factor, 0, 255).astype(np.uint8)
+    pure_black_ink = np.asarray(source.convert("L")) <= 8
+    result[pure_black_ink] = source_rgb.astype(np.uint8)[pure_black_ink]
     if protected_mask is not None and protected_mask.any():
         result[protected_mask] = source_rgb.astype(np.uint8)[protected_mask]
     return Image.fromarray(result, mode="RGB")

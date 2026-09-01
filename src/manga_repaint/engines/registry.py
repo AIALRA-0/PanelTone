@@ -29,6 +29,14 @@ class EngineRegistry:
     def health(self) -> dict[str, dict[str, Any]]:
         return {name: engine.healthcheck() for name, engine in self._engines.items()}
 
+    def release(self, name: str) -> dict[str, Any]:
+        engine = self.get(name)
+        release = getattr(engine, "release", None)
+        if not callable(release):
+            raise ValueError(f"引擎 {name} 不支持释放模型显存")
+        result = release()
+        return result if isinstance(result, dict) else {"status": "released"}
+
     @classmethod
     def from_json(cls, path: Path, default_comfy_url: str) -> EngineRegistry:
         registry = cls()

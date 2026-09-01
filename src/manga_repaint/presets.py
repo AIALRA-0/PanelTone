@@ -175,7 +175,12 @@ def build_prompt(
     constraints = (
         "Preserve every character identity, face, expression, body pose, hand, object, "
         "camera angle, panel boundary, speech bubble, text location and crop. "
-        "Do not add, remove, rewrite or relocate content."
+        "Do not add, remove, rewrite or relocate content. "
+        "Keep skin, face, eyes, mouth, hands, feet, hair and clothing as separate "
+        "semantic regions. "
+        "Never paint exposed skin with clothing color or merge a garment across a body boundary. "
+        "Reuse the same character and object colors across panels and pages. "
+        "Keep speech bubbles, lettering, sound effects, ink lines and frame borders unchanged."
     )
     parts = [operation, constraints, color.prompt, style.prompt]
     if user_prompt.strip():

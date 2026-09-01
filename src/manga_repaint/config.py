@@ -19,6 +19,11 @@ class Settings:
     panel_padding: int = 32
     max_archive_members: int = 5000
     max_archive_ratio: int = 200
+    max_archive_uncompressed_mib: int = 16384
+    async_ingest_threshold_mib: int = 32
+    recovery_stale_seconds: int = 120
+    telemetry_gpu_interval_seconds: float = 1.0
+    telemetry_idle_interval_seconds: float = 5.0
     allowed_roots: list[Path] = field(default_factory=list)
 
     @classmethod
@@ -75,6 +80,21 @@ class Settings:
             ),
             max_archive_members=int(os.getenv("PANELTONE_MAX_ARCHIVE_MEMBERS", "5000")),
             max_archive_ratio=int(os.getenv("PANELTONE_MAX_ARCHIVE_RATIO", "200")),
+            max_archive_uncompressed_mib=int(
+                os.getenv("PANELTONE_MAX_ARCHIVE_UNCOMPRESSED_MIB", "16384")
+            ),
+            async_ingest_threshold_mib=int(
+                os.getenv("PANELTONE_ASYNC_INGEST_THRESHOLD_MIB", "32")
+            ),
+            recovery_stale_seconds=int(
+                os.getenv("PANELTONE_RECOVERY_STALE_SECONDS", "120")
+            ),
+            telemetry_gpu_interval_seconds=float(
+                os.getenv("PANELTONE_TELEMETRY_GPU_INTERVAL_SECONDS", "1")
+            ),
+            telemetry_idle_interval_seconds=float(
+                os.getenv("PANELTONE_TELEMETRY_IDLE_INTERVAL_SECONDS", "5")
+            ),
             allowed_roots=roots,
         )
 

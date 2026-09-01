@@ -26,9 +26,15 @@ class EngineResult:
     engine_metadata: dict[str, Any] = field(default_factory=dict)
 
 
+class EngineInterrupted(RuntimeError):
+    """Signal that a model request stopped because the user paused or cancelled it."""
+
+
 class Engine(Protocol):
     name: str
 
     def generate(self, request: EngineRequest) -> EngineResult: ...
 
     def healthcheck(self) -> dict[str, Any]: ...
+
+    def interrupt(self) -> dict[str, Any]: ...

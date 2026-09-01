@@ -1,11 +1,11 @@
 <div align="center">
   <h1 align="center">PanelTone</h1>
   <p>A local workbench for manga colorization and style redraw</p>
-  <p><strong>0.2.0-alpha.1</strong> · Windows 11 first · Local processing · Chinese-first project</p>
+  <p><strong>0.2.0-alpha.2</strong> · Windows 11 first · Local processing · Chinese-first project</p>
   <p><a href="README.md">简体中文</a> · <a href="SECURITY.md">Security</a> · <a href="CONTRIBUTING.md">Contributing</a></p>
 </div>
 
-> PanelTone is a public alpha release. Task management, batch input, page-ready output, and deterministic detail protection are available, while generation quality still depends on the local model, source pages, and settings
+> PanelTone is a local-first public alpha. Task management, batch input, page-ready output, and deterministic detail protection are available, while generation quality still depends on the local model, source pages, and settings. It is not a mature or production-stable release
 
 <div align="center">
   <img src="docs/assets/workbench-desktop.png" width="100%" alt="PanelTone desktop workbench with a synthetic manga task list, source-result comparison, page thumbnails, option explanations, and live progress" />
@@ -121,6 +121,10 @@ The only default external network action is a user-confirmed model download. The
 
 Local-path import can read files available to the current account. Set `PANELTONE_ALLOWED_ROOTS` to restrict access. On Windows, separate roots with semicolons
 
+Remote ingress is not a default deployment feature. If you operate a private gateway, keep PanelTone bound to the local loopback interface and place HTTPS plus single sign-on at that gateway. A reverse SSH forward can use the parameterized form `127.0.0.1:${GATEWAY_PORT} → 127.0.0.1:${PANELTONE_PORT}`. Keep gateway hosts, users, keys, domains, and business paths in private configuration outside this repository
+
+The repository includes `scripts/maintain_reverse_tunnel.ps1` and `scripts/install_reverse_tunnel_task.ps1` as parameterized operations templates. They provide forward-failure exit, 30-second keepalives, reconnects, local log rotation, and a logon-triggered task running as the current limited Windows user
+
 Permanent deletion is available only from trash and requires typing the confirmation phrase. It removes the task database, pages, and outputs and cannot be undone
 
 ## 8. Verification
@@ -129,7 +133,7 @@ The release candidate uses these checks on Windows:
 
 ```powershell
 # Check Python formatting and common defects
-.\.venv\Scripts\python -m ruff check src tests
+.\.venv\Scripts\python -m ruff check .
 
 # Run import, archive safety, queue, recovery, protection, API, and 300-page stress tests
 .\.venv\Scripts\python -m pytest -q
@@ -139,7 +143,7 @@ Set-Location src\manga_repaint\web\frontend
 npm run build
 ```
 
-Automated coverage includes count, order, and duplicate checks for a 300-page synthetic book. Browser acceptance covers `1440×900`, `1280×900`, and `390×844`, with no page-level horizontal overflow observed
+Automated coverage includes count, order, and duplicate checks for a 300-page synthetic book. Browser acceptance covers `1526×986`, `1440×900`, `1280×900`, `1024×768`, and `390×844` to check desktop, narrow, and mobile layouts for page-level horizontal overflow
 
 <div align="center">
   <img src="docs/assets/workbench-mobile.png" width="300" alt="PanelTone mobile preview showing a synthetic source-result comparison and page thumbnails" />

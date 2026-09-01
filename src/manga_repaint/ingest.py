@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 from PIL import Image
@@ -12,6 +13,7 @@ from PIL import Image
 from .hashing import sha256_file
 
 SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
+ProgressCallback = Callable[[str, int, int, str], None]
 
 
 def _natural_key(path: Path) -> list[str | int]:
@@ -33,18 +35,27 @@ def _copy_normalized(source: Path, destination: Path) -> None:
         image.convert("RGB").save(destination, format="PNG", compress_level=6)
 
 
-def _ingest_directory(source: Path, pages_dir: Path) -> list[Path]:
+def _ingest_directory(
+    source: Path,
+    pages_dir: Path,
+    progress: ProgressCallback | None = None,
+    max_members: int = 5000,
+) -> list[Path]:
     images = sorted(
         (path for path in source.rglob("*") if path.suffix.casefold() in SUPPORTED_IMAGES),
         key=_natural_key,
     )
     if not images:
         raise ValueError(f"No supported images found in {source}")
+    if len(images) > max_members:
+        raise ValueError(f"Directory has more than {max_members} images")
     outputs: list[Path] = []
     for index, image_path in enumerate(images):
         output = pages_dir / f"page_{index:05d}.png"
         _copy_normalized(image_path, output)
         outputs.append(output)
+        if progress:
+            progress("copying", index + 1, len(images), image_path.name)
     return outputs
 
 
@@ -53,6 +64,8 @@ def _ingest_cbz(
     pages_dir: Path,
     max_members: int = 5000,
     max_ratio: int = 200,
+    progress: ProgressCallback | None = None,
+    max_uncompressed_bytes: int | None = None,
 ) -> list[Path]:
     with tempfile.TemporaryDirectory(prefix="manga-repaint-cbz-") as temp_name:
         temp_root = Path(temp_name)
@@ -60,6 +73,9 @@ def _ingest_cbz(
             all_members = [item for item in archive.infolist() if not item.is_dir()]
             if len(all_members) > max_members:
                 raise ValueError(f"Archive has more than {max_members} files")
+            total_uncompressed = sum(max(0, item.file_size) for item in all_members)
+            if max_uncompressed_bytes is not None and total_uncompressed > max_uncompressed_bytes:
+                raise ValueError("Archive expands beyond the configured size limit")
             nested = {".zip", ".cbz", ".rar", ".cbr", ".7z"}
             if any(Path(item.filename).suffix.casefold() in nested for item in all_members):
                 raise ValueError("Nested archives are not supported")
@@ -77,16 +93,24 @@ def _ingest_cbz(
             if not members:
                 raise ValueError(f"No supported images found in {source}")
             extracted: list[Path] = []
-            for member in members:
+            for index, member in enumerate(members):
                 target = _safe_member_path(temp_root, member.filename)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with archive.open(member) as src, target.open("wb") as dst:
                     shutil.copyfileobj(src, dst)
                 extracted.append(target)
-        return _ingest_file_list(sorted(extracted, key=_natural_key), pages_dir)
+                if progress:
+                    progress("extracting", index + 1, len(members), member.filename)
+        return _ingest_file_list(sorted(extracted, key=_natural_key), pages_dir, progress)
 
 
-def _ingest_cbr(source: Path, pages_dir: Path, max_members: int = 5000) -> list[Path]:
+def _ingest_cbr(
+    source: Path,
+    pages_dir: Path,
+    max_members: int = 5000,
+    progress: ProgressCallback | None = None,
+    max_uncompressed_bytes: int | None = None,
+) -> list[Path]:
     known_windows_path = Path("C:/Program Files/7-Zip/7z.exe")
     seven_zip = (
         shutil.which("7z")
@@ -117,10 +141,22 @@ def _ingest_cbr(source: Path, pages_dir: Path, max_members: int = 5000) -> list[
         )
         if len(images) > max_members:
             raise ValueError(f"Archive has more than {max_members} images")
-        return _ingest_file_list(images, pages_dir)
+        if max_uncompressed_bytes is not None:
+            total_uncompressed = sum(
+                path.stat().st_size for path in temp_root.rglob("*") if path.is_file()
+            )
+            if total_uncompressed > max_uncompressed_bytes:
+                raise ValueError("Archive expands beyond the configured size limit")
+        return _ingest_file_list(images, pages_dir, progress)
 
 
-def _ingest_pdf(source: Path, pages_dir: Path, render_dpi: int = 300) -> list[Path]:
+def _ingest_pdf(
+    source: Path,
+    pages_dir: Path,
+    render_dpi: int = 300,
+    progress: ProgressCallback | None = None,
+    max_pages: int = 5000,
+) -> list[Path]:
     try:
         import fitz
     except ImportError as exc:
@@ -130,6 +166,8 @@ def _ingest_pdf(source: Path, pages_dir: Path, render_dpi: int = 300) -> list[Pa
     with fitz.open(source) as document:
         if document.page_count == 0:
             raise ValueError(f"PDF has no pages: {source}")
+        if document.page_count > max_pages:
+            raise ValueError(f"PDF has more than {max_pages} pages")
         for index, page in enumerate(document):
             output = pages_dir / f"page_{index:05d}.png"
             images = page.get_images(full=True)
@@ -153,10 +191,14 @@ def _ingest_pdf(source: Path, pages_dir: Path, render_dpi: int = 300) -> list[Pa
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
                 pixmap.save(str(output))
             outputs.append(output)
+            if progress:
+                progress("rendering", index + 1, document.page_count, f"PDF 第 {index + 1} 页")
     return outputs
 
 
-def _ingest_file_list(images: list[Path], pages_dir: Path) -> list[Path]:
+def _ingest_file_list(
+    images: list[Path], pages_dir: Path, progress: ProgressCallback | None = None
+) -> list[Path]:
     if not images:
         raise ValueError("Archive contains no supported images")
     outputs: list[Path] = []
@@ -164,6 +206,8 @@ def _ingest_file_list(images: list[Path], pages_dir: Path) -> list[Path]:
         output = pages_dir / f"page_{index:05d}.png"
         _copy_normalized(image_path, output)
         outputs.append(output)
+        if progress:
+            progress("normalizing", index + 1, len(images), image_path.name)
     return outputs
 
 
@@ -172,20 +216,40 @@ def ingest_book(
     pages_dir: Path,
     max_archive_members: int = 5000,
     max_archive_ratio: int = 200,
+    progress: ProgressCallback | None = None,
+    max_archive_uncompressed_bytes: int | None = None,
 ) -> list[Path]:
     source = source.resolve(strict=True)
     pages_dir.mkdir(parents=True, exist_ok=True)
     if source.is_dir():
-        return _ingest_directory(source, pages_dir)
+        return _ingest_directory(source, pages_dir, progress, max_archive_members)
     suffix = source.suffix.casefold()
     if suffix == ".cbz" or suffix == ".zip":
-        return _ingest_cbz(source, pages_dir, max_archive_members, max_archive_ratio)
+        return _ingest_cbz(
+            source,
+            pages_dir,
+            max_archive_members,
+            max_archive_ratio,
+            progress,
+            max_archive_uncompressed_bytes,
+        )
     if suffix == ".cbr" or suffix == ".rar":
-        return _ingest_cbr(source, pages_dir, max_archive_members)
+        return _ingest_cbr(
+            source,
+            pages_dir,
+            max_archive_members,
+            progress,
+            max_archive_uncompressed_bytes,
+        )
     if suffix == ".pdf":
-        return _ingest_pdf(source, pages_dir)
+        return _ingest_pdf(
+            source,
+            pages_dir,
+            progress=progress,
+            max_pages=max_archive_members,
+        )
     if suffix in SUPPORTED_IMAGES:
-        return _ingest_file_list([source], pages_dir)
+        return _ingest_file_list([source], pages_dir, progress)
     raise ValueError(f"Unsupported source type: {source.suffix}")
 
 

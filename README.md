@@ -1,11 +1,11 @@
 <div align="center">
   <h1 align="center">PanelTone</h1>
   <p>本地漫画上色与画风重绘工作台</p>
-  <p><strong>0.2.0-alpha.1</strong> · Windows 11 优先 · 本机处理 · 中文优先</p>
+  <p><strong>0.2.0-alpha.2</strong> · Windows 11 优先 · 本机处理 · 中文优先</p>
   <p><a href="README.en.md">English</a> · <a href="SECURITY.md">安全报告</a> · <a href="CONTRIBUTING.md">参与贡献</a></p>
 </div>
 
-> PanelTone 当前是公开 alpha 版本，任务管理、批量输入、逐页输出和确定性细节保护已经可用；生成质量仍取决于本地模型、输入页面与参数，不应当视为成熟生产软件
+> PanelTone 当前是本地优先的公开 alpha 版本，任务管理、批量输入、逐页输出和确定性细节保护已经可用；生成质量仍取决于本地模型、输入页面与参数，不应当视为成熟或生产稳定软件
 
 <div align="center">
   <img src="docs/assets/workbench-desktop.png" width="100%" alt="PanelTone 桌面工作台使用合成漫画展示任务列表、原图结果对比、逐页缩略图、设置说明与实时进度" />
@@ -125,6 +125,10 @@ PanelTone 默认只绑定 `127.0.0.1`，任务、页面、SQLite 数据库、日
 
 本地路径导入能够读取当前账户有权访问的文件；需要限制范围时设置 `PANELTONE_ALLOWED_ROOTS`，多个目录在 Windows 上使用分号分隔
 
+远程入口不是默认部署能力。需要自行提供私有入口时，应让 PanelTone 继续只监听本机回环地址，并在受控网关上叠加 HTTPS 与单点登录。反向 SSH 端口转发可以使用参数化形式 `127.0.0.1:${GATEWAY_PORT} → 127.0.0.1:${PANELTONE_PORT}`；网关主机、用户、密钥、域名与业务路径必须保存在仓库外的私有配置中
+
+仓库提供 `scripts/maintain_reverse_tunnel.ps1` 与 `scripts/install_reverse_tunnel_task.ps1` 作为参数化运维模板；前者启用转发失败退出、30 秒保活、自动重连和本地日志轮转，后者以当前低权限 Windows 用户注册登录时启动的计划任务
+
 永久删除只允许从回收站执行，并要求输入“永久删除”；删除会移除任务数据库、页面和输出，无法恢复
 
 ## 8. 验证状态
@@ -133,7 +137,7 @@ PanelTone 默认只绑定 `127.0.0.1`，任务、页面、SQLite 数据库、日
 
 ```powershell
 # 检查 Python 代码格式与常见错误
-.\.venv\Scripts\python -m ruff check src tests
+.\.venv\Scripts\python -m ruff check .
 
 # 运行批量导入、压缩包安全、队列、恢复、保护、API 和 300 页压力测试
 .\.venv\Scripts\python -m pytest -q
@@ -143,7 +147,7 @@ Set-Location src\manga_repaint\web\frontend
 npm run build
 ```
 
-自动测试覆盖 `300` 页合成漫画的页数、顺序和重复项；浏览器验收覆盖 `1440×900`、`1280×900` 与 `390×844`，已确认桌面和移动端没有页面级横向溢出
+自动测试覆盖 `300` 页合成漫画的页数、顺序和重复项；浏览器验收覆盖 `1526×986`、`1440×900`、`1280×900`、`1024×768` 与 `390×844`，用于确认桌面、窄屏与移动端没有页面级横向溢出
 
 <div align="center">
   <img src="docs/assets/workbench-mobile.png" width="300" alt="PanelTone 移动端预览使用合成漫画展示原图结果对比与逐页缩略图" />

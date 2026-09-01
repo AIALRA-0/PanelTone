@@ -5,6 +5,7 @@ from PIL import Image
 
 from manga_repaint.color import (
     composite_protected,
+    composite_strict_colorization,
     lab_l,
     preserve_ink_overlay,
     preserve_luminance_lab,
@@ -39,3 +40,53 @@ def test_ink_overlay_preserves_black_without_white_halo() -> None:
     result = np.asarray(preserve_ink_overlay(source, generated))
     assert np.all(result[11:13, 4:20] == 0)
     assert np.all(result[0, 0] == np.array([220, 120, 70]))
+
+
+def test_ink_overlay_preserves_near_black_print_pixels_exactly() -> None:
+    source = Image.new("RGB", (12, 12), (255, 255, 255))
+    pixels = np.asarray(source).copy()
+    pixels[4:8, 4:8] = np.array([7, 7, 7])
+    source = Image.fromarray(pixels, mode="RGB")
+    generated = Image.new("RGB", source.size, (240, 160, 90))
+
+    result = np.asarray(preserve_ink_overlay(source, generated))
+
+    assert np.array_equal(result[4:8, 4:8], pixels[4:8, 4:8])
+
+
+def test_strict_colorization_does_not_replace_screentones_with_grayscale() -> None:
+    source_pixels = np.full((24, 24, 3), 180, dtype=np.uint8)
+    source_pixels[2:5, 2:22] = 0
+    source = Image.fromarray(source_pixels, mode="RGB")
+    generated = Image.new("RGB", source.size, (220, 80, 40))
+    protected = np.zeros((24, 24), dtype=bool)
+    protected[16:20, 4:20] = True
+
+    result = np.asarray(
+        composite_strict_colorization(source, generated, protected, chroma_strength=1.0)
+    )
+
+    assert np.array_equal(result[2:5, 2:22], source_pixels[2:5, 2:22])
+    assert np.array_equal(result[16:20, 4:20], source_pixels[16:20, 4:20])
+    assert not np.array_equal(result[10, 10], source_pixels[10, 10])
+    assert int(result[10, 10].max()) - int(result[10, 10].min()) > 20
+
+
+def test_strict_colorization_preserves_antialiased_boundary_edges() -> None:
+    source_pixels = np.full((32, 32, 3), 255, dtype=np.uint8)
+    source_pixels[:, 15:17] = 132
+    source_pixels[:, 16] = 82
+    source = Image.fromarray(source_pixels, mode="RGB")
+    generated = Image.new("RGB", source.size, (220, 80, 40))
+
+    result = np.asarray(
+        composite_strict_colorization(
+            source,
+            generated,
+            np.zeros((32, 32), dtype=bool),
+            chroma_strength=1.0,
+            ink_core_threshold=64,
+        )
+    )
+
+    assert np.array_equal(result[:, 15:17], source_pixels[:, 15:17])

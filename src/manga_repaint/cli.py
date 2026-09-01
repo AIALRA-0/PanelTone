@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .api import create_app
@@ -19,6 +21,30 @@ def _manager(args: argparse.Namespace) -> ProjectManager:
 
 def _print(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+def _configure_logging(settings: Settings) -> None:
+    """Persist local worker logs next to the user's data without exposing book paths in the UI."""
+    logger = logging.getLogger("paneltone")
+    logger.setLevel(logging.INFO)
+    log_dir = settings.data_root.parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "paneltone.log"
+    if not any(
+        isinstance(handler, RotatingFileHandler)
+        and Path(getattr(handler, "baseFilename", "")).resolve() == log_path.resolve()
+        for handler in logger.handlers
+    ):
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+        logger.addHandler(handler)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,6 +98,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # The web server creates its own application manager.  Do not construct a
+    # throw-away manager first: its startup recovery pass could observe a live
+    # job and mark it paused before the actual server is ready.
+    if args.command == "serve":
+        import uvicorn
+
+        settings = Settings.from_json(Path(args.settings)) if args.settings else Settings.from_env()
+        registry = EngineRegistry.from_json(Path(args.engines), settings.comfyui_url)
+        _configure_logging(settings)
+        uvicorn.run(
+            create_app(settings, registry),
+            host=args.host,
+            port=args.port,
+        )
+        return 0
+
     manager = _manager(args)
     if args.command == "create":
         spec = JobSpec(
@@ -111,11 +154,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "health":
         _print(manager.registry.health())
-        return 0
-    if args.command == "serve":
-        import uvicorn
-
-        uvicorn.run(create_app(manager.settings, manager.registry), host=args.host, port=args.port)
         return 0
     parser.error("Unknown command")
     return 2

@@ -11,7 +11,9 @@ def test_event_stream_starts_with_snapshot_then_new_events(tmp_path) -> None:
     catalog.add_event("old", {"value": 1})
     hub = EventHub(catalog, lambda: [{"id": "job"}])
     stream = hub.stream()
-    assert "event: snapshot" in next(stream)
+    snapshot = next(stream)
+    assert "event: snapshot" in snapshot
+    assert "id: 1" in snapshot
     hub.publish("job_progress", {"percent": 50}, "job")
     message = next(stream)
     assert "event: job_progress" in message
@@ -47,3 +49,4 @@ def test_job_queue_preserves_reordered_pending_jobs() -> None:
 
     assert processed == ["first", "third", "second"]
     assert all(kind == "job_queued" for kind, _payload, _job_id in events)
+    queue.stop()

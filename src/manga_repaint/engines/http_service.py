@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 from PIL import Image
 
-from .base import EngineRequest, EngineResult
+from .base import EngineInterrupted, EngineRequest, EngineResult
 
 
 class HTTPImageEngine:
@@ -49,6 +49,12 @@ class HTTPImageEngine:
                 headers=self._headers(),
             ) as client:
                 response = client.post("/generate", data=payload, files=files)
+                if response.status_code in {409, 499}:
+                    try:
+                        detail = response.json().get("detail", "模型请求已中断")
+                    except ValueError:
+                        detail = "模型请求已中断"
+                    raise EngineInterrupted(str(detail))
                 response.raise_for_status()
                 request.output_path.parent.mkdir(parents=True, exist_ok=True)
                 request.output_path.write_bytes(response.content)
@@ -66,11 +72,32 @@ class HTTPImageEngine:
             },
         )
 
+    def interrupt(self) -> dict[str, Any]:
+        """Ask the local model service to stop its current request."""
+        with httpx.Client(base_url=self.base_url, timeout=5, headers=self._headers()) as client:
+            response = client.post("/interrupt")
+            response.raise_for_status()
+            payload = response.json()
+        return payload if isinstance(payload, dict) else {"status": "interrupt_requested"}
+
+    def release(self) -> dict[str, Any]:
+        """Release an idle model pipeline and return the service state."""
+        with httpx.Client(base_url=self.base_url, timeout=10, headers=self._headers()) as client:
+            response = client.post("/release")
+            response.raise_for_status()
+            payload = response.json()
+        return payload if isinstance(payload, dict) else {"status": "release_requested"}
+
     def healthcheck(self) -> dict[str, Any]:
         try:
             with httpx.Client(base_url=self.base_url, timeout=5, headers=self._headers()) as client:
                 response = client.get("/health")
                 response.raise_for_status()
-                return {"ok": True, "engine": self.name, **response.json()}
+                payload = response.json()
+                state = str(payload.get("state", ""))
+                result: dict[str, Any] = {"ok": state != "failed", "engine": self.name, **payload}
+                if state == "failed":
+                    result["error"] = payload.get("last_error") or "模型服务加载失败"
+                return result
         except Exception as exc:
             return {"ok": False, "engine": self.name, "error": str(exc)}

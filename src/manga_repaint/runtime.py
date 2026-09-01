@@ -9,9 +9,15 @@ from .catalog import Catalog
 
 
 class EventHub:
-    def __init__(self, catalog: Catalog, snapshot: Callable[[], Any]):
+    def __init__(
+        self,
+        catalog: Catalog,
+        snapshot: Callable[[], Any],
+        sanitize: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ):
         self.catalog = catalog
         self.snapshot = snapshot
+        self.sanitize = sanitize or (lambda payload: payload)
         self._condition = threading.Condition()
 
     def publish(self, kind: str, payload: dict[str, Any], job_id: str | None = None) -> int:
@@ -24,14 +30,20 @@ class EventHub:
         if last_event_id <= 0:
             last_event_id = self.catalog.latest_event_id()
         snapshot = {"jobs": self.snapshot()}
-        yield f"event: snapshot\ndata: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+        # Give the initial snapshot a cursor as well.  EventSource then sends
+        # Last-Event-ID on a reconnect even when no domain event arrived
+        # before the first network interruption.
+        yield (
+            f"id: {last_event_id}\nevent: snapshot\n"
+            f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+        )
         cursor = last_event_id
         while True:
             events = self.catalog.events_after(cursor)
             if events:
                 for item in events:
                     cursor = int(item["id"])
-                    data = dict(item["payload"])
+                    data = self.sanitize(dict(item["payload"]))
                     if item["job_id"]:
                         data.setdefault("job_id", item["job_id"])
                     yield (
@@ -58,6 +70,14 @@ class JobQueue:
         self._stop = threading.Event()
         self._worker = threading.Thread(target=self._run, name="paneltone-gpu-worker", daemon=True)
         self._worker.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Stop the queue worker during local app shutdown."""
+        self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+        if self._worker.is_alive():
+            self._worker.join(timeout=max(0.0, timeout))
 
     def enqueue(self, job_id: str) -> int:
         with self._pending_lock:

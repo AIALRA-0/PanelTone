@@ -1,7 +1,8 @@
 param(
     [string]$EnvironmentPath = ".venv-flux",
     [int]$Port = 8781,
-    [string]$ModelCachePath = ""
+    [string]$ModelCachePath = "",
+    [double]$IdleReleaseSeconds = 60
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,7 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
 # Keep the model service local and allow one long-lived process to reuse the loaded model
 $env:PANELTONE_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
 $env:PANELTONE_MODEL_CPU_OFFLOAD = "1"
+$env:PANELTONE_MODEL_IDLE_RELEASE_SECONDS = [string]$IdleReleaseSeconds
 # Keep the previous names for the alpha compatibility window
 $env:MANGA_REPAINT_MODEL_ID = $env:PANELTONE_MODEL_ID
 $env:MANGA_REPAINT_MODEL_CPU_OFFLOAD = $env:PANELTONE_MODEL_CPU_OFFLOAD

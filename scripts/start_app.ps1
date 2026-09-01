@@ -14,9 +14,15 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Application environment is missing; install the project before starting"
 }
 
-# Use the application data directory unless the user selected another model directory
+# Leave Hugging Face's default cache unchanged unless the user selected another directory
+# This lets an existing verified download be reused instead of silently starting from an empty cache
 if (-not $ModelCachePath) {
-    $ModelCachePath = Join-Path $env:LOCALAPPDATA "PanelTone\models"
+    $defaultModelCache = Join-Path $env:USERPROFILE ".cache\huggingface\hub\models--black-forest-labs--FLUX.2-klein-4B"
+    $appModelCache = Join-Path $env:LOCALAPPDATA "PanelTone\models"
+    $appModelHub = Join-Path $appModelCache "hub\models--black-forest-labs--FLUX.2-klein-4B"
+    if (-not (Test-Path -LiteralPath $defaultModelCache) -and (Test-Path -LiteralPath $appModelHub)) {
+        $ModelCachePath = $appModelCache
+    }
 }
 
 # Start the optional local model helper when its isolated environment is installed

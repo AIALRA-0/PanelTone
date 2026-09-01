@@ -31,12 +31,35 @@ def face(
     hair: str = "short",
 ) -> None:
     x, y = center
-    draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill="white", outline="#111111", width=6)
+    draw.ellipse(
+        (x - radius, y - radius, x + radius, y + radius),
+        fill="white",
+        outline="#111111",
+        width=6,
+    )
     if hair == "long":
-        draw.arc((x - radius - 10, y - radius - 18, x + radius + 10, y + radius + 35), 170, 370, fill="#111111", width=24)
-        draw.arc((x - radius, y - radius - 10, x + radius, y + radius), 190, 350, fill="#111111", width=18)
+        draw.arc(
+            (x - radius - 10, y - radius - 18, x + radius + 10, y + radius + 35),
+            170,
+            370,
+            fill="#111111",
+            width=24,
+        )
+        draw.arc(
+            (x - radius, y - radius - 10, x + radius, y + radius),
+            190,
+            350,
+            fill="#111111",
+            width=18,
+        )
     else:
-        draw.arc((x - radius, y - radius - 12, x + radius, y + radius), 195, 345, fill="#111111", width=22)
+        draw.arc(
+            (x - radius, y - radius - 12, x + radius, y + radius),
+            195,
+            345,
+            fill="#111111",
+            width=22,
+        )
     draw.ellipse((x - radius // 3 - 5, y - 6, x - radius // 3 + 5, y + 5), fill="#111111")
     draw.ellipse((x + radius // 3 - 5, y - 6, x + radius // 3 + 5, y + 5), fill="#111111")
     draw.arc((x - 25, y + 12, x + 25, y + 42), 10, 170, fill="#111111", width=4)
@@ -54,7 +77,12 @@ def create_page(index: int, target: Path) -> None:
     image = Image.new("RGB", (900, 1200), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((18, 18, 882, 1182), outline="#111111", width=8)
-    draw.text((48, 40), f"PANELTONE  /  SYNTHETIC PAGE {index + 1:02d}", fill="#111111", font=font(24, True))
+    draw.text(
+        (48, 40),
+        f"PANELTONE  /  SYNTHETIC PAGE {index + 1:02d}",
+        fill="#111111",
+        font=font(24, True),
+    )
 
     panel(draw, (45, 90, 855, 490))
     halftone(draw, (52, 97, 848, 483), 16)
@@ -90,7 +118,13 @@ def create_page(index: int, target: Path) -> None:
         draw.line((start, end), fill="#111111", width=3)
 
     panel(draw, (45, 920, 855, 1145))
-    draw.rounded_rectangle((90, 950, 410, 1080), radius=55, fill="white", outline="#111111", width=6)
+    draw.rounded_rectangle(
+        (90, 950, 410, 1080),
+        radius=55,
+        fill="white",
+        outline="#111111",
+        width=6,
+    )
     draw.polygon(((375, 1065), (435, 1110), (405, 1048)), fill="white", outline="#111111")
     draw.text((135, 980), "INK AND TEXT", fill="#111111", font=font(28, True))
     draw.text((145, 1020), "remain unchanged", fill="#111111", font=font(22))
