@@ -151,6 +151,36 @@ def test_display_asset_backfill_is_bounded_and_idempotent(
     assert manager.prebuild_display_assets_for_job(job_id) == 0
 
 
+def test_geometry_locked_project_aligns_model_canvas_without_importing_edges(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    source = Image.new("RGB", (722, 1024), (230, 230, 230))
+    generated = Image.new("RGB", (720, 1536), (220, 90, 60))
+    spec = JobSpec(
+        source=tmp_path / "source.png",
+        workspace=settings.data_root,
+        engine="palette",
+    )
+
+    final, _qa_mask = manager._compose_unit(
+        source,
+        generated,
+        np.zeros((1024, 722), dtype=bool),
+        spec,
+    )
+
+    assert final.size == source.size
+    # Geometry-locked colourization keeps the source value channel as the
+    # upper RGB bound; RGB luminance itself changes when hue/saturation is
+    # introduced.
+    assert np.array_equal(
+        np.max(np.asarray(final), axis=2),
+        np.max(np.asarray(source), axis=2),
+    )
+
+
 def test_page_ready_event_precedes_completed(tmp_path: Path, manga_pages: Path) -> None:
     events: list[tuple[str, dict[str, object]]] = []
     manager = ProjectManager(

@@ -783,7 +783,7 @@ class ProjectManager:
         normal GPU run, including balanced and generative detail modes.
         """
         source_rgb = source.convert("RGB")
-        generated_rgb = self._render_generated(generated, spec)
+        generated_rgb = self._render_color_candidate(source, generated, spec)
         effective_chroma = spec.chroma_strength * float(
             render_profile(spec.color_preset, spec.style_preset)["chroma_multiplier"]
         )
@@ -834,6 +834,32 @@ class ProjectManager:
             contrast=float(profile["contrast"]),
             hue_shift=float(profile["hue_shift"]),
         )
+
+    @staticmethod
+    def _render_color_candidate(
+        source: Image.Image, generated: Image.Image, spec: JobSpec
+    ) -> Image.Image:
+        """Align a model colour candidate to the source canvas without cropping.
+
+        FLUX rounds each request to a model-friendly multiple and caps the
+        longest side.  Legacy results therefore may be 720x1024 for a
+        722x1024 panel or 1440x1536 for a 1444x2048 page.  That difference is
+        safe only because geometry-locked composition consumes generated H/S
+        channels exclusively; the source remains the sole geometry and value
+        canvas.  Explicitly resize here so the strict compositor never has to
+        guess, crop, or import model edges.
+        """
+        rendered = ProjectManager._render_generated(generated, spec)
+        if rendered.size == source.size:
+            return rendered
+        logger.info(
+            "resizing model colour candidate from %sx%s to source canvas %sx%s",
+            rendered.width,
+            rendered.height,
+            source.width,
+            source.height,
+        )
+        return rendered.resize(source.size, Image.Resampling.LANCZOS)
 
     def queue(self, job_id: str) -> None:
         # Starting or resuming a job explicitly clears controls left by a
@@ -1233,7 +1259,9 @@ class ProjectManager:
                                 source_rgb
                                 if spec.mode == JobMode.COLORIZE
                                 and is_already_colorized(source_rgb)
-                                else self._render_generated(generated_image, spec)
+                                else self._render_color_candidate(
+                                    source_image, generated_image, spec
+                                )
                             )
                             qa = evaluate(
                                 source_rgb,
@@ -1864,7 +1892,9 @@ class ProjectManager:
                                     source_rgb,
                                     final,
                                     qa_mask,
-                                    generated=self._render_generated(generated_image, spec),
+                                    generated=self._render_color_candidate(
+                                        source_image, generated_image, spec
+                                    ),
                                     line_f1_min=(
                                         self.settings.qa_line_f1_min
                                         if spec.mode != JobMode.STYLE_FULL
