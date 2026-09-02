@@ -218,6 +218,23 @@ def test_geometry_locked_colorization_uses_source_value_and_not_generated_edges(
     assert not np.array_equal(result[10, 44], source_pixels[10, 44])
 
 
+def test_geometry_locked_colorization_preserves_value_of_coloured_scan() -> None:
+    source_pixels = np.full((48, 48, 3), (180, 220, 250), dtype=np.uint8)
+    source_pixels[20:24, 8:40] = (20, 40, 60)
+    source = Image.fromarray(source_pixels, mode="RGB")
+    generated = Image.new("RGB", source.size, (210, 90, 70))
+
+    result = np.asarray(
+        composite_geometry_locked_colorization(
+            source, generated, np.zeros((48, 48), dtype=bool)
+        )
+    )
+    source_value = cv2.cvtColor(source_pixels, cv2.COLOR_RGB2HSV)[..., 2]
+    result_value = cv2.cvtColor(result, cv2.COLOR_RGB2HSV)[..., 2]
+
+    assert np.array_equal(result_value, source_value)
+
+
 def test_geometry_locked_colorization_rejects_dimension_mismatch() -> None:
     source = Image.new("RGB", (32, 32), "white")
     generated = Image.new("RGB", (31, 32), "red")

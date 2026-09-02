@@ -369,7 +369,6 @@ def composite_geometry_locked_colorization(
     if protected_mask.shape != (height, width):
         raise ValueError("protection mask shape does not match source image")
 
-    source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
     barrier = geometry_barrier_mask(
         Image.fromarray(source_rgb, mode="RGB"),
         protected_mask,
@@ -460,9 +459,10 @@ def composite_geometry_locked_colorization(
     composed_hsv = np.empty((height, width, 3), dtype=np.uint8)
     composed_hsv[..., 0] = np.mod(filtered_hue, 180.0).astype(np.uint8)
     composed_hsv[..., 1] = np.clip(filtered_saturation, 0, 255).astype(np.uint8)
-    # Source grayscale is the sole value channel.  This deliberately ignores
-    # generated RGB, value, Lab lightness, edges and texture.
-    composed_hsv[..., 2] = source_gray
+    # The source value channel is the sole value channel.  This deliberately
+    # ignores generated RGB, value, Lab lightness, edges and texture while
+    # preserving the original brightness of scans that contain colour accents.
+    composed_hsv[..., 2] = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2HSV)[..., 2]
     result_rgb = cv2.cvtColor(composed_hsv, cv2.COLOR_HSV2RGB)
     result_rgb[barrier] = source_rgb[barrier]
     return Image.fromarray(result_rgb, mode="RGB")
