@@ -298,6 +298,79 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   .dialog > footer { position: sticky; bottom: 0; background: white; }
 }
 
+/* Compact page-state overview: the hit target stays accessible while the
+   visual mark no longer turns a long book into a wall of black circles. */
+.page-status-grid { gap: 2px; align-content: start; }
+.page-status-grid .page-state {
+  display: grid;
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  min-height: 18px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+}
+.page-status-grid .page-state.qa_passed,
+.page-status-grid .page-state.running,
+.page-status-grid .page-state.failed,
+.page-status-grid .page-state.qa_failed,
+.page-status-grid .page-state.pending { border: 0; background: transparent; }
+.page-status-grid .page-state:hover { background: var(--soft); }
+.page-status-grid .page-state.current { box-shadow: 0 0 0 1px var(--ink); }
+.page-status-grid .page-state-mark {
+  width: 6px;
+  height: 6px;
+  flex-basis: 6px;
+  border-width: 1px;
+}
+.page-status-grid .page-state-mark.processing { border-radius: 1px; }
+.page-status-grid .page-state-mark.failed { width: 5px; height: 5px; }
+
+/* Page navigation belongs to the reading surface, not the crowded toolbar. */
+.canvas-page-nav {
+  position: absolute;
+  z-index: 6;
+  top: 50%;
+  display: grid;
+  width: 38px;
+  height: 54px;
+  place-items: center;
+  transform: translateY(-50%);
+  border: 1px solid rgba(255,255,255,.55);
+  border-radius: 8px;
+  background: rgba(17,17,17,.72);
+  color: white;
+  cursor: pointer;
+}
+.canvas-page-nav.previous { left: 12px; }
+.canvas-page-nav.next { right: 12px; }
+.canvas-page-nav:disabled { opacity: .2; cursor: default; }
+.canvas-page-count {
+  position: absolute;
+  z-index: 6;
+  bottom: 12px;
+  left: 50%;
+  min-width: 64px;
+  padding: 5px 9px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: rgba(17,17,17,.72);
+  color: white;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  pointer-events: none;
+}
+
+@media (max-width: 759px) {
+  .canvas-page-nav { width: 34px; height: 46px; }
+  .canvas-page-nav.previous { left: 7px; }
+  .canvas-page-nav.next { right: 7px; }
+}
+
 /* PanelTone workstation refinements */
 :root {
   --space-1: 4px;

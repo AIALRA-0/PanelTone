@@ -92,7 +92,9 @@ type Page = {
   total_units?: number
   error?: string | null
   source_url: string
+  source_display_url?: string | null
   final_url: string | null
+  final_display_url?: string | null
   preview_url?: string | null
   preview_only?: boolean
   thumbnail_url: string | null
@@ -369,10 +371,14 @@ function App() {
   const pageSelectionRef = useRef(new Map<string, number>())
   const manualPageSelectionRef = useRef(new Set<string>())
   const logListRef = useRef<HTMLDivElement | null>(null)
+  const activeFilmstripPageRef = useRef<HTMLButtonElement | null>(null)
   const eventRefreshTimerRef = useRef<number | null>(null)
   const pendingEventRefreshRef = useRef({ jobs: false, library: false, pages: false, logs: false, health: false })
   const pageLoadCountRef = useRef(0)
   const pageLoadTargetRef = useRef(1)
+  const prefetchQueueRef = useRef<string[]>([])
+  const prefetchActiveRef = useRef(0)
+  const prefetchedUrlsRef = useRef(new Set<string>())
   const gestureRef = useRef({
     pointers: new Map<number, { x: number; y: number }>(),
     startPan: { x: 0, y: 0 },
@@ -383,7 +389,8 @@ function App() {
 
   const selected = jobs.find(job => job.id === selectedId) || jobs[0] || null
   const currentPage = pages.find(page => page.page_index === pageIndex) || pages[0]
-  const currentResultUrl = currentPage?.final_url || currentPage?.preview_url || null
+  const currentSourceUrl = currentPage?.source_display_url || currentPage?.source_url || null
+  const currentResultUrl = currentPage?.final_display_url || currentPage?.final_url || currentPage?.preview_url || null
   const selectedEngine = typeof selected?.spec.engine === 'string' ? selected.spec.engine : null
   const activeEngine = selectedEngine || 'palette'
   const modelHealth = health[activeEngine]
@@ -513,7 +520,7 @@ function App() {
   async function refreshRawLogs(jobId = selectedRef.current) {
     const requestId = ++rawLogsRequestRef.current
     const query = new URLSearchParams({ kind: logKind, limit: '80' })
-    if (jobId) query.set('job_id', jobId)
+    if (jobId && logKind !== 'gpu') query.set('job_id', jobId)
     const result = await api<RawLog[]>(`/api/logs?${query.toString()}`)
     if (requestId === rawLogsRequestRef.current) setRawLogs(result)
   }
@@ -592,19 +599,38 @@ function App() {
     }, 160)
   }
 
+  function pumpPrefetchQueue() {
+    while (prefetchActiveRef.current < 2 && prefetchQueueRef.current.length) {
+      const url = prefetchQueueRef.current.shift()
+      if (!url) continue
+      prefetchActiveRef.current += 1
+      const image = new Image()
+      image.decoding = 'async'
+      const finish = () => {
+        prefetchActiveRef.current = Math.max(0, prefetchActiveRef.current - 1)
+        pumpPrefetchQueue()
+      }
+      image.onload = finish
+      image.onerror = finish
+      image.src = url
+    }
+  }
+
+  function queueImagePrefetch(url: string | null | undefined) {
+    if (!url || prefetchedUrlsRef.current.has(url)) return
+    prefetchedUrlsRef.current.add(url)
+    prefetchQueueRef.current.push(url)
+    pumpPrefetchQueue()
+  }
+
   function prefetchPageAssets(jobId: string | null, index: number, sourcePages = pagesRef.current) {
     if (!jobId) return
-    const targets = sourcePages.filter(page => Math.abs(page.page_index - index) <= 1)
+    const targets = sourcePages
+      .filter(page => Math.abs(page.page_index - index) <= 2)
+      .sort((left, right) => Math.abs(left.page_index - index) - Math.abs(right.page_index - index))
     for (const page of targets) {
-      const urls = page.page_index === index
-        ? [page.source_url, page.final_url || page.preview_url]
-        : [page.thumbnail_url || page.source_url]
-      for (const url of urls) {
-        if (!url) continue
-        const image = new Image()
-        image.decoding = 'async'
-        image.src = url
-      }
+      queueImagePrefetch(page.source_display_url || page.source_url)
+      queueImagePrefetch(page.final_display_url || page.final_url || page.preview_url)
     }
   }
 
@@ -704,6 +730,14 @@ function App() {
     prefetchPageAssets(selected?.id || null, pageIndex)
   }, [selected?.id, pageIndex, currentPage?.asset_revision, previewMode, currentResultUrl])
 
+  useEffect(() => {
+    activeFilmstripPageRef.current?.scrollIntoView({
+      behavior: 'auto',
+      block: 'nearest',
+      inline: 'center',
+    })
+  }, [selected?.id, pageIndex, pages.length])
+
   function handlePageReady(data: Record<string, unknown>) {
     const jobId = String(data.job_id || '')
     const index = Number(data.page_index)
@@ -722,7 +756,9 @@ function App() {
       source_url: typeof data.source_url === 'string'
         ? freshAssetUrl(data.source_url, assetRevision)
         : `/api/jobs/${jobId}/pages/${index}/source`,
+      source_display_url: `/api/assets/jobs/${jobId}/pages/${index}/source.webp?v=${encodeURIComponent(assetRevision)}`,
       final_url: typeof data.final_url === 'string' ? freshAssetUrl(data.final_url, assetRevision) : null,
+      final_display_url: typeof data.final_url === 'string' ? `/api/assets/jobs/${jobId}/pages/${index}/final.webp?v=${encodeURIComponent(assetRevision)}` : null,
       preview_url: hasPreview ? freshAssetUrl(String(data.preview_url), assetRevision) : null,
       preview_only: hasPreview && typeof data.final_url !== 'string',
       thumbnail_url: typeof data.thumbnail_url === 'string'
@@ -772,7 +808,6 @@ function App() {
       const data = JSON.parse(event.data || '{}') as Record<string, unknown>
       if (event.type === 'gpu_metrics') {
         setGpuMetrics(data as unknown as GpuMetrics)
-        if (logKindRef.current !== 'activity') scheduleEventRefresh({ logs: true })
         return
       }
       const jobEvents = ['snapshot', 'job_status', 'job_queued', 'job_ready', 'job_error']
@@ -1153,11 +1188,6 @@ function App() {
                     <button key={id} className={previewMode === id ? 'active' : ''} onClick={() => setPreviewMode(id)}>{label}</button>)}
                 </div>
                 <button className="plain-button" onClick={() => setPreviewDark(value => !value)}>{previewDark ? '白底' : '深色底'}</button>
-                <div className="page-navigation" aria-label="页面翻页">
-                  <button className="icon-button" onClick={() => movePage(-1)} disabled={pages.findIndex(page => page.page_index === pageIndex) <= 0} aria-label="上一页" title="上一页"><Icon name="chevron-left" /></button>
-                  <span>{currentPage ? `${currentPage.page_index + 1} / ${pages.length}` : '—'}</span>
-                  <button className="icon-button" onClick={() => movePage(1)} disabled={pages.findIndex(page => page.page_index === pageIndex) < 0 || pages.findIndex(page => page.page_index === pageIndex) >= pages.length - 1} aria-label="下一页" title="下一页"><Icon name="chevron-right" /></button>
-                </div>
                 <div className="segmented zoom-controls" aria-label="缩放">
                   {(['fit', '50', '100', '200'] as const).map(value => <button key={value} className={zoom === value && ((value === 'fit' && canvasScale === 1) || value !== 'fit') ? 'active' : ''} onClick={() => setZoomPreset(value)}>{value === 'fit' ? '适配' : `${value}%`}</button>)}
                   <span className="zoom-readout" aria-live="polite">{Math.round(canvasScale * 100)}%</span>
@@ -1184,11 +1214,14 @@ function App() {
             <div className={`canvas canvas-gesture-zone ${previewDark ? 'dark' : ''} zoom-${zoom}`} onWheel={handleCanvasWheel} onPointerDown={handleCanvasPointerDown} onPointerMove={handleCanvasPointerMove} onPointerUp={handleCanvasPointerUp} onPointerCancel={handleCanvasPointerUp}>
               {currentPage ? <>
                 {previewMode === 'compare' && currentResultUrl ? <div className="compare-stage">
-                  <img style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} />
+                  <img style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} />
                   <div className="compare-result" style={{ clipPath: `inset(0 0 0 ${compare}%)`, transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}><img src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /></div>
                   <div className="compare-line" style={{ left: `${compare}%` }}><span /></div>
                   <input className="compare-range" aria-label="拖动比较原图和结果" type="range" min="0" max="100" value={compare} onChange={event => setCompare(Number(event.target.value))} />
-                </div> : previewMode === 'source' ? <img className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : previewMode === 'mask' ? <img className="single-page mask-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={`/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask`} alt={`第 ${currentPage.page_index + 1} 页保护遮罩`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : currentResultUrl ? <img className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : waitingForModel ? <div className="waiting-page model-waiting"><span className="waiting-symbol">!</span><strong>模型服务未连接</strong><span>当前没有页面在处理，服务恢复后会自动继续</span>{selected.error && <small className="waiting-detail">{selected.error}</small>}<button onClick={() => refreshHealth()}>重新检测模型</button></div> : <div className="waiting-page"><div className="spinner" /><strong>{modelLoading ? '正在加载模型权重' : waitingPageTitle}</strong><span>{modelLoading ? '首次启动需要准备模型，完成后才会生成第 1 页' : waitingPageHint}</span>{modelLoading && <div className="model-stage-progress">{typeof modelHealth?.progress === 'number' ? <><progress max="100" value={modelHealth.progress} /><strong>{modelHealth.progress.toFixed(0)}%</strong></> : <small>{modelHealth?.stage || modelHealth?.message || '当前服务只提供阶段状态，未提供可靠总量'}</small>}</div>}</div>}
+                </div> : previewMode === 'source' ? <img className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : previewMode === 'mask' ? <img className="single-page mask-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={`/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask`} alt={`第 ${currentPage.page_index + 1} 页保护遮罩`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : currentResultUrl ? <img className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : waitingForModel ? <div className="waiting-page model-waiting"><span className="waiting-symbol">!</span><strong>模型服务未连接</strong><span>当前没有页面在处理，服务恢复后会自动继续</span>{selected.error && <small className="waiting-detail">{selected.error}</small>}<button onClick={() => refreshHealth()}>重新检测模型</button></div> : <div className="waiting-page"><div className="spinner" /><strong>{modelLoading ? '正在加载模型权重' : waitingPageTitle}</strong><span>{modelLoading ? '首次启动需要准备模型，完成后才会生成第 1 页' : waitingPageHint}</span>{modelLoading && <div className="model-stage-progress">{typeof modelHealth?.progress === 'number' ? <><progress max="100" value={modelHealth.progress} /><strong>{modelHealth.progress.toFixed(0)}%</strong></> : <small>{modelHealth?.stage || modelHealth?.message || '当前服务只提供阶段状态，未提供可靠总量'}</small>}</div>}</div>}
+                <button className="canvas-page-nav previous" onClick={() => movePage(-1)} disabled={pages.findIndex(page => page.page_index === pageIndex) <= 0} aria-label="上一页" title="上一页"><Icon name="chevron-left" /></button>
+                <button className="canvas-page-nav next" onClick={() => movePage(1)} disabled={pages.findIndex(page => page.page_index === pageIndex) < 0 || pages.findIndex(page => page.page_index === pageIndex) >= pages.length - 1} aria-label="下一页" title="下一页"><Icon name="chevron-right" /></button>
+                <span className="canvas-page-count" aria-label="当前页码">{currentPage.page_index + 1} / {pages.length}</span>
                 {pageLoading && <div className="page-loading" role="status"><span className="spinner" />正在载入第 {currentPage.page_index + 1} 页</div>}
               </> : <div className="waiting-page"><strong>正在准备页面</strong><span>页面展开后会显示缩略图</span></div>}
             </div>
@@ -1196,7 +1229,7 @@ function App() {
             <div className="filmstrip filmstrip-shell" aria-label="漫画页面">
               <div className="filmstrip-viewport">
                 <div className="filmstrip-pages">
-                  {pages.map(page => <button key={page.page_index} className={page.page_index === pageIndex ? 'active' : ''} onClick={() => selectPage(page.page_index)}>
+                  {pages.map(page => <button key={page.page_index} ref={page.page_index === pageIndex ? activeFilmstripPageRef : undefined} className={page.page_index === pageIndex ? 'active' : ''} onClick={() => selectPage(page.page_index)}>
                     <img loading="lazy" decoding="async" src={page.thumbnail_url || page.source_url} alt={`第 ${page.page_index + 1} 页`} /><span>{page.page_index + 1}</span>{page.final_url ? <i className="page-state-mark completed" aria-label="已完成"><Icon name="check" /></i> : page.preview_url ? <i className="page-state-mark processing" title="已有预览，尚未通过整页检查" aria-label="处理中">◌</i> : page.status === 'failed' ? <i className="page-state-mark failed" aria-label="失败" /> : null}
                   </button>)}
                 </div>
@@ -1231,7 +1264,7 @@ function App() {
               <div className="progress-actions">{selected.status === 'completed' ? <button onClick={() => action(selected.id, 'download')}>下载成品</button> : selected.status === 'archived' ? <span>已在回收站</span> : <><button onClick={() => action(selected.id, selected.status === 'running' || selected.status === 'queued' ? 'pause' : 'start')}><Icon name={selected.status === 'running' || selected.status === 'queued' ? 'pause' : 'play'} />{selected.status === 'running' || selected.status === 'queued' ? '暂停' : '运行或继续'}</button><button onClick={() => action(selected.id, 'cancel')}>取消</button></>}</div>
             </div>
             <div className="page-status-grid" aria-label="每页状态">
-              {(selected.progress.page_states || []).map(page => <button key={page.page_index} className={`page-state ${page.status}`} title={page.error || undefined} onClick={() => { selectPage(page.page_index); setMobileTab('preview') }}><span className={`page-state-mark ${page.status === 'qa_passed' ? 'completed' : page.status === 'running' ? 'processing' : page.status === 'failed' || page.status === 'qa_failed' ? 'failed' : 'pending'}`} aria-hidden="true" /><span>第 {page.page_index + 1} 页</span><small>{page.status === 'qa_passed' ? '完成' : page.status === 'running' ? '处理中' : page.status === 'failed' ? '失败' : page.status === 'pending' ? '等待处理' : page.status === 'ingesting' ? '展开中' : page.status === 'waiting_model' ? '等待模型' : `${page.completed_units}/${page.total_units}`}</small></button>)}
+              {(selected.progress.page_states || []).map(page => <button key={page.page_index} className={`page-state ${page.status} ${page.page_index === pageIndex ? 'current' : ''}`} title={page.error || `第 ${page.page_index + 1} 页`} aria-label={`第 ${page.page_index + 1} 页 ${page.status === 'qa_passed' ? '完成' : page.status === 'running' ? '处理中' : page.status === 'failed' || page.status === 'qa_failed' ? '失败' : '等待'}`} onClick={() => { selectPage(page.page_index); setMobileTab('preview') }}><span className={`page-state-mark ${page.status === 'qa_passed' ? 'completed' : page.status === 'running' ? 'processing' : page.status === 'failed' || page.status === 'qa_failed' ? 'failed' : 'pending'}`} aria-hidden="true" /></button>)}
             </div>
           </div>
           <section className="activity-log" aria-label="后台日志">
@@ -1246,7 +1279,7 @@ function App() {
               <button onClick={copyLogs}>复制</button>
             </div>}
             <div ref={logListRef}>{logKind === 'activity' ? logs.slice(-12).reverse().map(item => <p key={item.id}><time>{formatLogTime(item.created_at)}</time><span>{item.message}</span></p>) : logKind === 'gpu' ? visibleRawLogs.slice(-12).reverse().map(item => <p key={`${item.id}-${item.timestamp}`}><time>{formatLogTime(item.timestamp)}</time><span>{item.message}{item.metrics?.utilization_percent != null ? ` · GPU ${item.metrics.utilization_percent}%` : ''}</span></p>) : visibleRawLogs.slice(-12).reverse().map(item => <p key={`${item.id}-${item.timestamp}`}><time>{formatLogTime(item.timestamp)}</time><span>[{item.level}] {item.component} · {item.message}</span></p>)}</div>
-            <footer><button onClick={() => { if (!window.confirm('原始日志可能包含本机路径，请确认后再分享')) return; window.location.href = `/api/logs/download?kind=${logKind === 'activity' ? 'raw' : logKind}${selected ? `&job_id=${selected.id}` : ''}` }}>下载日志</button>{gpuMetrics && <span>{gpuMetrics.available ? `${gpuMetrics.name || 'GPU'} · ${gpuMetrics.utilization_percent ?? '—'}% · ${gpuMetrics.memory_used_mib ?? '—'} / ${gpuMetrics.memory_total_mib ?? '—'} MiB` : `GPU 不可用：${gpuMetrics.reason || '未提供原因'}`}</span>}</footer>
+            <footer><button onClick={() => { if (!window.confirm('原始日志可能包含本机路径，请确认后再分享')) return; window.location.href = `/api/logs/download?kind=${logKind === 'activity' ? 'raw' : logKind}${selected && logKind !== 'gpu' ? `&job_id=${selected.id}` : ''}` }}>下载日志</button>{gpuMetrics && <span>{gpuMetrics.available ? `${gpuMetrics.name || 'GPU'} · ${gpuMetrics.utilization_percent ?? '—'}% · ${gpuMetrics.memory_used_mib ?? '—'} / ${gpuMetrics.memory_total_mib ?? '—'} MiB` : `GPU 不可用：${gpuMetrics.reason || '未提供原因'}`}</span>}</footer>
           </section>
         </div>}
       </section>}
@@ -1331,7 +1364,7 @@ function Inspector({ selected, presets, health, currentPage, collapsed, onToggle
     <section className="setting-section"><h3>配色</h3><div className="swatch-row"><span className={`swatch ${selected.spec.color_preset}`} /><strong>{color?.name}</strong></div><OptionInfo item={color} /></section>
     <section className="setting-section"><h3>画风</h3><strong>{style?.name}</strong><OptionInfo item={style} /></section>
     <section className="setting-section compact"><div><small>细节保护</small><strong>{presets?.details.find(item => item.id === selected.spec.detail_mode)?.name}</strong></div><div><small>处理单位</small><strong>{presets?.panels.find(item => item.id === selected.spec.panel_mode)?.name}</strong></div><div><small>导出</small><strong>{presets?.outputs.find(item => item.id === selected.spec.output_format)?.name}</strong></div></section>
-    <section className={`setting-section semantic-state ${semanticStatus === 'fallback' ? 'warning' : ''}`} aria-label="语义分层状态"><h3>语义分层</h3><strong>{semanticLabel}</strong><small>{semanticStatus === 'fallback' ? '未安装 semantic-manga-v1，仅保护文字、气泡、墨线和边框；低置信度区域保留原始亮度' : semanticStatus === 'ready' ? '当前页面已保存类别遮罩与置信度图' : '页面资产可用后显示遮罩状态'}</small></section>
+    <section className={`setting-section semantic-state ${semanticStatus === 'fallback' ? 'warning' : ''}`} aria-label="语义分层状态"><h3>语义分层</h3><strong>{semanticLabel}</strong><small>{semanticStatus === 'fallback' ? '确定性保护文字、气泡、墨线和边框；人物与场景采用完整彩色合成' : semanticStatus === 'ready' ? 'Koharu 保护文字、气泡和框线，确定性检测补充核心墨线；不虚构人体分层' : '页面资产可用后显示遮罩状态'}</small></section>
     <section className="setting-section"><h3>本地引擎</h3><div className="engine-state"><span className={`health-dot ${health[selected.spec.engine as string]?.ok ? 'ready' : ''}`} /><strong>{selected.spec.engine}</strong></div></section>
     <div className="inspector-actions">
       {selected.status === 'completed' && <button className="button primary" onClick={() => onAction(selected.id, 'download')}>下载成品</button>}
