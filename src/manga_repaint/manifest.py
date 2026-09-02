@@ -211,7 +211,7 @@ class Manifest:
                       qa_json=?,error=NULL WHERE id=?
                     """,
                     (
-                        str(unit["generated_path"]),
+                        str(unit["generated_path"]) if unit["generated_path"] else None,
                         str(unit["final_path"]),
                         json.dumps(qa_data, ensure_ascii=False),
                         int(unit["id"]),
@@ -597,6 +597,33 @@ class Manifest:
                 (_now(), unit_id),
             )
 
+    def finish_bypassed_unit(
+        self, unit_id: int, final_path: Path, qa: QAResult
+    ) -> None:
+        """Finish a source-pass-through unit without a generated asset."""
+        status = UnitStatus.QA_PASSED if qa.passed else UnitStatus.QA_FAILED
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE units SET status=?,generated_path=NULL,final_path=?,qa_json=?,finished_at=?
+                WHERE id=?
+                """,
+                (
+                    status.value,
+                    str(final_path),
+                    json.dumps(qa.to_json_dict(), ensure_ascii=False),
+                    _now(),
+                    unit_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE jobs SET updated_at=?
+                WHERE id=(SELECT p.job_id FROM pages p JOIN units u ON u.page_id=p.id WHERE u.id=?)
+                """,
+                (_now(), unit_id),
+            )
+
     def replace_unit_output(
         self, unit_id: int, generated_path: Path, final_path: Path
     ) -> None:
@@ -643,7 +670,7 @@ class Manifest:
     def accept_repaired_unit(
         self,
         unit_id: int,
-        generated_path: Path,
+        generated_path: Path | None,
         final_path: Path,
         qa: QAResult,
     ) -> None:
@@ -664,7 +691,7 @@ class Manifest:
                 WHERE id=?
                 """,
                 (
-                    str(generated_path),
+                    str(generated_path) if generated_path else None,
                     str(final_path),
                     json.dumps(qa_data, ensure_ascii=False),
                     unit_id,
@@ -935,6 +962,17 @@ class Manifest:
                     "SELECT * FROM pages WHERE job_id=? ORDER BY page_index", (job_id,)
                 ).fetchall()
             ]
+
+    def page_by_index(self, job_id: str, page_index: int) -> dict[str, Any]:
+        """Read one page row without scanning the rest of the book."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pages WHERE job_id=? AND page_index=?",
+                (job_id, page_index),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown page {page_index} for job {job_id}")
+        return dict(row)
 
     def page_asset_revision(self, page_id: int) -> str | None:
         with self.connect() as connection:

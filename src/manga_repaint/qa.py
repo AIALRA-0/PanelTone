@@ -9,21 +9,20 @@ from .models import QAResult
 
 
 def _edge_map(image: Image.Image) -> np.ndarray:
-    luminance = np.clip(np.rint(lab_l(image) * 2.55), 0, 255).astype(np.uint8)
-    return cv2.Canny(luminance, 80, 160) > 0
+    # Geometry is measured on the value channel. Geometry-locked colorization
+    # deliberately copies this channel from the source, so hue changes cannot
+    # be mistaken for a newly drawn edge.
+    rgb = np.asarray(image.convert("RGB"))
+    value = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[..., 2]
+    return cv2.Canny(value, 80, 160) > 0
 
 
 def _f1(reference: np.ndarray, candidate: np.ndarray) -> float:
     if not reference.any() and not candidate.any():
         return 1.0
-    # Use a scale-aware tolerance: a small antialias/resize offset on a
-    # full-resolution page is visually the same edge, while small unit-test
-    # images retain a one-pixel tolerance.  The 1.25% bound accommodates the
-    # compositor's source/generated resize without allowing whole-line loss;
-    # exact protected-pixel and black-ink checks remain independent gates.
-    radius = max(1, int(round(min(reference.shape) * 0.0125)))
-    kernel_size = radius * 2 + 1
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    # A fixed one-pixel tolerance is intentional. A page-sized tolerance
+    # allowed visibly shifted lines and doubled faces to pass on large scans.
+    kernel = np.ones((3, 3), dtype=np.uint8)
     reference_neighborhood = cv2.dilate(reference.astype(np.uint8), kernel).astype(bool)
     candidate_neighborhood = cv2.dilate(candidate.astype(np.uint8), kernel).astype(bool)
     matched_reference = np.logical_and(reference, candidate_neighborhood).sum()
@@ -31,6 +30,52 @@ def _f1(reference: np.ndarray, candidate: np.ndarray) -> float:
     recall = float(matched_reference / max(1, reference.sum()))
     precision = float(matched_candidate / max(1, candidate.sum()))
     return 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+
+
+def _geometry_metrics(
+    source_edges: np.ndarray, result_edges: np.ndarray
+) -> tuple[float, float, float]:
+    """Return source recall, added-edge ratio and edge alignment."""
+    source_neighborhood = cv2.dilate(source_edges.astype(np.uint8), np.ones((3, 3), np.uint8))
+    result_neighborhood = cv2.dilate(result_edges.astype(np.uint8), np.ones((3, 3), np.uint8))
+    source_edge_recall = (
+        float(np.logical_and(source_edges, result_neighborhood > 0).sum() / source_edges.sum())
+        if source_edges.any()
+        else 1.0
+    )
+    result_count = int(result_edges.sum())
+    added_edges = np.logical_and(result_edges, source_neighborhood == 0)
+    added_edge_ratio = float(added_edges.sum() / max(1, result_count))
+    chroma_edge_alignment = float(
+        np.logical_and(result_edges, source_neighborhood > 0).sum() / max(1, result_count)
+    )
+    return source_edge_recall, added_edge_ratio, chroma_edge_alignment
+
+
+def _neutral_island_metrics(
+    generated_rgb: np.ndarray, result_rgb: np.ndarray, roi: np.ndarray
+) -> tuple[float, float]:
+    """Measure result neutral pixels where the candidate has stable colour."""
+    if not roi.any():
+        return 0.0, 0.0
+    generated_max = generated_rgb.max(axis=-1).astype(np.float32)
+    generated_chroma = generated_max - generated_rgb.min(axis=-1).astype(np.float32)
+    generated_saturation = generated_chroma / np.maximum(generated_max, 1.0)
+    candidate_colour = np.logical_and(
+        roi, np.logical_and(generated_chroma >= 6.0, generated_saturation >= 0.08)
+    )
+    result_max = result_rgb.max(axis=-1).astype(np.float32)
+    result_chroma = result_max - result_rgb.min(axis=-1).astype(np.float32)
+    result_saturation = result_chroma / np.maximum(result_max, 1.0)
+    neutral = np.logical_and(
+        candidate_colour,
+        np.logical_or(result_chroma < 6.0, result_saturation < 0.08),
+    )
+    ratio = float(neutral.sum() / max(1, candidate_colour.sum()))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(neutral.astype(np.uint8), 8)
+    largest = int(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0
+    largest_ratio = float(largest / max(1, candidate_colour.sum()))
+    return ratio, largest_ratio
 
 
 def _color_coverage(rgb: np.ndarray, roi: np.ndarray) -> float:
@@ -81,10 +126,35 @@ def evaluate(
     generated: Image.Image | None = None,
     color_retention_min: float = 0.70,
     color_dropout_tiles_max: int = 0,
+    source_class: str = "line_art",
+    source_passthrough: bool = False,
+    source_edge_recall_min: float = 0.995,
+    added_edge_ratio_max: float = 0.005,
+    neutral_island_ratio_max: float = 0.08,
+    largest_neutral_island_ratio_max: float = 0.03,
+    panel_boundary_mask: np.ndarray | None = None,
+    geometry_locked: bool = False,
+    bypass_reason: str | None = None,
+    source_sha256: str | None = None,
+    final_sha256: str | None = None,
 ) -> QAResult:
     dimension_match = source.size == result.size
     if not dimension_match:
-        return QAResult(False, -1, 0.0, float("inf"), False, ["dimension_mismatch"])
+        return QAResult(
+            passed=False,
+            protected_pixel_diff=-1,
+            line_edge_f1=0.0,
+            luminance_mae=float("inf"),
+            dimension_match=False,
+            reasons=["dimension_mismatch"],
+            source_class=source_class,
+            source_passthrough=source_passthrough,
+            bypass_reason=bypass_reason,
+            source_sha256=source_sha256,
+            final_sha256=final_sha256,
+        )
+    if protected_mask.shape != (source.height, source.width):
+        raise ValueError("protection mask shape does not match source image")
 
     source_rgb = np.asarray(source.convert("RGB")).astype(np.int16)
     result_rgb = np.asarray(result.convert("RGB")).astype(np.int16)
@@ -98,21 +168,10 @@ def evaluate(
     luminance_mae = float(np.abs(source_luma - result_luma).mean())
     source_edges = _edge_map(source)
     result_edges = _edge_map(result)
-    if protected_mask.any():
-        # Compare edges that have protected context on all sides.  This avoids
-        # treating a generated colour transition immediately outside a
-        # protected line as a lost source line; exact protected pixels and
-        # black-ink preservation remain independent checks.
-        roi = cv2.erode(
-            protected_mask.astype(np.uint8), np.ones((5, 5), np.uint8)
-        ).astype(bool)
-        source_edges = np.logical_and(source_edges, roi)
-        result_edges = np.logical_and(result_edges, roi)
-    source_edge_neighborhood = cv2.dilate(
-        source_edges.astype(np.uint8), np.ones((5, 5), np.uint8)
-    ).astype(bool)
-    result_edges = np.logical_and(result_edges, source_edge_neighborhood)
     line_edge_f1 = _f1(source_edges, result_edges)
+    source_edge_recall, added_edge_ratio, chroma_edge_alignment = _geometry_metrics(
+        source_edges, result_edges
+    )
 
     pure_black = np.all(source_rgb <= 8, axis=-1)
     if pure_black.any():
@@ -126,6 +185,8 @@ def evaluate(
     result_color_coverage = 0.0
     color_retention_ratio = 1.0
     color_dropout_tiles = 0
+    neutral_island_ratio = 0.0
+    largest_neutral_island_ratio = 0.0
     if generated is not None:
         generated_rgb = np.asarray(
             generated.convert("RGB").resize(source.size, Image.Resampling.LANCZOS)
@@ -142,6 +203,26 @@ def evaluate(
             color_dropout_tiles = _color_dropout_tiles(
                 generated_rgb, result_rgb, color_roi
             )
+            neutral_island_ratio, largest_neutral_island_ratio = _neutral_island_metrics(
+                generated_rgb, result_rgb, color_roi
+            )
+
+    panel_boundary_bleed_ratio = 0.0
+    if panel_boundary_mask is not None:
+        if panel_boundary_mask.shape != protected_mask.shape:
+            raise ValueError("panel boundary mask shape does not match source image")
+        boundary = panel_boundary_mask.astype(bool)
+        outside = cv2.dilate(boundary.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        outside &= ~boundary
+        source_chroma = source_rgb.max(axis=-1) - source_rgb.min(axis=-1)
+        # Only neutral source pixels are eligible bleed targets. Existing
+        # coloured artwork immediately outside a crop is legitimate page
+        # content, not evidence that the candidate crossed the boundary.
+        eligible = np.logical_and(outside, source_chroma < 6)
+        result_chroma = result_rgb.max(axis=-1) - result_rgb.min(axis=-1)
+        panel_boundary_bleed_ratio = float(
+            np.logical_and(eligible, result_chroma >= 6).sum() / max(1, eligible.sum())
+        )
 
     reasons: list[str] = []
     if protected_diff != 0:
@@ -156,6 +237,23 @@ def evaluate(
         reasons.append("color_retention_below_threshold")
     if color_dropout_tiles > color_dropout_tiles_max:
         reasons.append("regional_color_dropout")
+    if geometry_locked:
+        if source_edge_recall < source_edge_recall_min:
+            reasons.append("source_edge_recall_below_threshold")
+        if added_edge_ratio > added_edge_ratio_max:
+            reasons.append("added_edge_ratio_above_threshold")
+        if neutral_island_ratio > neutral_island_ratio_max:
+            reasons.append("neutral_island_above_threshold")
+        if largest_neutral_island_ratio > largest_neutral_island_ratio_max:
+            reasons.append("largest_neutral_island_above_threshold")
+        if panel_boundary_bleed_ratio > 0.0:
+            reasons.append("panel_boundary_bleed")
+    if source_passthrough:
+        if not np.array_equal(source_rgb, result_rgb):
+            reasons.append("source_passthrough_changed")
+        # A bypass page is an exact source copy, so colour and geometry gates
+        # do not reject it merely because no generated candidate exists.
+        reasons = [reason for reason in reasons if reason == "source_passthrough_changed"]
     return QAResult(
         passed=not reasons,
         protected_pixel_diff=protected_diff,
@@ -169,4 +267,15 @@ def evaluate(
         result_color_coverage=result_color_coverage,
         color_retention_ratio=color_retention_ratio,
         color_dropout_tiles=color_dropout_tiles,
+        source_class=source_class,
+        source_passthrough=source_passthrough,
+        source_edge_recall=source_edge_recall,
+        added_edge_ratio=added_edge_ratio,
+        chroma_edge_alignment=chroma_edge_alignment,
+        neutral_island_ratio=neutral_island_ratio,
+        largest_neutral_island_ratio=largest_neutral_island_ratio,
+        panel_boundary_bleed_ratio=panel_boundary_bleed_ratio,
+        bypass_reason=bypass_reason,
+        source_sha256=source_sha256,
+        final_sha256=final_sha256,
     )

@@ -1,10 +1,100 @@
 from __future__ import annotations
 
+import hashlib
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 from PIL import Image
 
 from .masks import ink_edge_mask
+
+
+@dataclass(frozen=True, slots=True)
+class SourceClassification:
+    """Deterministic page/unit classification used before model inference."""
+
+    source_class: str
+    source_passthrough: bool
+    bypass_reason: str
+    foreground_ratio: float
+    edge_ratio: float
+    gray_std: float
+
+
+def _composited_rgb(image: Image.Image) -> np.ndarray:
+    """Return RGB pixels with transparent input composited over white."""
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.float32)
+    alpha = rgba[..., 3:4] / 255.0
+    rgb = rgba[..., :3] * alpha + 255.0 * (1.0 - alpha)
+    return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+
+def image_sha256(image: Image.Image) -> str:
+    """Hash normalized RGB pixels, independent of the source file encoding."""
+    rgb = _composited_rgb(image)
+    digest = hashlib.sha256()
+    digest.update(f"{rgb.shape[1]}x{rgb.shape[0]}x{rgb.shape[2]}".encode("ascii"))
+    digest.update(rgb.tobytes())
+    return digest.hexdigest()
+
+
+def classify_source_page(image: Image.Image) -> SourceClassification:
+    """Classify a page before inference so empty pages cannot be hallucinated.
+
+    The classifier intentionally uses only source pixels.  Semantic models are
+    not involved, which keeps normal processing, repair and resume decisions
+    identical even when an optional semantic provider is unavailable.
+    """
+    rgb = _composited_rgb(image)
+    normalized = Image.fromarray(rgb, mode="RGB")
+    if is_already_colorized(normalized):
+        return SourceClassification("already_color", True, "source_already_color", 0.0, 0.0, 0.0)
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    height, width = gray.shape
+    border = np.concatenate(
+        (gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1])
+    )
+    background = float(np.median(border)) if border.size else 255.0
+    deviation = np.abs(gray.astype(np.float32) - background)
+    foreground = deviation >= max(12.0, float(np.std(border)) * 2.0)
+    edges = cv2.Canny(gray, 60, 150) > 0
+    foreground_ratio = float(foreground.mean())
+    edge_ratio = float(edges.mean())
+    gray_std = float(gray.astype(np.float32).std())
+
+    if (foreground_ratio <= 0.001 and edge_ratio <= 0.0005) or gray_std <= 1.0:
+        return SourceClassification(
+            "blank", True, "source_is_blank_or_uniform", foreground_ratio, edge_ratio, gray_std
+        )
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        foreground.astype(np.uint8), connectivity=8
+    )
+    largest_component = 0
+    if component_count > 1:
+        largest_component = int(stats[1:, cv2.CC_STAT_AREA].max())
+    largest_ratio = largest_component / max(1, width * height)
+    if (
+        foreground_ratio <= 0.04
+        # Canny reports both sides of a narrow printed stroke.  The measured
+        # page ratio is therefore allowed a small raster margin above the
+        # semantic 1.2% sparse-content target.
+        and edge_ratio <= 0.020
+        and largest_ratio < 0.10
+    ):
+        return SourceClassification(
+            "sparse_text_or_logo",
+            True,
+            "source_is_sparse_text_or_logo",
+            foreground_ratio,
+            edge_ratio,
+            gray_std,
+        )
+    return SourceClassification(
+        "line_art", False, "source_requires_colorization", foreground_ratio, edge_ratio, gray_std
+    )
 
 
 def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
@@ -251,6 +341,133 @@ def composite_strict_colorization(
     result = np.clip(np.rint(result), 0, 255).astype(np.uint8)
     result[strict_mask] = source_rgb.astype(np.uint8)[strict_mask]
     return Image.fromarray(result, mode="RGB")
+
+
+def composite_geometry_locked_colorization(
+    source: Image.Image,
+    generated: Image.Image,
+    protected_mask: np.ndarray,
+    chroma_strength: float = 1.0,
+    ink_core_threshold: int = 64,
+) -> Image.Image:
+    """Apply model colour to source geometry without importing model edges.
+
+    ``generated`` contributes only hue and saturation.  The value channel,
+    edges, ink and all explicitly protected pixels come from ``source``.  A
+    shifted or hallucinated model structure therefore cannot create a second
+    face, line, balloon or panel in the result.
+    """
+    if not 0.0 <= chroma_strength <= 2.5:
+        raise ValueError("Chroma strength must be between 0.0 and 2.5")
+    if not 0 <= ink_core_threshold <= 255:
+        raise ValueError("Ink core threshold must be between 0 and 255")
+    if source.size != generated.size:
+        raise ValueError("source and generated dimensions must match exactly")
+    source_rgb = _composited_rgb(source)
+    generated_rgb = _composited_rgb(generated)
+    height, width = source_rgb.shape[:2]
+    if protected_mask.shape != (height, width):
+        raise ValueError("protection mask shape does not match source image")
+
+    source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
+    barrier = geometry_barrier_mask(
+        Image.fromarray(source_rgb, mode="RGB"),
+        protected_mask,
+        ink_core_threshold=ink_core_threshold,
+    )
+    traversable = ~barrier
+
+    generated_hsv = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hue = generated_hsv[..., 0] * (2.0 * np.pi / 180.0)
+    saturation = generated_hsv[..., 1]
+    valid_color = np.logical_and(saturation >= 18.0, generated_hsv[..., 2] >= 8.0)
+    filtered_hue = generated_hsv[..., 0].copy()
+    filtered_saturation = saturation.copy()
+    component_count, labels = cv2.connectedComponents(
+        traversable.astype(np.uint8), connectivity=8
+    )
+
+    for component in range(1, component_count):
+        region = labels == component
+        area = int(region.sum())
+        if area < 4:
+            continue
+        valid = np.logical_and(region, valid_color)
+        valid_count = int(valid.sum())
+        if valid_count / area < 0.20:
+            filtered_saturation[region] = saturation[region] * chroma_strength
+            continue
+
+        weights = np.where(valid, saturation / 255.0, 0.0).astype(np.float32)
+        cos_values = np.cos(hue) * weights
+        sin_values = np.sin(hue) * weights
+        # Masked normalized convolution is performed on each source-connected
+        # component, so no generated colour can cross a source barrier.
+        region_float = region.astype(np.float32)
+        local_cos = cv2.GaussianBlur(cos_values * region_float, (0, 0), 1.15)
+        local_sin = cv2.GaussianBlur(sin_values * region_float, (0, 0), 1.15)
+        local_sat = cv2.GaussianBlur(saturation * valid * region_float, (0, 0), 1.15)
+        local_weight = cv2.GaussianBlur(
+            valid.astype(np.float32) * region_float, (0, 0), 1.15
+        )
+        stable_cos = float(cos_values[valid].sum())
+        stable_sin = float(sin_values[valid].sum())
+        stable_angle = float(np.arctan2(stable_sin, stable_cos))
+        stable_strength = float(np.hypot(stable_cos, stable_sin) / max(1, valid_count))
+        stable_hue = (stable_angle % (2.0 * np.pi)) * 180.0 / np.pi
+        stable_saturation = float(np.median(saturation[valid])) * chroma_strength
+        good_local = np.logical_and(region, local_weight > 0.01)
+        local_angle = np.mod(
+            np.arctan2(local_sin, local_cos), 2.0 * np.pi
+        ) * 180.0 / np.pi
+        filtered_hue[good_local] = local_angle[good_local] / 2.0
+        filtered_saturation[good_local] = (
+            local_sat[good_local] / np.maximum(local_weight[good_local], 1e-3)
+        ) * chroma_strength
+        # Fill neutral holes only when the component has a coherent colour
+        # signal.  This avoids turning a genuinely neutral page into a flat
+        # tint while fixing the half-white skin/scene islands.
+        if stable_strength >= 0.12:
+            holes = np.logical_and(region, ~good_local)
+            filtered_hue[holes] = stable_hue / 2.0
+            filtered_saturation[holes] = stable_saturation
+        filtered_hue[region] %= 180.0
+        filtered_saturation[region] = np.clip(filtered_saturation[region], 0, 255)
+
+    composed_hsv = np.empty((height, width, 3), dtype=np.uint8)
+    composed_hsv[..., 0] = np.mod(filtered_hue, 180.0).astype(np.uint8)
+    composed_hsv[..., 1] = np.clip(filtered_saturation, 0, 255).astype(np.uint8)
+    # Source grayscale is the sole value channel.  This deliberately ignores
+    # generated RGB, value, Lab lightness, edges and texture.
+    composed_hsv[..., 2] = source_gray
+    result_rgb = cv2.cvtColor(composed_hsv, cv2.COLOR_HSV2RGB)
+    result_rgb[barrier] = source_rgb[barrier]
+    return Image.fromarray(result_rgb, mode="RGB")
+
+
+def geometry_barrier_mask(
+    source: Image.Image,
+    protected_mask: np.ndarray,
+    *,
+    ink_core_threshold: int = 64,
+) -> np.ndarray:
+    """Return the source geometry barrier shared by composition and QA."""
+    if not 0 <= ink_core_threshold <= 255:
+        raise ValueError("Ink threshold must be between 0 and 255")
+    if protected_mask.shape != (source.height, source.width):
+        raise ValueError("protection mask shape does not match source image")
+    source_rgb = _composited_rgb(source)
+    source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
+    source_edges = cv2.Canny(source_gray, 60, 150) > 0
+    ink = ink_edge_mask(
+        Image.fromarray(source_rgb, mode="RGB"),
+        core_threshold=ink_core_threshold,
+        edge_threshold=128,
+    )
+    barrier = np.logical_or.reduce((protected_mask, source_edges, ink))
+    # A one-pixel guard prevents the colour diffusion kernel from sampling on
+    # the opposite side of a source line or panel boundary.
+    return cv2.dilate(barrier.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
 
 
 def validated_colorization_protection(

@@ -115,6 +115,17 @@ class QAResult:
     result_color_coverage: float = 0.0
     color_retention_ratio: float = 1.0
     color_dropout_tiles: int = 0
+    source_class: str = "line_art"
+    source_passthrough: bool = False
+    source_edge_recall: float = 1.0
+    added_edge_ratio: float = 0.0
+    chroma_edge_alignment: float = 1.0
+    neutral_island_ratio: float = 0.0
+    largest_neutral_island_ratio: float = 0.0
+    panel_boundary_bleed_ratio: float = 0.0
+    bypass_reason: str | None = None
+    source_sha256: str | None = None
+    final_sha256: str | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)

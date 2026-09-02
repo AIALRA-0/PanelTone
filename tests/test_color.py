@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import cv2
 import numpy as np
-from PIL import Image
+import pytest
+from PIL import Image, ImageDraw
 
 from manga_repaint.color import (
+    classify_source_page,
+    composite_geometry_locked_colorization,
     composite_protected,
     composite_strict_colorization,
+    geometry_barrier_mask,
     is_already_colorized,
     lab_l,
     preserve_ink_overlay,
@@ -174,3 +179,65 @@ def test_already_colorized_source_is_detected() -> None:
 
     assert is_already_colorized(source)
     assert not is_already_colorized(Image.new("RGB", source.size, (220, 220, 220)))
+
+
+def test_source_classifier_bypasses_blank_sparse_and_already_colour_pages() -> None:
+    blank = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+    sparse = Image.new("RGB", (96, 96), "white")
+    sparse_pixels = np.asarray(sparse).copy()
+    sparse_pixels[12:84, 46:49] = 0
+    sparse = Image.fromarray(sparse_pixels, mode="RGB")
+    coloured = Image.new("RGB", (96, 96), "white")
+    coloured_pixels = np.asarray(coloured).copy()
+    coloured_pixels[8:88, 8:88] = (60, 150, 220)
+    coloured = Image.fromarray(coloured_pixels, mode="RGB")
+
+    assert classify_source_page(blank).source_class == "blank"
+    assert classify_source_page(sparse).source_class == "sparse_text_or_logo"
+    assert classify_source_page(coloured).source_class == "already_color"
+
+
+def test_geometry_locked_colorization_uses_source_value_and_not_generated_edges() -> None:
+    source_pixels = np.full((64, 64, 3), 220, dtype=np.uint8)
+    source_pixels[28:34, 8:56] = 0
+    source = Image.fromarray(source_pixels, mode="RGB")
+    generated_pixels = np.full((64, 64, 3), (220, 70, 40), dtype=np.uint8)
+    generated_pixels[8:56, 42:48] = (30, 80, 230)
+    generated = Image.fromarray(generated_pixels, mode="RGB")
+    protected = np.zeros((64, 64), dtype=bool)
+    protected[29:33, 10:54] = True
+
+    result = np.asarray(
+        composite_geometry_locked_colorization(source, generated, protected)
+    )
+    result_value = cv2.cvtColor(result, cv2.COLOR_RGB2HSV)[..., 2]
+    source_value = np.asarray(source.convert("L"))
+
+    assert np.array_equal(result_value, source_value)
+    assert np.array_equal(result[protected], source_pixels[protected])
+    assert not np.array_equal(result[10, 44], source_pixels[10, 44])
+
+
+def test_geometry_locked_colorization_rejects_dimension_mismatch() -> None:
+    source = Image.new("RGB", (32, 32), "white")
+    generated = Image.new("RGB", (31, 32), "red")
+    with pytest.raises(ValueError, match="dimensions"):
+        composite_geometry_locked_colorization(
+            source, generated, np.zeros((32, 32), dtype=bool)
+        )
+
+
+def test_geometry_barrier_matches_locked_composer_protection() -> None:
+    source = Image.new("RGB", (40, 40), "white")
+    draw = ImageDraw.Draw(source)
+    draw.rectangle((8, 8, 31, 31), outline="black", width=2)
+    mask = np.zeros((40, 40), dtype=bool)
+    barrier = geometry_barrier_mask(source, mask)
+    result = composite_geometry_locked_colorization(
+        source,
+        Image.new("RGB", source.size, (210, 90, 80)),
+        mask,
+    )
+    source_array = np.asarray(source)
+    result_array = np.asarray(result)
+    assert np.array_equal(source_array[barrier], result_array[barrier])

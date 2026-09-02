@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import zipfile
 from pathlib import Path
@@ -83,6 +84,71 @@ def test_whole_book_end_to_end_and_resume(tmp_path: Path, manga_pages: Path) -> 
     page = Path(manager._manifest(job_id).pages(job_id)[0]["output_path"])
     with Image.open(page) as image:
         assert image.size == (320, 420)
+
+
+def test_blank_colorize_page_is_source_passthrough_without_model_output(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "blank-book"
+    source.mkdir()
+    Image.new("RGB", (120, 100), "white").save(source / "001.png")
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    job_id = manager.create(
+        JobSpec(source=source, workspace=settings.data_root, engine="palette")
+    )
+
+    output = manager.process(job_id)
+
+    assert output.is_file()
+    units = manager._manifest(job_id).page_units(
+        int(manager._manifest(job_id).pages(job_id)[0]["id"])
+    )
+    assert len(units) == 1
+    assert units[0]["generated_path"] is None
+    qa = json.loads(units[0]["qa_json"])
+    assert qa["source_class"] == "blank"
+    assert qa["source_passthrough"] is True
+
+
+def test_source_passthrough_survives_transactional_repair_without_dot_path(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "blank-book"
+    source.mkdir()
+    Image.new("RGB", (120, 100), "white").save(source / "001.png")
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    job_id = manager.create(
+        JobSpec(source=source, workspace=settings.data_root, engine="palette")
+    )
+    manager.process(job_id)
+
+    assert manager.repair_completed_colorization(job_id) == 1
+    unit = manager._manifest(job_id).page_units(
+        int(manager._manifest(job_id).pages(job_id)[0]["id"])
+    )[0]
+    assert unit["generated_path"] is None
+    assert unit["final_path"]
+    assert manager.status(job_id)["status"] == "completed"
+
+
+def test_display_asset_backfill_is_bounded_and_idempotent(
+    tmp_path: Path, manga_pages: Path
+) -> None:
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    job_id = manager.create(
+        JobSpec(source=manga_pages, workspace=settings.data_root, engine="palette")
+    )
+    manager.process(job_id)
+
+    display = manager._job_dir(job_id) / "display" / "final" / "page_00000.webp"
+    assert display.is_file()
+    display.unlink()
+    assert manager.prebuild_display_assets_for_job(job_id) == 1
+    assert display.stat().st_size <= 900 * 1024
+    assert manager.prebuild_display_assets_for_job(job_id) == 0
 
 
 def test_page_ready_event_precedes_completed(tmp_path: Path, manga_pages: Path) -> None:
@@ -210,6 +276,11 @@ def test_failed_staged_repair_does_not_change_live_results(
 
     assert _sha256(first_page) == before
     assert not (manager._job_dir(job_id) / "repair-backups").exists()
+    reports = list((manager._job_dir(job_id) / "repair-reports").glob("*.json"))
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert report["status"] == "rolled_back"
+    assert report["live_results_preserved"] is True
 
 
 def test_pause_request_at_queue_boundary_does_not_start_job(

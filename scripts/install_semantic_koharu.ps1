@@ -84,5 +84,5 @@ $markerPath = Join-Path $modelRoot.FullName "semantic-model.json"
 $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $markerPath -Encoding UTF8
 $installedDirectory = Join-Path $modelRoot.Parent.Parent.FullName "installed"
 New-Item -ItemType Directory -Path $installedDirectory -Force | Out-Null
-$metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $installedDirectory "semantic-manga-v1.json") -Encoding UTF8
+$metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $installedDirectory "semantic-manga-v1-compatible.json") -Encoding UTF8
 Write-Output ($metadata | ConvertTo-Json -Depth 5)

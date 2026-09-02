@@ -20,7 +20,7 @@
       "purpose": "快速画风编辑和多参考图编辑"
     },
     {
-      "id": "semantic-manga-v1",
+      "id": "semantic-manga-v1-compatible",
       "name": "语义保护适配器（Koharu YOLO26s）",
       "repository": "mayocream/koharu-yolo26s",
       "revision": "aa7b56752bc91337e0af1e44ad08b4022c9a975b",
