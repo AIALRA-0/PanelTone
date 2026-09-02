@@ -21,23 +21,23 @@
     },
     {
       "id": "semantic-manga-v1",
-      "name": "语义分层接口（未发布权重）",
-      "repository": "未指定（项目预留插槽）",
-      "revision": "unreleased",
+      "name": "语义保护适配器（Koharu YOLO26s）",
+      "repository": "mayocream/koharu-yolo26s",
+      "revision": "aa7b56752bc91337e0af1e44ad08b4022c9a975b",
       "allow_patterns": [
         "*.json",
         "*.safetensors",
         "*.onnx",
-        "*.txt"
+        "*.txt",
+        "*.yaml"
       ],
-      "license": "未发布，待候选模型审查",
-      "license_url": "",
-      "memory": "候选模型确定后评估",
-      "download_size": "暂无，未发布权重",
+      "license": "Other（需遵守模型卡及上游数据集条款）",
+      "license_url": "https://huggingface.co/mayocream/koharu-yolo26s",
+      "memory": "独立本机 CUDA 环境，推理前按显存实测",
+      "download_size": "SafeTensors，约 11.5M 参数；下载前核对文件大小",
       "storage": "PanelTone 模型目录",
-      "purpose": "预留皮肤、头发、服装和身体部位分层接口；当前使用基础保护模式",
-      "downloadable": false,
-      "unavailable_reason": "这不是已发布模型，不对应可下载权重；完成来源、固定版本、许可证、哈希和基准审查后才会开放安装"
+      "purpose": "保护文字、气泡、版面和拟声词，并叠加确定性墨线与边框保护",
+      "downloadable": true
     }
   ]
 }

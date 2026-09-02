@@ -79,16 +79,16 @@ def border_mask(image: Image.Image) -> np.ndarray:
 def text_like_mask(image: Image.Image) -> np.ndarray:
     gray = np.asarray(image.convert("L"))
     dark = (gray < 120).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
-    result = np.zeros_like(dark)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
     page_area = image.width * image.height
-    for label in range(1, count):
-        _, _, width, height, area = stats[label]
-        if not 2 <= area <= max(24, page_area * 0.002):
-            continue
-        if height > image.height * 0.08 or width > image.width * 0.15:
-            continue
-        result[labels == label] = 1
+    valid = (
+        (stats[:, cv2.CC_STAT_AREA] >= 2)
+        & (stats[:, cv2.CC_STAT_AREA] <= max(24, page_area * 0.002))
+        & (stats[:, cv2.CC_STAT_HEIGHT] <= image.height * 0.08)
+        & (stats[:, cv2.CC_STAT_WIDTH] <= image.width * 0.15)
+    )
+    valid[0] = False
+    result = valid[labels].astype(np.uint8)
     return cv2.dilate(result, np.ones((7, 7), np.uint8), iterations=1).astype(bool)
 
 
@@ -98,17 +98,17 @@ def text_region_mask(image: Image.Image) -> np.ndarray:
     height, width = gray.shape
     page_area = height * width
     dark = (gray < 105).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
-    glyphs = np.zeros_like(dark)
-    for label in range(1, count):
-        x, y, component_width, component_height, area = stats[label]
-        if not 3 <= area <= max(1800, page_area * 0.0015):
-            continue
-        if component_width > width * 0.08 or component_height > height * 0.08:
-            continue
-        if component_width < 2 or component_height < 3:
-            continue
-        glyphs[labels == label] = 1
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    valid = (
+        (stats[:, cv2.CC_STAT_AREA] >= 3)
+        & (stats[:, cv2.CC_STAT_AREA] <= max(1800, page_area * 0.0015))
+        & (stats[:, cv2.CC_STAT_WIDTH] <= width * 0.08)
+        & (stats[:, cv2.CC_STAT_HEIGHT] <= height * 0.08)
+        & (stats[:, cv2.CC_STAT_WIDTH] >= 2)
+        & (stats[:, cv2.CC_STAT_HEIGHT] >= 3)
+    )
+    valid[0] = False
+    glyphs = valid[labels].astype(np.uint8)
 
     grouped = cv2.dilate(
         glyphs,

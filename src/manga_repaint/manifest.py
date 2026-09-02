@@ -360,6 +360,26 @@ class Manifest:
         result["descriptor"] = json.loads(result.pop("descriptor_json") or "{}")
         return result
 
+    def semantic_masks_for_job(self, job_id: str) -> dict[int, dict[str, Any]]:
+        """Return the newest persisted semantic descriptor for each page."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sm.*, p.page_index
+                FROM semantic_masks sm JOIN pages p ON p.id=sm.page_id
+                WHERE p.job_id=?
+                ORDER BY sm.id
+                """,
+                (job_id,),
+            ).fetchall()
+        result: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            item = dict(row)
+            page_index = int(item.pop("page_index"))
+            item["descriptor"] = json.loads(item.pop("descriptor_json") or "{}")
+            result[page_index] = item
+        return result
+
     def save_mask_correction(self, page_id: int, corrections: list[dict[str, Any]]) -> int:
         with self._lock, self.connect() as connection:
             cursor = connection.execute(
@@ -856,6 +876,25 @@ class Manifest:
                     "SELECT * FROM units WHERE page_id=? ORDER BY unit_index", (page_id,)
                 ).fetchall()
             ]
+
+    def page_units_for_job(self, job_id: str) -> dict[int, list[dict[str, Any]]]:
+        """Read every unit for a job with one query."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT u.*, p.page_index
+                FROM units u JOIN pages p ON p.id=u.page_id
+                WHERE p.job_id=?
+                ORDER BY p.page_index,u.unit_index
+                """,
+                (job_id,),
+            ).fetchall()
+        result: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            item = dict(row)
+            page_index = int(item.pop("page_index"))
+            result.setdefault(page_index, []).append(item)
+        return result
 
     def progress(self, job_id: str) -> dict[str, Any]:
         with self.connect() as connection:

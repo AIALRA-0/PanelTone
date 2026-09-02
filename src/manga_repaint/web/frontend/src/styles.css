@@ -976,3 +976,94 @@ button, input, select, textarea { font-size: 14px; }
 @media (max-width: 759px) {
   .text-size-button { display: none; }
 }
+
+/* Current interaction contract: collapsed sidebars release the whole track,
+   while the preview remains usable at tablet widths. */
+@media (min-width: 760px) {
+  .workspace { grid-template-columns: minmax(190px, 22vw) minmax(0, 1fr) minmax(250px, 28vw); }
+  .workspace.left-collapsed { grid-template-columns: 0 minmax(0, 1fr) minmax(250px, 28vw); }
+  .workspace.right-collapsed { grid-template-columns: minmax(190px, 22vw) minmax(0, 1fr) 0; }
+  .workspace.left-collapsed.right-collapsed { grid-template-columns: 0 minmax(0, 1fr) 0; }
+  .workspace.left-collapsed .library-panel,
+  .workspace.right-collapsed .inspector-panel {
+    width: 0;
+    min-width: 0;
+    border: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+  .workspace.left-collapsed .library-panel > *,
+  .workspace.right-collapsed .inspector-panel > * {
+    display: none !important;
+  }
+}
+
+.panel-heading > div { min-width: 0; }
+.panel-heading h1, .panel-heading h2,
+.choice-cards strong, .choice-cards small,
+.option-info, .setting-section > strong {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.choice-cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.choice-cards.styles, .choice-cards.profiles { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.choice-cards button { min-height: 70px; align-content: start; }
+.choice-cards.profiles button { min-height: 74px; }
+.field-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.dialog.import-dialog { grid-template-rows: auto minmax(0, 1fr) auto auto; }
+.upload-status { display: grid; gap: 5px; padding: 8px 20px; border-top: 1px solid var(--line); background: #fffdf3; color: var(--ink); }
+.upload-status > div { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.upload-status progress { width: 100%; height: 8px; accent-color: var(--ink); }
+
+/* The completed mark is round and the active/processing mark is square. */
+.status-shape.running { border-radius: 1px; background: var(--ink); }
+.status-shape.completed { border-radius: 50%; background: var(--ink); }
+.page-state { grid-template-columns: auto minmax(0, 1fr); align-items: center; }
+.page-state > small { grid-column: 2; }
+.page-state-mark { display: inline-grid; width: 12px; height: 12px; place-items: center; flex: 0 0 12px; border: 1px solid var(--ink); border-radius: 50%; font-style: normal; font-size: 8px; line-height: 1; }
+.page-state-mark.completed { border-radius: 50%; background: var(--ink); color: white; }
+.page-state-mark.processing { border-radius: 1px; background: var(--ink); color: white; }
+.page-state-mark.failed { border-radius: 1px; transform: rotate(45deg); background: transparent; }
+.page-state-mark.pending { border-style: dashed; }
+.filmstrip-pages > button i.page-state-mark { top: 2px; right: 2px; }
+
+/* Zoom and gestures are one canvas transform; the compare slider stays a
+   separate horizontal split control. */
+.canvas-gesture-zone { overflow: hidden; touch-action: none; user-select: none; cursor: grab; }
+.canvas-gesture-zone:active { cursor: grabbing; }
+.canvas.zoom-50 .single-page,
+.canvas.zoom-100 .single-page,
+.canvas.zoom-200 .single-page { width: auto; height: auto; max-width: 100%; max-height: 100%; }
+.canvas.zoom-50 .compare-stage,
+.canvas.zoom-100 .compare-stage,
+.canvas.zoom-200 .compare-stage { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+.canvas .single-page, .canvas .compare-stage img, .canvas .compare-result { transform-origin: center center; }
+.canvas .compare-stage img, .canvas .single-page { transition: transform 90ms ease-out; }
+.compare-result { transition: transform 90ms ease-out; }
+.page-navigation { display: inline-flex; align-items: center; gap: 3px; min-width: max-content; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.page-navigation .icon-button { width: 30px; height: 30px; min-height: 30px; }
+.page-navigation button:disabled { opacity: .35; cursor: not-allowed; }
+.zoom-controls { align-items: center; }
+.zoom-readout { min-width: 42px; padding: 0 5px; color: var(--muted); font-size: 11px; text-align: center; font-variant-numeric: tabular-nums; }
+.page-loading { position: absolute; z-index: 5; left: 50%; bottom: 18px; transform: translateX(-50%); display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid rgba(255,255,255,.35); border-radius: 6px; background: rgba(17,17,17,.82); color: white; font-size: 12px; pointer-events: none; }
+.page-loading .spinner { width: 15px; height: 15px; border-width: 2px; }
+.waiting-page { color: #e8e8e8; }
+.waiting-page strong { color: #ffffff; font-size: 16px; }
+.waiting-page span, .waiting-page small { color: #d3d3d3; }
+.model-stage-progress { display: grid; grid-template-columns: minmax(140px, 240px) auto; align-items: center; gap: 8px; width: min(90%, 360px); color: #e8e8e8; }
+.model-stage-progress progress { width: 100%; accent-color: #fff; }
+.model-stage-progress small { grid-column: 1 / -1; color: #d3d3d3; }
+.filmstrip.filmstrip-shell { height: 124px; }
+.filmstrip-viewport { padding: 8px 16px; }
+
+@media (max-width: 759px) {
+  .choice-cards, .choice-cards.styles, .choice-cards.profiles { grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); }
+  .field-grid { grid-template-columns: 1fr; }
+  .canvas-gesture-zone { overflow: hidden; }
+  .page-navigation { gap: 1px; font-size: 11px; }
+  .page-navigation .icon-button { width: 28px; height: 28px; }
+  .zoom-readout { display: none; }
+  .filmstrip-viewport { padding: 8px 10px; }
+  .upload-status { padding-inline: 14px; }
+  .dialog.import-dialog { grid-template-rows: auto minmax(0, 1fr) auto auto; }
+}

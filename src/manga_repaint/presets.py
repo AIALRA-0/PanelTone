@@ -145,6 +145,77 @@ STYLE_PRESETS = {
 }
 
 
+# These controls make the visible style choice affect both the model request
+# and the deterministic finishing pass.  They are deliberately conservative:
+# protection and source luminance remain authoritative over stylistic grading.
+STYLE_RENDER_PROFILES = {
+    "original_ink": {
+        "style_guidance": (
+            "clean original ink colouring, restrained chroma, minimal rendering change"
+        ),
+        "guidance_scale": 1.0,
+        "num_inference_steps": 4,
+        "saturation": 0.78,
+        "contrast": 0.98,
+        "hue_shift": 0.0,
+        "chroma_multiplier": 0.84,
+    },
+    "modern_anime": {
+        "style_guidance": (
+            "modern cel-shaded anime rendering, crisp separated flat colours and controlled shadows"
+        ),
+        "guidance_scale": 1.05,
+        "num_inference_steps": 5,
+        "saturation": 1.18,
+        "contrast": 1.06,
+        "hue_shift": 0.0,
+        "chroma_multiplier": 1.08,
+    },
+    "soft_painted": {
+        "style_guidance": (
+            "soft painted illustration, smooth material transitions and gentle brush texture"
+        ),
+        "guidance_scale": 1.0,
+        "num_inference_steps": 5,
+        "saturation": 0.94,
+        "contrast": 0.93,
+        "hue_shift": 0.0,
+        "chroma_multiplier": 1.0,
+    },
+    "watercolor": {
+        "style_guidance": (
+            "transparent watercolor wash, paper-like pigment variation and airy low-contrast colour"
+        ),
+        "guidance_scale": 0.98,
+        "num_inference_steps": 5,
+        "saturation": 0.80,
+        "contrast": 0.88,
+        "hue_shift": 0.0,
+        "chroma_multiplier": 0.84,
+    },
+    "dramatic_noir": {
+        "style_guidance": (
+            "dramatic noir cinema, high-contrast graphic lighting with sparse accent colours"
+        ),
+        "guidance_scale": 1.08,
+        "num_inference_steps": 5,
+        "saturation": 0.72,
+        "contrast": 1.16,
+        "hue_shift": 0.0,
+        "chroma_multiplier": 0.76,
+    },
+}
+
+COLOR_RENDER_PROFILES = {
+    "natural": {"saturation": 1.0, "contrast": 1.0, "hue_shift": 0.0},
+    "warm_cinematic": {"saturation": 1.02, "contrast": 1.02, "hue_shift": 5.0},
+    "cool_night": {"saturation": 0.92, "contrast": 1.04, "hue_shift": -10.0},
+    "vivid_anime": {"saturation": 1.14, "contrast": 1.04, "hue_shift": 0.0},
+    "pastel": {"saturation": 0.78, "contrast": 0.90, "hue_shift": 2.0},
+    "retro_print": {"saturation": 0.86, "contrast": 0.96, "hue_shift": 7.0},
+}
+
+
 def get_color_preset(preset_id: str) -> PromptPreset:
     try:
         return COLOR_PRESETS[preset_id]
@@ -157,6 +228,21 @@ def get_style_preset(preset_id: str) -> PromptPreset:
         return STYLE_PRESETS[preset_id]
     except KeyError as exc:
         raise ValueError(f"Unknown style preset: {preset_id}") from exc
+
+
+def render_profile(color_preset_id: str, style_preset_id: str) -> dict[str, float | int | str]:
+    if color_preset_id not in COLOR_RENDER_PROFILES:
+        raise ValueError(f"Unknown color preset: {color_preset_id}")
+    if style_preset_id not in STYLE_RENDER_PROFILES:
+        raise ValueError(f"Unknown style preset: {style_preset_id}")
+    style = STYLE_RENDER_PROFILES[style_preset_id]
+    color = COLOR_RENDER_PROFILES[color_preset_id]
+    return {
+        **style,
+        "saturation": float(style["saturation"]) * float(color["saturation"]),
+        "contrast": float(style["contrast"]) * float(color["contrast"]),
+        "hue_shift": float(style["hue_shift"]) + float(color["hue_shift"]),
+    }
 
 
 def build_prompt(

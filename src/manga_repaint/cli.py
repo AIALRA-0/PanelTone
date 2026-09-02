@@ -65,7 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--detail-mode", choices=[item.value for item in DetailMode], default="strict"
     )
-    create.add_argument("--output-format", choices=["cbz", "pdf", "images"], default="cbz")
+    create.add_argument(
+        "--output-format", choices=["cbz", "pdf", "images", "jpeg", "webp"], default="cbz"
+    )
     create.add_argument("--panel-mode", choices=["page", "detect"], default="page")
     create.add_argument("--seed", type=int, default=0)
     create.add_argument("--prompt", default="")

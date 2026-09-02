@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,6 +64,8 @@ class RawLogStore:
         self.max_bytes = max(1024 * 1024, max_bytes)
         self.backups = max(1, backups)
         self._lock = threading.RLock()
+        self._degraded_until = 0.0
+        self._degraded_notice_sent = False
         # Event IDs are sent to the browser as cursors.  Reusing ``1`` after
         # an application restart makes Last-Event-ID ambiguous and can cause
         # logs to disappear or be shown twice.  Recover the largest ID once at
@@ -145,9 +148,25 @@ class RawLogStore:
                 "utf-8"
             )
             path = self._path_for(component)
-            self._rotate(path, len(encoded))
-            with path.open("ab") as stream:
-                stream.write(encoded)
+            now = time.monotonic()
+            if now < self._degraded_until:
+                entry["dropped"] = True
+                return entry
+            try:
+                self._rotate(path, len(encoded))
+                with path.open("ab") as stream:
+                    stream.write(encoded)
+                self._degraded_notice_sent = False
+            except OSError as exc:
+                # Telemetry must never take down the API or turn one full disk
+                # into an error storm.  Keep the event in memory only and
+                # retry after a short backoff so normal operation can recover
+                # once space is freed.
+                self._degraded_until = now + 30.0
+                entry["dropped"] = True
+                if not self._degraded_notice_sent:
+                    logger.error("raw log store degraded: %s", exc)
+                    self._degraded_notice_sent = True
             return entry
 
     def _iter_paths(self) -> list[Path]:

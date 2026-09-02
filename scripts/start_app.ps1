@@ -1,7 +1,9 @@
 param(
     [int]$Port = 8765,
     [int]$ModelPort = 8781,
+    [int]$SemanticPort = 8782,
     [string]$ModelCachePath = "",
+    [string]$SemanticModelRootPath = "",
     [switch]$SkipModelService
 )
 
@@ -9,6 +11,10 @@ $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $engineConfig = Join-Path $projectRoot "configs\engines.example.json"
+$semanticPythonPath = Join-Path $projectRoot ".venv-semantic\Scripts\python.exe"
+if (-not $SemanticModelRootPath) {
+    $SemanticModelRootPath = Join-Path $env:LOCALAPPDATA "PanelTone\models\semantic\koharu-yolo26s"
+}
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     throw "Application environment is missing; install the project before starting"
@@ -62,6 +68,49 @@ if (-not $modelHealthy -and -not $SkipModelService -and (Test-Path -LiteralPath 
 }
 if (-not $modelHealthy) {
     Write-Warning "The model service is not ready; PanelTone will open so the model can be installed or reconnected"
+}
+
+# Keep the optional segmentation stack out of the main application environment
+# and bind it to loopback just like the diffusion service.
+$semanticHealthy = $false
+try {
+    $null = Invoke-RestMethod -Uri "http://127.0.0.1:$SemanticPort/health" -TimeoutSec 2
+    $semanticHealthy = $true
+} catch {
+    $semanticHealthy = $false
+}
+if (-not $semanticHealthy -and
+    (Test-Path -LiteralPath $semanticPythonPath) -and
+    (Test-Path -LiteralPath (Join-Path $SemanticModelRootPath "model.safetensors"))) {
+    $logDir = Join-Path $env:LOCALAPPDATA "PanelTone\logs"
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $semanticScript = Join-Path $PSScriptRoot "start_semantic_koharu.ps1"
+    $semanticArguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", "`"$semanticScript`"",
+        "-Port", $SemanticPort,
+        "-ModelRootPath", "`"$SemanticModelRootPath`""
+    )
+    Start-Process -FilePath "powershell.exe" -ArgumentList $semanticArguments -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $logDir "semantic.stdout.log") `
+        -RedirectStandardError (Join-Path $logDir "semantic.stderr.log")
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        Start-Sleep -Milliseconds 500
+        try {
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$SemanticPort/health" -TimeoutSec 2
+            $semanticHealthy = $true
+            break
+        } catch {
+            $semanticHealthy = $false
+        }
+    }
+}
+if ($semanticHealthy) {
+    $env:PANELTONE_SEMANTIC_URL = "http://127.0.0.1:$SemanticPort"
+} else {
+    Remove-Item Env:PANELTONE_SEMANTIC_URL -ErrorAction SilentlyContinue
+    Write-Warning "语义保护服务未连接；PanelTone 将使用确定性文字、气泡、墨线和边框保护"
 }
 
 # Bind to localhost so book pages and task metadata are not exposed to the network

@@ -75,7 +75,8 @@ def _lab_to_rgb_gamut_mapped(lab: np.ndarray) -> np.ndarray:
 
 
 def lab_l(image: Image.Image) -> np.ndarray:
-    return _rgb_to_lab(np.asarray(image.convert("RGB")))[..., 0]
+    rgb = np.asarray(image.convert("RGB"))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)[..., 0].astype(np.float32) * (100.0 / 255.0)
 
 
 def preserve_luminance_lab(
@@ -89,11 +90,60 @@ def preserve_luminance_lab(
     generated_rgb = np.asarray(
         generated.convert("RGB").resize(source.size, Image.Resampling.LANCZOS)
     )
-    source_lab = _rgb_to_lab(source_rgb)
-    generated_lab = _rgb_to_lab(generated_rgb)
-    generated_lab[..., 0] = source_lab[..., 0]
-    generated_lab[..., 1:] *= chroma_strength
-    return Image.fromarray(_lab_to_rgb_gamut_mapped(generated_lab), mode="RGB")
+    source_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB)
+    generated_lab = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2LAB)
+    target_l = source_lab[..., 0].astype(np.float32)
+    base_chroma = 128.0 + (
+        generated_lab[..., 1:].astype(np.float32) - 128.0
+    ) * chroma_strength
+    chroma_scale = np.ones(target_l.shape, dtype=np.float32)
+    result = generated_rgb
+
+    # OpenCV clips out-of-gamut Lab colours during the inverse conversion.  A
+    # single conversion therefore changes L substantially for saturated
+    # colours at the ends of the tonal range.  Reduce chroma only for those
+    # pixels and recheck the converted result; this keeps the fast vectorized
+    # path while retaining the source luminance contract.
+    for _ in range(8):
+        composed_lab = np.empty_like(source_lab)
+        composed_lab[..., 0] = source_lab[..., 0]
+        composed_lab[..., 1:] = np.clip(
+            128.0 + (base_chroma - 128.0) * chroma_scale[..., None],
+            0,
+            255,
+        ).astype(np.uint8)
+        result = cv2.cvtColor(composed_lab, cv2.COLOR_LAB2RGB)
+        result_l = cv2.cvtColor(result, cv2.COLOR_RGB2LAB)[..., 0].astype(
+            np.float32
+        )
+        out_of_tolerance = np.abs(result_l - target_l) > 1.0
+        if not out_of_tolerance.any():
+            break
+        chroma_scale[out_of_tolerance] *= 0.72
+    return Image.fromarray(result, mode="RGB")
+
+
+def apply_render_profile(
+    image: Image.Image,
+    *,
+    saturation: float = 1.0,
+    contrast: float = 1.0,
+    hue_shift: float = 0.0,
+) -> Image.Image:
+    """Apply a bounded style grade before source-protection composition."""
+    if not 0.0 <= saturation <= 2.5:
+        raise ValueError("Saturation must be between 0.0 and 2.5")
+    if not 0.5 <= contrast <= 1.5:
+        raise ValueError("Contrast must be between 0.5 and 1.5")
+    if not -180.0 <= hue_shift <= 180.0:
+        raise ValueError("Hue shift must be between -180 and 180 degrees")
+    rgb = np.asarray(image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0, 255)
+    hsv[..., 2] = np.clip((hsv[..., 2] - 127.5) * contrast + 127.5, 0, 255)
+    hsv[..., 0] = (hsv[..., 0] + hue_shift / 2.0) % 180.0
+    graded = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    return Image.fromarray(graded, mode="RGB")
 
 
 def composite_protected(
@@ -107,6 +157,21 @@ def composite_protected(
     )
     result = generated_array.copy()
     result[mask] = source_array[mask]
+    return Image.fromarray(result, mode="RGB")
+
+
+def replace_masked(
+    base: Image.Image,
+    replacement: Image.Image,
+    mask: np.ndarray,
+) -> Image.Image:
+    """Replace only the selected pixels while preserving the base elsewhere."""
+    base_array = np.asarray(base.convert("RGB"))
+    replacement_array = np.asarray(
+        replacement.convert("RGB").resize(base.size, Image.Resampling.LANCZOS)
+    )
+    result = base_array.copy()
+    result[mask] = replacement_array[mask]
     return Image.fromarray(result, mode="RGB")
 
 

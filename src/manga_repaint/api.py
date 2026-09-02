@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
+import httpx
 import numpy as np
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -64,7 +65,7 @@ class JobOptions(BaseModel):
     engine: str = "palette"
     protection: ProtectionMode = ProtectionMode.STRICT
     detail_mode: DetailMode = DetailMode.STRICT
-    output_format: Literal["cbz", "pdf", "images"] = "cbz"
+    output_format: Literal["cbz", "pdf", "images", "jpeg", "webp"] = "cbz"
     panel_mode: Literal["page", "detect"] = "page"
     seed: int = 0
     prompt: str = ""
@@ -221,11 +222,27 @@ def _option_payload() -> dict[str, list[dict[str, str]]]:
             },
             {
                 "id": "images",
-                "name": "PNG 图片",
-                "description": "保留逐页 PNG，不生成压缩包",
+                "name": "PNG 图片包",
+                "description": "保留逐页 PNG 并打包下载，不改变页面像素",
                 "best_for": "继续编辑和质量检查",
-                "changes": "不额外压缩页面",
-                "tradeoff": "需要自行管理文件夹",
+                "changes": "只改变下载容器格式",
+                "tradeoff": "下载后需要解压文件夹",
+            },
+            {
+                "id": "jpeg",
+                "name": "JPEG 图片包",
+                "description": "以高质量 JPEG 打包逐页图片，兼容性好",
+                "best_for": "通用图片查看和分享",
+                "changes": "页面改为高质量有损压缩",
+                "tradeoff": "细线和文字边缘可能有轻微压缩损失",
+            },
+            {
+                "id": "webp",
+                "name": "WEBP 图片包",
+                "description": "以无损 WEBP 打包逐页图片，体积更小",
+                "best_for": "现代浏览器和本地归档",
+                "changes": "页面编码为无损 WEBP",
+                "tradeoff": "部分旧阅读器不支持 WEBP",
             },
         ],
     }
@@ -1928,11 +1945,12 @@ def create_app(
         try:
             manifest = manager._manifest(job_id)
             pages = manifest.pages(job_id)
+            units_by_page = manifest.page_units_for_job(job_id)
+            semantic_by_page = manifest.semantic_masks_for_job(job_id)
             result: list[dict[str, Any]] = []
 
             for page in pages:
-                page_id = int(page["id"])
-                units = manifest.page_units(int(page["id"]))
+                units = units_by_page.get(int(page["page_index"]), [])
                 source_path = Path(page["source_path"])
                 thumbnail_path = (
                     manager._job_dir(job_id)
@@ -1954,22 +1972,6 @@ def create_app(
                 )
                 output_path = Path(page["output_path"] or "")
                 has_final = bool(page["output_path"] and output_path.is_file())
-                # A browser can reconnect after the one-shot preview event was
-                # emitted.  Rebuild a non-export preview on demand when unit
-                # results already exist, so a completed panel is never hidden
-                # behind the untouched source image just because an SSE event
-                # was missed.  This path is deliberately limited to pages
-                # without a final output and never changes manifest state.
-                if not has_final and not preview_path.is_file():
-                    try:
-                        manager._assemble_page_preview(job_id, manifest, page_id)
-                    except (OSError, ValueError) as exc:
-                        logger.warning(
-                            "preview recovery failed job=%s page=%s: %s",
-                            job_id,
-                            int(page["page_index"]) + 1,
-                            exc,
-                        )
                 revision = page.get("asset_revision")
                 if not revision:
                     candidates = [
@@ -1988,9 +1990,7 @@ def create_app(
                         if candidates
                         else None
                     )
-                    if revision:
-                        manifest.set_page_asset_revision(page_id, revision)
-                semantic_row = manifest.semantic_mask(page_id)
+                semantic_row = semantic_by_page.get(int(page["page_index"]))
                 semantic_descriptor_payload = (
                     dict(semantic_row.get("descriptor") or {}) if semantic_row else None
                 )
@@ -2201,6 +2201,10 @@ def create_app(
                     / "pages"
                     / f"page_{page_index:05d}.png"
                 )
+                if not path.is_file():
+                    recovered = manager._assemble_page_preview(job_id, manifest, int(page["id"]))
+                    if recovered is not None:
+                        path = recovered
             elif variant == "mask":
                 units = manifest.page_units(int(page["id"]))
                 if not units:
@@ -2247,12 +2251,28 @@ def create_app(
             output_dir = manager._job_dir(job_id) / "output"
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="找不到这个任务") from exc
-        outputs = list(output_dir.glob("book.*"))
+        outputs = sorted(
+            (
+                path
+                for path in output_dir.glob("book*")
+                if path.is_file() and path.name in {
+                    "book.cbz",
+                    "book.pdf",
+                    "book-images.zip",
+                    "book-jpeg.zip",
+                    "book-webp.zip",
+                }
+            ),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
         if not outputs:
             raise HTTPException(status_code=404, detail="整本成品尚不可用")
-        media_type = {".cbz": "application/vnd.comicbook+zip", ".pdf": "application/pdf"}.get(
-            outputs[0].suffix.casefold(), "application/octet-stream"
-        )
+        media_type = {
+            ".cbz": "application/vnd.comicbook+zip",
+            ".pdf": "application/pdf",
+            ".zip": "application/zip",
+        }.get(outputs[0].suffix.casefold(), "application/octet-stream")
         return FileResponse(outputs[0], filename=outputs[0].name, media_type=media_type)
 
     @app.get("/api/models")
@@ -2278,6 +2298,17 @@ def create_app(
                 None,
             )
             connected = descriptor["repository"] in connected_repositories
+            if descriptor["id"] == "semantic-manga-v1":
+                semantic_url = getattr(manager.semantic_engine, "base_url", "")
+                if semantic_url:
+                    try:
+                        semantic_response = httpx.get(f"{semantic_url}/health", timeout=2)
+                        semantic_payload = semantic_response.json()
+                        connected = bool(
+                            semantic_response.is_success and semantic_payload.get("available")
+                        )
+                    except (httpx.HTTPError, ValueError):
+                        connected = False
             item["installed"] = marker.is_file()
             item["connected"] = connected
             item["supports_interrupt"] = bool(
@@ -2301,11 +2332,16 @@ def create_app(
             from huggingface_hub import snapshot_download
 
             descriptor = next(item for item in model_catalog["models"] if item["id"] == model_id)
+            local_dir = None
+            if model_id == "semantic-manga-v1":
+                local_dir = settings.model_root / "semantic" / "koharu-yolo26s"
+                local_dir.mkdir(parents=True, exist_ok=True)
             snapshot_path = snapshot_download(
                 repo_id=descriptor["repository"],
                 revision=descriptor["revision"],
                 cache_dir=settings.model_root / "hub",
                 allow_patterns=descriptor.get("allow_patterns"),
+                local_dir=local_dir,
             )
             marker = settings.model_root / "installed" / f"{model_id}.json"
             marker.parent.mkdir(parents=True, exist_ok=True)

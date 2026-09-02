@@ -9,6 +9,7 @@ from manga_repaint.color import (
     lab_l,
     preserve_ink_overlay,
     preserve_luminance_lab,
+    replace_masked,
 )
 
 
@@ -20,6 +21,18 @@ def test_protected_pixels_are_exact() -> None:
     result = np.asarray(composite_protected(source, generated, mask))
     assert np.all(result[mask] == 255)
     assert np.all(result[~mask] == np.array([30, 120, 220]))
+
+
+def test_replace_masked_preserves_base_outside_uncertain_region() -> None:
+    base = Image.new("RGB", (20, 20), (20, 30, 40))
+    replacement = Image.new("RGB", (20, 20), (220, 180, 90))
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[5:15, 5:15] = True
+
+    result = np.asarray(replace_masked(base, replacement, mask))
+
+    assert np.all(result[mask] == np.array([220, 180, 90]))
+    assert np.all(result[~mask] == np.array([20, 30, 40]))
 
 
 def test_lab_composition_keeps_luminance_close() -> None:

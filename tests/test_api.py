@@ -7,6 +7,7 @@ import types
 import zipfile
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -66,6 +67,38 @@ def test_api_create_run_and_download(tmp_path: Path, manga_pages: Path) -> None:
             "application/vnd.comicbook+zip",
             "application/zip",
         }
+
+
+@pytest.mark.parametrize(
+    ("output_format", "content_type"),
+    [
+        ("pdf", "application/pdf"),
+        ("images", "application/zip"),
+        ("jpeg", "application/zip"),
+        ("webp", "application/zip"),
+    ],
+)
+def test_api_download_supports_all_image_exports(
+    tmp_path: Path, manga_pages: Path, output_format: str, content_type: str
+) -> None:
+    app = create_app(Settings(data_root=tmp_path / "jobs"), EngineRegistry())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs?auto_start=false",
+            json={
+                "source": str(manga_pages),
+                "engine": "palette",
+                "output_format": output_format,
+            },
+        )
+        assert response.status_code == 202
+        job_id = response.json()["job_id"]
+        assert wait_operation(client, response.json()["progress_url"])["status"] == "completed"
+        app.state.manager.process(job_id)
+
+        download = client.get(f"/api/jobs/{job_id}/download")
+        assert download.status_code == 200
+        assert download.headers["content-type"] == content_type
 
 
 def test_api_presets_and_local_upload(tmp_path: Path) -> None:
@@ -255,7 +288,9 @@ def test_batch_rejects_duplicate_image_order_and_invalid_event_cursor(tmp_path: 
     assert client.get("/api/events", headers={"Last-Event-ID": "not-a-number"}).status_code == 400
 
 
-def test_pages_endpoint_recovers_missed_live_preview(tmp_path: Path, manga_pages: Path) -> None:
+def test_preview_endpoint_recovers_missed_live_preview(
+    tmp_path: Path, manga_pages: Path, monkeypatch
+) -> None:
     app = create_app(
         Settings(data_root=tmp_path / "jobs", qa_line_f1_min=1.1), EngineRegistry()
     )
@@ -274,11 +309,22 @@ def test_pages_endpoint_recovers_missed_live_preview(tmp_path: Path, manga_pages
     # already generated unit output without turning it into an export result.
     preview_path.unlink()
 
-    response = client.get(f"/api/jobs/{job_id}/pages")
+    def fail_if_listing_writes(*_args, **_kwargs):
+        raise AssertionError("page listing must not update the manifest")
+
+    monkeypatch.setattr(
+        type(app.state.manager._manifest(job_id)),
+        "set_page_asset_revision",
+        fail_if_listing_writes,
+    )
+    listing = client.get(f"/api/jobs/{job_id}/pages")
+    assert listing.status_code == 200
+    assert listing.json()[0]["preview_url"] is None
+
+    monkeypatch.undo()
+    response = client.get(f"/api/jobs/{job_id}/pages/0/preview")
     assert response.status_code == 200
-    page = response.json()[0]
-    assert page["preview_only"] is True
-    assert page["preview_url"].startswith(f"/api/jobs/{job_id}/pages/0/preview")
+    assert response.headers["content-type"].startswith("image/png")
     assert preview_path.is_file()
 
 

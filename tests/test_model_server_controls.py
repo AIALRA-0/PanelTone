@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+from PIL import Image
+
 from manga_repaint import __version__
 from manga_repaint.model_server import Flux2Runtime, app
 
@@ -55,4 +57,50 @@ def test_runtime_releases_pipeline_after_idle_grace_period() -> None:
 
     assert result["status"] == "released"
     assert runtime._pipeline is None
+    runtime.shutdown()
+
+
+def test_runtime_forwards_negative_mode_and_style_metadata() -> None:
+    class FakePipeline:
+        def __init__(self) -> None:
+            self.received = {}
+
+        def __call__(
+            self,
+            image,
+            prompt,
+            height,
+            width,
+            guidance_scale,
+            num_inference_steps,
+            generator,
+            negative_prompt,
+        ):
+            self.received = locals()
+            return type("Output", (), {"images": [Image.new("RGB", (width, height), "white")]})()
+
+    runtime = Flux2Runtime()
+    runtime.device = "cpu"
+    runtime._pipeline = FakePipeline()
+    runtime.state = "ready"
+    runtime.generate(
+        Image.new("RGB", (32, 32), "white"),
+        [],
+        "base prompt",
+        7,
+        negative_prompt="bleeding colours",
+        mode="style_full",
+        metadata={
+            "style_guidance": "graphic cel shading",
+            "guidance_scale": 1.2,
+            "num_inference_steps": 6,
+        },
+    )
+
+    received = runtime._pipeline.received
+    assert received["negative_prompt"] == "bleeding colours"
+    assert "graphic cel shading" in received["prompt"]
+    assert "clearly different rendering style" in received["prompt"]
+    assert received["guidance_scale"] == 1.2
+    assert received["num_inference_steps"] == 6
     runtime.shutdown()

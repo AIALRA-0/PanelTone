@@ -15,7 +15,14 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from .color import composite_protected, composite_strict_colorization, preserve_ink_overlay
+from .color import (
+    apply_render_profile,
+    composite_protected,
+    composite_strict_colorization,
+    preserve_ink_overlay,
+    preserve_luminance_lab,
+    replace_masked,
+)
 from .config import Settings, ensure_allowed_path
 from .engines import EngineInterrupted, EngineRegistry, EngineRequest
 from .export import export_book
@@ -28,14 +35,15 @@ from .masks import (
     ink_detail_mask,
     save_mask,
 )
-from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode
+from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode, UnitStatus
 from .panels import extract_panels
-from .presets import build_prompt, get_color_preset, get_style_preset
+from .presets import build_prompt, get_color_preset, get_style_preset, render_profile
 from .qa import evaluate
 from .semantic import (
     ConservativeSemanticMaskEngine,
     SemanticMaskEngine,
     SemanticMaskResult,
+    configured_semantic_engine,
     semantic_descriptor,
 )
 
@@ -70,7 +78,8 @@ class ProjectManager:
         # browser refresh.  Serialize the tiny disk write so a refresh cannot
         # observe a partially-written preview or race the temporary file.
         self._preview_lock = threading.RLock()
-        self.semantic_engine = semantic_engine or ConservativeSemanticMaskEngine()
+        self.semantic_engine = semantic_engine or configured_semantic_engine(settings.model_root)
+        self._semantic_fallback = ConservativeSemanticMaskEngine()
         self._semantic_cache: dict[tuple[str, int], SemanticMaskResult] = {}
         # Semantic masks are persisted on disk and can be large for a full
         # book. Keep only a tiny hot cache so a 300-page run cannot retain one
@@ -697,16 +706,53 @@ class ProjectManager:
             hints.append(f"{label} {region} uses base color {color}{suffix}")
         return "Locked color records: " + "; ".join(hints)
 
-    def _corrected_unit_mask(self, job_id: str, unit: dict[str, Any]) -> np.ndarray:
+    def _corrected_unit_masks(
+        self, job_id: str, unit: dict[str, Any]
+    ) -> tuple[np.ndarray, np.ndarray]:
         with Image.open(unit["mask_path"]) as mask_image:
             mask = np.asarray(mask_image.convert("L")) > 0
         page_id = int(unit["page_id"])
         corrections = self._manifest(job_id).mask_corrections(page_id)
-        return apply_mask_corrections(
+        corrected = apply_mask_corrections(
             mask,
             corrections,
             offset=(int(unit["x"]), int(unit["y"])),
         )
+        try:
+            semantic = self.semantic_page(job_id, int(unit["page_index"]))
+            x, y = int(unit["x"]), int(unit["y"])
+            height, width = corrected.shape
+            if (
+                x < 0
+                or y < 0
+                or width <= 0
+                or height <= 0
+                or y + height > semantic.confidence.shape[0]
+                or x + width > semantic.confidence.shape[1]
+            ):
+                raise ValueError("semantic crop falls outside the page")
+            protected = np.zeros_like(corrected)
+            for name in ("text", "bubbles", "borders", "ink"):
+                page_mask = semantic.masks.get(name)
+                if page_mask is not None:
+                    crop = page_mask[y : y + height, x : x + width]
+                    if crop.shape != corrected.shape:
+                        raise ValueError(f"semantic {name} crop shape mismatch")
+                    protected |= crop
+            uncertain = semantic.uncertain[y : y + height, x : x + width]
+            if uncertain.shape != corrected.shape:
+                raise ValueError("semantic uncertainty crop shape mismatch")
+            corrected |= protected
+        except (KeyError, OSError, ValueError, RuntimeError) as exc:
+            logger.warning(
+                "semantic unit mask unavailable job=%s page=%s unit=%s: %s",
+                job_id,
+                int(unit["page_index"]) + 1,
+                int(unit["unit_index"]) + 1,
+                exc,
+            )
+            uncertain = np.zeros_like(corrected)
+        return corrected, uncertain
 
     def _compose_unit(
         self,
@@ -714,6 +760,7 @@ class ProjectManager:
         generated: Image.Image,
         mask: np.ndarray,
         spec: JobSpec,
+        uncertain_mask: np.ndarray | None = None,
     ) -> tuple[Image.Image, np.ndarray]:
         """Compose one generated unit and return its QA protection mask.
 
@@ -722,7 +769,14 @@ class ProjectManager:
         normal GPU run, including balanced and generative detail modes.
         """
         source_rgb = source.convert("RGB")
-        generated_rgb = generated.convert("RGB")
+        profile = render_profile(spec.color_preset, spec.style_preset)
+        generated_rgb = apply_render_profile(
+            generated.convert("RGB"),
+            saturation=float(profile["saturation"]),
+            contrast=float(profile["contrast"]),
+            hue_shift=float(profile["hue_shift"]),
+        )
+        effective_chroma = spec.chroma_strength * float(profile["chroma_multiplier"])
         if (
             spec.mode == JobMode.STYLE_FULL
             or not spec.preserve_ink
@@ -750,8 +804,14 @@ class ProjectManager:
                 source_rgb,
                 generated_rgb,
                 mask,
-                chroma_strength=spec.chroma_strength,
+                chroma_strength=effective_chroma,
             )
+        # A semantic provider may explicitly mark pixels as uncertain.  Keep
+        # their source luminance even in the more permissive detail modes so a
+        # weak segmentation result cannot create large, flat colour blocks.
+        if uncertain_mask is not None and uncertain_mask.any():
+            luminance_safe = preserve_luminance_lab(source_rgb, final, effective_chroma)
+            final = replace_masked(final, luminance_safe, uncertain_mask)
         qa_mask = mask
         if spec.preserve_ink and spec.mode != JobMode.STYLE_FULL:
             qa_mask = np.logical_or(mask, ink_detail_mask(source_rgb, threshold=64))
@@ -999,7 +1059,13 @@ class ProjectManager:
                             ),
                             references=spec.style_references,
                             attempt=attempts_used,
-                            metadata=spec.metadata,
+                            metadata={
+                                **spec.metadata,
+                                "style_preset": spec.style_preset,
+                                "color_preset": spec.color_preset,
+                                "detail_mode": spec.detail_mode.value,
+                                **render_profile(spec.color_preset, spec.style_preset),
+                            },
                         )
                         cached_generated = Path(unit["generated_path"] or "")
                         can_reuse_generated = (
@@ -1062,9 +1128,9 @@ class ProjectManager:
                             Image.open(source_path) as source_image,
                             Image.open(generated_path) as generated_image,
                         ):
-                            mask = self._corrected_unit_mask(job_id, unit)
+                            mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
                             final, qa_mask = self._compose_unit(
-                                source_image, generated_image, mask, spec
+                                source_image, generated_image, mask, spec, uncertain_mask
                             )
                             source_rgb = source_image.convert("RGB")
                             final.save(final_path, format="PNG")
@@ -1301,9 +1367,16 @@ class ProjectManager:
             return None
         with Image.open(page["source_path"]) as source:
             canvas = source.convert("RGB")
-        for unit in units:
-            with Image.open(unit["final_path"]) as result:
-                canvas.paste(result.convert("RGB"), (unit["x"], unit["y"]))
+        valid_units = self._paste_units_safely(canvas, units, job_id=job_id)
+        if valid_units != len(units):
+            logger.error(
+                "page assembly rejected job=%s page=%s valid_units=%s total_units=%s",
+                job_id,
+                page["page_index"],
+                valid_units,
+                len(units),
+            )
+            return None
         output = self._job_dir(job_id) / "final" / "pages" / f"page_{page['page_index']:05d}.png"
         output.parent.mkdir(parents=True, exist_ok=True)
         canvas.save(output, format="PNG")
@@ -1331,7 +1404,7 @@ class ProjectManager:
             page = next(item for item in manifest.pages(job_id) if int(item["id"]) == page_id)
             units = manifest.page_units(page_id)
             available = [
-                unit
+                dict(unit)
                 for unit in units
                 if unit["final_path"] and Path(unit["final_path"]).is_file()
             ]
@@ -1339,9 +1412,7 @@ class ProjectManager:
                 return None
             with Image.open(page["source_path"]) as source:
                 canvas = source.convert("RGB")
-            for unit in available:
-                with Image.open(unit["final_path"]) as result:
-                    canvas.paste(result.convert("RGB"), (int(unit["x"]), int(unit["y"])))
+            self._paste_units_safely(canvas, available, job_id=job_id)
             page_index = int(page["page_index"])
             output = (
                 self._job_dir(job_id)
@@ -1369,6 +1440,67 @@ class ProjectManager:
             manifest.set_page_asset_revision(page_id, str(time.time_ns()))
             return output
 
+    def _paste_units_safely(
+        self, canvas: Image.Image, units: list[dict[str, Any]], *, job_id: str
+    ) -> int:
+        """Paste panel results without clipping, resizing, or double painting.
+
+        PIL silently clips a paste that runs outside the page.  That behavior
+        can turn one bad crop into a cross-panel colour block, so every unit is
+        checked first.  Overlapping padded crops keep the first writer's pixels
+        and leave the source image visible for any invalid unit.
+        """
+        page_width, page_height = canvas.size
+        occupied = np.zeros((page_height, page_width), dtype=bool)
+        valid = 0
+        for unit in units:
+            try:
+                x, y = int(unit["x"]), int(unit["y"])
+                width, height = int(unit["width"]), int(unit["height"])
+                final_path = Path(unit["final_path"] or "")
+                if (
+                    width <= 0
+                    or height <= 0
+                    or x < 0
+                    or y < 0
+                    or x + width > page_width
+                    or y + height > page_height
+                    or not final_path.is_file()
+                ):
+                    raise ValueError("panel bounds or result path invalid")
+                with Image.open(final_path) as result:
+                    result_rgb = result.convert("RGB")
+                    if result_rgb.size != (width, height):
+                        raise ValueError(
+                            f"result size {result_rgb.size} != crop {(width, height)}"
+                        )
+                    target = occupied[y : y + height, x : x + width]
+                    write_mask = ~target
+                    if not write_mask.all():
+                        logger.warning(
+                            "overlapping panel crop kept first result job=%s page=%s unit=%s",
+                            job_id,
+                            unit.get("page_index"),
+                            unit.get("unit_index"),
+                        )
+                    if write_mask.any():
+                        canvas.paste(
+                            result_rgb,
+                            (x, y),
+                            Image.fromarray((write_mask.astype(np.uint8) * 255), mode="L"),
+                        )
+                        target[write_mask] = True
+                valid += 1
+            except (OSError, TypeError, ValueError, KeyError) as exc:
+                logger.error(
+                    "invalid panel result left as source job=%s page=%s unit=%s: %s",
+                    job_id,
+                    unit.get("page_index"),
+                    unit.get("unit_index"),
+                    exc,
+                )
+        return valid
+
     def repair_completed_colorization(
         self,
         job_id: str,
@@ -1386,6 +1518,10 @@ class ProjectManager:
         total_pages = len(pages)
         for page_number, page in enumerate(pages, start=1):
             for unit in manifest.page_units(int(page["id"])):
+                # page_units(page_id) intentionally returns only unit columns;
+                # carry the already-known page index into the shared mask path
+                # so semantic crops and diagnostics address the right page.
+                unit = {**unit, "page_index": int(page["page_index"])}
                 generated_path = Path(unit["generated_path"] or "")
                 source_path = Path(unit["source_path"])
                 final_path = Path(unit["final_path"] or "")
@@ -1399,9 +1535,9 @@ class ProjectManager:
                     Image.open(source_path) as source_image,
                     Image.open(generated_path) as generated_image,
                 ):
-                    mask = self._corrected_unit_mask(job_id, unit)
+                    mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
                     final, qa_mask = self._compose_unit(
-                        source_image, generated_image, mask, spec
+                        source_image, generated_image, mask, spec, uncertain_mask
                     )
                     source_rgb = source_image.convert("RGB")
                     final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1482,6 +1618,34 @@ class ProjectManager:
                     )
             if progress_callback is not None:
                 progress_callback(int(page["page_index"]), page_number, total_pages)
+        if repaired:
+            output_pages = [
+                Path(page["output_path"])
+                for page in manifest.pages(job_id)
+                if page["output_path"] and Path(page["output_path"]).is_file()
+            ]
+            all_units_passed = all(
+                unit["status"] == UnitStatus.QA_PASSED.value
+                for page in manifest.pages(job_id)
+                for unit in manifest.page_units(int(page["id"]))
+            )
+            if len(output_pages) == total_pages and all_units_passed:
+                output_dir = self._job_dir(job_id) / "output"
+                staging_dir = output_dir / f".repair-export-{uuid.uuid4().hex}"
+                try:
+                    temporary_output = export_book(output_pages, staging_dir, spec.output_format)
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    repaired_output = output_dir / temporary_output.name
+                    temporary_output.replace(repaired_output)
+                    manifest.add_event(
+                        job_id,
+                        "book_exported",
+                        {"path": str(repaired_output), "reason": "results_repaired"},
+                    )
+                except Exception:
+                    logger.exception("job=%s repaired pages but book export failed", job_id)
+                finally:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
         return repaired
 
     def _assemble_pages(self, job_id: str, manifest: Manifest) -> list[Path]:
@@ -1494,11 +1658,13 @@ class ProjectManager:
                 units = connection.execute(
                     "SELECT * FROM units WHERE page_id=? ORDER BY unit_index", (page_id,)
                 ).fetchall()
-            for unit in units:
-                if unit["status"] != "qa_passed" or not unit["final_path"]:
-                    raise RuntimeError(f"Page {page['page_index']} has unfinished units")
-                with Image.open(unit["final_path"]) as result:
-                    canvas.paste(result.convert("RGB"), (unit["x"], unit["y"]))
+            if any(unit["status"] != "qa_passed" or not unit["final_path"] for unit in units):
+                raise RuntimeError(f"Page {page['page_index']} has unfinished units")
+            valid_units = self._paste_units_safely(
+                canvas, [dict(unit) for unit in units], job_id=job_id
+            )
+            if valid_units != len(units):
+                raise RuntimeError(f"Page {page['page_index']} has invalid panel results")
             output = (
                 self._job_dir(job_id) / "final" / "pages" / f"page_{page['page_index']:05d}.png"
             )
@@ -1670,7 +1836,19 @@ class ProjectManager:
         if page is None:
             raise KeyError(f"Unknown page: {page_index}")
         with Image.open(page["source_path"]) as source:
-            result = self.semantic_engine.segment(source)
+            try:
+                result = self.semantic_engine.segment(source)
+                engine = self.semantic_engine
+            except Exception as exc:
+                logger.warning(
+                    "semantic provider unavailable job=%s page=%s; "
+                    "using deterministic fallback: %s",
+                    job_id,
+                    page_index + 1,
+                    exc,
+                )
+                result = self._semantic_fallback.segment(source)
+                engine = self._semantic_fallback
         semantic_dir = self._job_dir(job_id) / "masks" / "semantic" / f"page_{page_index:05d}"
         semantic_dir.mkdir(parents=True, exist_ok=True)
         for name, mask in result.masks.items():
@@ -1685,7 +1863,7 @@ class ProjectManager:
             int(page["id"]),
             provider=result.provider,
             version=result.version,
-            descriptor=semantic_descriptor(self.semantic_engine, result),
+            descriptor=semantic_descriptor(engine, result),
             confidence_path=confidence_path,
             uncertain_path=uncertain_path,
         )

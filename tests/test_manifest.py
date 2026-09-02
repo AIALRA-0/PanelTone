@@ -73,3 +73,39 @@ def test_paused_job_with_stale_running_unit_reports_paused_stage(tmp_path: Path)
     manifest.set_job_status("paused", JobStatus.PAUSED)
 
     assert manifest.progress("paused")["stage"] == "paused"
+
+
+def test_manifest_bulk_page_reads_group_units_and_latest_semantic_rows(tmp_path: Path) -> None:
+    manifest = Manifest(tmp_path / "manifest.sqlite")
+    manifest.create_job("bulk", JobSpec(source=tmp_path, workspace=tmp_path))
+    source = tmp_path / "source.png"
+    mask = tmp_path / "mask.png"
+    source.write_bytes(b"source")
+    mask.write_bytes(b"mask")
+    first_page = manifest.add_page("bulk", 0, source, "sha0", 10, 10)
+    second_page = manifest.add_page("bulk", 1, source, "sha1", 10, 10)
+    manifest.add_unit(first_page, 0, PanelBox(0, 0, 10, 10), "palette", "p0", source, mask)
+    manifest.add_unit(second_page, 0, PanelBox(0, 0, 10, 10), "palette", "p1", source, mask)
+    manifest.save_semantic_mask(
+        first_page,
+        provider="deterministic-protection",
+        version="1",
+        descriptor={"status": "fallback"},
+        confidence_path=None,
+        uncertain_path=None,
+    )
+    manifest.save_semantic_mask(
+        first_page,
+        provider="semantic-manga-v1-compatible/koharu-yolo26s",
+        version="koharu-yolo26s",
+        descriptor={"status": "ready"},
+        confidence_path=None,
+        uncertain_path=None,
+    )
+
+    units = manifest.page_units_for_job("bulk")
+    semantic = manifest.semantic_masks_for_job("bulk")
+
+    assert [item["unit_index"] for item in units[0]] == [0]
+    assert [item["unit_index"] for item in units[1]] == [0]
+    assert semantic[0]["descriptor"] == {"status": "ready"}

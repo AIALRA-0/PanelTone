@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import inspect
 import io
+import json
 import logging
 import os
 import threading
@@ -105,7 +106,17 @@ class Flux2Runtime:
                 logger.exception("model load failed model=%s", self.model_id)
                 raise
 
-    def generate(self, source: Image.Image, references: list[Image.Image], prompt: str, seed: int):
+    def generate(
+        self,
+        source: Image.Image,
+        references: list[Image.Image],
+        prompt: str,
+        seed: int,
+        *,
+        negative_prompt: str = "",
+        mode: str = "style_locked",
+        metadata: dict[str, object] | None = None,
+    ):
         import torch
 
         width = max(256, min(1536, round(source.width / 16) * 16))
@@ -120,6 +131,33 @@ class Flux2Runtime:
             self._active_requests += 1
             self.last_activity = time.time()
             try:
+                metadata = metadata or {}
+                style_guidance = str(metadata.get("style_guidance") or "").strip()
+                if style_guidance:
+                    prompt = f"{prompt.rstrip('. ')}. {style_guidance}"
+                mode_guidance = {
+                    "colorize": (
+                        "Keep the original drawing and only add believable colour and light."
+                    ),
+                    "style_locked": (
+                        "Keep the exact drawing, layout and identities while changing "
+                        "rendering style."
+                    ),
+                    "style_full": (
+                        "Use a clearly different rendering style but keep content and "
+                        "layout recognizable."
+                    ),
+                }.get(mode)
+                if mode_guidance:
+                    prompt = f"{prompt.rstrip('. ')}. {mode_guidance}"
+                try:
+                    guidance_scale = min(20.0, max(0.0, float(metadata.get("guidance_scale", 1.0))))
+                except (TypeError, ValueError):
+                    guidance_scale = 1.0
+                try:
+                    inference_steps = min(100, max(1, int(metadata.get("num_inference_steps", 4))))
+                except (TypeError, ValueError):
+                    inference_steps = 4
                 call_kwargs = {
                     "image": images if len(images) > 1 else images[0],
                     "prompt": prompt
@@ -130,8 +168,8 @@ class Flux2Runtime:
                     ),
                     "height": height,
                     "width": width,
-                    "guidance_scale": 1.0,
-                    "num_inference_steps": 4,
+                    "guidance_scale": guidance_scale,
+                    "num_inference_steps": inference_steps,
                     "generator": torch.Generator(device=self.device).manual_seed(seed),
                 }
                 # Diffusers has used two callback spellings across releases.  Add
@@ -141,6 +179,18 @@ class Flux2Runtime:
                     parameters = inspect.signature(pipeline.__call__).parameters
                 except (TypeError, ValueError):
                     parameters = {}
+                if "negative_prompt" in parameters and negative_prompt.strip():
+                    call_kwargs["negative_prompt"] = negative_prompt.strip()
+                elif negative_prompt.strip():
+                    # Some FLUX pipelines do not expose classifier-free
+                    # negative conditioning.  Keep the constraint visible in
+                    # the prompt instead of silently discarding it.
+                    call_kwargs["prompt"] = (
+                        f"{call_kwargs['prompt']}. Avoid {negative_prompt.strip()}"
+                    )
+                for name in ("guidance_scale", "num_inference_steps"):
+                    if name not in parameters:
+                        call_kwargs.pop(name, None)
                 if "callback_on_step_end" in parameters:
                     call_kwargs["callback_on_step_end"] = self._step_callback
                     if "callback_on_step_end_tensor_inputs" in parameters:
@@ -299,7 +349,12 @@ def generate(
     mode: Annotated[str, Form()] = "style_locked",
     metadata_json: Annotated[str, Form()] = "{}",
 ) -> Response:
-    del negative_prompt, mode, metadata_json
+    try:
+        metadata = json.loads(metadata_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="模型参数 JSON 无效") from exc
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="模型参数必须是对象")
     source_image = Image.open(io.BytesIO(source.file.read())).convert("RGB")
     reference_images = []
     for reference in references or []:
@@ -314,7 +369,15 @@ def generate(
         seed,
     )
     try:
-        result = runtime.generate(source_image, reference_images, prompt, seed)
+        result = runtime.generate(
+            source_image,
+            reference_images,
+            prompt,
+            seed,
+            negative_prompt=negative_prompt,
+            mode=mode,
+            metadata=metadata,
+        )
     except GenerationInterrupted as exc:
         logger.info("generation interrupted model=%s", runtime.model_id)
         raise HTTPException(status_code=499, detail=str(exc)) from exc
