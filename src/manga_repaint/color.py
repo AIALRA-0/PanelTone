@@ -200,16 +200,46 @@ def composite_strict_colorization(
     )
     source_gray = np.asarray(source.convert("L"), dtype=np.uint8)
     strict_mask = np.logical_or(protected_mask, source_gray <= ink_core_threshold)
-    edge_low = max(8, ink_core_threshold // 2)
-    edge_high = min(255, max(edge_low + 1, ink_core_threshold * 2))
-    edges = cv2.Canny(source_gray, edge_low, edge_high)
-    edge_guard = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1) > 0
-    darkness = np.clip((160.0 - source_gray.astype(np.float32)) / 152.0, 0.0, 1.0)
-    soft_alpha = np.where(edge_guard & ~strict_mask, darkness**1.6, 0.0)[..., None]
-    result = generated_rgb * (1.0 - soft_alpha) + source_rgb * soft_alpha
+    # Print the source screentone and antialiased line strength over the colour
+    # base instead of blending gray source pixels into it. Multiplication keeps
+    # the generated hue while restoring the original manga structure.
+    ink_factor = np.where(
+        source_gray >= 240,
+        1.0,
+        np.power(source_gray.astype(np.float32) / 255.0, 0.42),
+    )[..., None]
+    result = generated_rgb * ink_factor
     result = np.clip(np.rint(result), 0, 255).astype(np.uint8)
     result[strict_mask] = source_rgb.astype(np.uint8)[strict_mask]
     return Image.fromarray(result, mode="RGB")
+
+
+def validated_colorization_protection(
+    source: Image.Image,
+    generated: Image.Image,
+    protected_mask: np.ndarray,
+    *,
+    dark_structure_threshold: int = 192,
+    neutral_chroma_threshold: int = 24,
+) -> np.ndarray:
+    """Reject bright protection pixels that contradict generated colour.
+
+    Text, borders and ink are dark in the source and remain protected. Bright
+    bubble interiors are protected only when the generated image also sees a
+    neutral field. This both erases model-redrawn text inside real bubbles and
+    prevents a false balloon over coloured skin from copying monochrome pixels.
+    """
+    if protected_mask.shape != (source.height, source.width):
+        raise ValueError("protection mask shape does not match source image")
+    source_gray = np.asarray(source.convert("L"), dtype=np.uint8)
+    generated_rgb = np.asarray(
+        generated.convert("RGB").resize(source.size, Image.Resampling.LANCZOS),
+        dtype=np.int16,
+    )
+    generated_chroma = generated_rgb.max(axis=-1) - generated_rgb.min(axis=-1)
+    dark_structure = source_gray <= dark_structure_threshold
+    neutral_field = generated_chroma <= neutral_chroma_threshold
+    return np.logical_and(protected_mask, np.logical_or(dark_structure, neutral_field))
 
 
 def preserve_ink_overlay(

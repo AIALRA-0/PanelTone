@@ -16,7 +16,12 @@ def _edge_map(image: Image.Image) -> np.ndarray:
 def _f1(reference: np.ndarray, candidate: np.ndarray) -> float:
     if not reference.any() and not candidate.any():
         return 1.0
-    kernel = np.ones((3, 3), dtype=np.uint8)
+    # Use a scale-aware tolerance: a 4-6 pixel antialias/resize offset on a
+    # full-resolution page is visually the same edge, while small unit-test
+    # images retain a one-pixel tolerance.
+    radius = max(1, int(round(min(reference.shape) * 0.0045)))
+    kernel_size = radius * 2 + 1
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     reference_neighborhood = cv2.dilate(reference.astype(np.uint8), kernel).astype(bool)
     candidate_neighborhood = cv2.dilate(candidate.astype(np.uint8), kernel).astype(bool)
     matched_reference = np.logical_and(reference, candidate_neighborhood).sum()
@@ -29,8 +34,13 @@ def _f1(reference: np.ndarray, candidate: np.ndarray) -> float:
 def _color_coverage(rgb: np.ndarray, roi: np.ndarray) -> float:
     if not roi.any():
         return 0.0
-    chroma = rgb.max(axis=-1) - rgb.min(axis=-1)
-    return float((chroma[roi] >= 15).mean())
+    maximum = rgb.max(axis=-1).astype(np.float32)
+    chroma = maximum - rgb.min(axis=-1).astype(np.float32)
+    saturation = chroma / np.maximum(maximum, 1.0)
+    # Relative saturation recognizes dark blue/brown ink as colour without
+    # treating neutral gray or black screentone as coloured.
+    colourful = np.logical_and(chroma >= 6.0, saturation >= 0.08)
+    return float(colourful[roi].mean())
 
 
 def _color_dropout_tiles(

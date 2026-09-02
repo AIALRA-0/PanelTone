@@ -27,6 +27,17 @@ def test_bubble_mask_rejects_enclosed_white_art_without_text() -> None:
     assert not mask[90, 120]
 
 
+def test_bubble_mask_rejects_face_like_region_with_one_dark_mark() -> None:
+    image = Image.new("L", (240, 180), 170)
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((50, 30, 190, 150), fill=255, outline=0, width=4)
+    draw.rectangle((112, 85, 123, 95), fill=0)
+
+    mask = bubble_mask(image.convert("RGB"))
+
+    assert not mask[65, 120]
+
+
 def test_bubble_mask_keeps_white_region_that_contains_detected_glyphs() -> None:
     image = Image.new("L", (240, 180), 170)
     draw = ImageDraw.Draw(image)

@@ -53,6 +53,44 @@ SEMANTIC_ORDER = (
 )
 
 
+def _validated_bubble_regions(
+    trusted: np.ndarray,
+    predicted: np.ndarray,
+    text: np.ndarray,
+) -> np.ndarray:
+    """Keep model balloons only when page evidence supports the prediction.
+
+    Manga segmenters occasionally label bright cheeks, hands or clothing as a
+    balloon.  Copying those pixels from a monochrome source creates the exact
+    half-white skin defect this protection layer is meant to prevent.  The
+    deterministic detector remains trusted; a model-only component must either
+    overlap it or contain at least two distinct text components.
+    """
+    if trusted.shape != predicted.shape or trusted.shape != text.shape:
+        raise ValueError("bubble validation masks must have identical shapes")
+    result = trusted.copy()
+    count, labels = cv2.connectedComponents(predicted.astype(np.uint8), connectivity=8)
+    text_count, text_labels, text_stats, _ = cv2.connectedComponentsWithStats(
+        text.astype(np.uint8), connectivity=8
+    )
+    valid_text_labels = {
+        label
+        for label in range(1, text_count)
+        if int(text_stats[label, cv2.CC_STAT_AREA]) >= 8
+    }
+    expanded_text = cv2.dilate(text.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    for label in range(1, count):
+        component = labels == label
+        if np.logical_and(component, trusted).any():
+            result |= component
+            continue
+        nearby_labels = set(np.unique(text_labels[np.logical_and(component, expanded_text)]))
+        nearby_labels.discard(0)
+        if len(nearby_labels & valid_text_labels) >= 2:
+            result |= component
+    return result
+
+
 @dataclass(slots=True)
 class SemanticMaskResult:
     masks: dict[str, np.ndarray]
@@ -219,6 +257,8 @@ class KoharuSemanticMaskEngine:
         fallback = ConservativeSemanticMaskEngine(self.confidence_threshold).segment(source)
         masks = {name: value.copy() for name, value in fallback.masks.items()}
         confidence = fallback.confidence.copy()
+        predicted_bubbles = np.zeros((height, width), dtype=bool)
+        bubble_confidence = np.zeros((height, width), dtype=np.float32)
         prediction = model.predict(
             source=np.asarray(source),
             imgsz=self.image_size,
@@ -238,7 +278,11 @@ class KoharuSemanticMaskEngine:
                 if name in {"dialogue_text", "onomatopoeia_text", "text"}:
                     target = "text"
                 elif name in {"balloon", "bubble", "bubbles"}:
-                    target = "bubbles"
+                    predicted_bubbles |= region
+                    bubble_confidence[region] = np.maximum(
+                        bubble_confidence[region], float(score)
+                    )
+                    continue
                 elif name in {"frame", "panel", "borders", "border"}:
                     # A frame prediction covers its panel interior.  Protect
                     # only the frame edge here; the deterministic detector is
@@ -251,6 +295,12 @@ class KoharuSemanticMaskEngine:
                     continue
                 masks[target] |= region
                 confidence[region] = np.maximum(confidence[region], float(score))
+        masks["bubbles"] = _validated_bubble_regions(
+            fallback.masks["bubbles"], predicted_bubbles, masks["text"]
+        )
+        confidence[masks["bubbles"]] = np.maximum(
+            confidence[masks["bubbles"]], bubble_confidence[masks["bubbles"]]
+        )
         protected = masks["text"] | masks["bubbles"] | masks["borders"] | masks["ink"]
         confidence[protected] = np.maximum(confidence[protected], 1.0)
         uncertain = confidence < self.confidence_threshold

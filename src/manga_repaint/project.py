@@ -21,6 +21,7 @@ from .color import (
     composite_protected,
     composite_strict_colorization,
     preserve_ink_overlay,
+    validated_colorization_protection,
 )
 from .config import Settings, ensure_allowed_path
 from .engines import EngineInterrupted, EngineRegistry, EngineRequest
@@ -782,6 +783,7 @@ class ProjectManager:
         )
         effective_chroma = spec.chroma_strength * float(profile["chroma_multiplier"])
         if spec.mode == JobMode.COLORIZE:
+            mask = validated_colorization_protection(source_rgb, generated_rgb, mask)
             final = composite_strict_colorization(
                 source_rgb,
                 generated_rgb,

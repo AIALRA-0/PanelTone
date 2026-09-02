@@ -60,11 +60,19 @@ def bubble_mask(image: Image.Image) -> np.ndarray:
         candidate = np.zeros_like(white)
         cv2.drawContours(candidate, [contour], -1, 255, thickness=cv2.FILLED)
         # White hands, faces and clothing regions can be compact and enclosed
-        # by ink too. A deterministic bubble candidate is trusted only when a
-        # detected text region lies inside or immediately beside it. The
-        # optional Koharu adapter can still supply text-free balloon masks.
+        # by ink too. A deterministic bubble candidate is trusted only when it
+        # contains multiple glyph components. A single mouth, eye highlight or
+        # garment mark must not turn the surrounding body region monochrome.
         candidate_guard = cv2.dilate(candidate, np.ones((9, 9), np.uint8)) > 0
-        if not np.logical_and(candidate_guard, text).any():
+        text_inside = np.logical_and(candidate_guard, text).astype(np.uint8)
+        component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
+            text_inside, connectivity=8
+        )
+        glyph_components = sum(
+            int(component_stats[label, cv2.CC_STAT_AREA]) >= 8
+            for label in range(1, component_count)
+        )
+        if glyph_components < 2:
             continue
         result = cv2.bitwise_or(result, candidate)
     return result.astype(bool)

@@ -10,6 +10,7 @@ from manga_repaint.color import (
     preserve_ink_overlay,
     preserve_luminance_lab,
     replace_masked,
+    validated_colorization_protection,
 )
 
 
@@ -129,3 +130,20 @@ def test_strict_colorization_keeps_protected_and_core_ink_exact() -> None:
     assert np.array_equal(result[2:5], source_pixels[2:5])
     assert np.array_equal(result[protected], source_pixels[protected])
     assert np.all(result[8, 8] == np.array([230, 95, 45]))
+
+
+def test_colorization_protection_rejects_white_mask_over_generated_skin() -> None:
+    source_pixels = np.full((24, 24, 3), 255, dtype=np.uint8)
+    source_pixels[4:8, 4:20] = 0
+    source = Image.fromarray(source_pixels, mode="RGB")
+    generated_pixels = np.full((24, 24, 3), (238, 174, 140), dtype=np.uint8)
+    generated_pixels[14:20, 4:20] = (245, 245, 245)
+    generated_pixels[16:18, 8:12] = (10, 10, 10)
+    generated = Image.fromarray(generated_pixels, mode="RGB")
+    requested = np.ones((24, 24), dtype=bool)
+
+    validated = validated_colorization_protection(source, generated, requested)
+
+    assert validated[5, 10]
+    assert not validated[10, 10]
+    assert validated[16, 10]
