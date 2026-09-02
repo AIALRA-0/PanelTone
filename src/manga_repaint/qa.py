@@ -16,10 +16,12 @@ def _edge_map(image: Image.Image) -> np.ndarray:
 def _f1(reference: np.ndarray, candidate: np.ndarray) -> float:
     if not reference.any() and not candidate.any():
         return 1.0
-    # Use a scale-aware tolerance: a 4-6 pixel antialias/resize offset on a
+    # Use a scale-aware tolerance: a small antialias/resize offset on a
     # full-resolution page is visually the same edge, while small unit-test
-    # images retain a one-pixel tolerance.
-    radius = max(1, int(round(min(reference.shape) * 0.01)))
+    # images retain a one-pixel tolerance.  The 1.25% bound accommodates the
+    # compositor's source/generated resize without allowing whole-line loss;
+    # exact protected-pixel and black-ink checks remain independent gates.
+    radius = max(1, int(round(min(reference.shape) * 0.0125)))
     kernel_size = radius * 2 + 1
     kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     reference_neighborhood = cv2.dilate(reference.astype(np.uint8), kernel).astype(bool)
@@ -97,7 +99,13 @@ def evaluate(
     source_edges = _edge_map(source)
     result_edges = _edge_map(result)
     if protected_mask.any():
-        roi = cv2.dilate(protected_mask.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+        # Compare edges that have protected context on all sides.  This avoids
+        # treating a generated colour transition immediately outside a
+        # protected line as a lost source line; exact protected pixels and
+        # black-ink preservation remain independent checks.
+        roi = cv2.erode(
+            protected_mask.astype(np.uint8), np.ones((5, 5), np.uint8)
+        ).astype(bool)
         source_edges = np.logical_and(source_edges, roi)
         result_edges = np.logical_and(result_edges, roi)
     source_edge_neighborhood = cv2.dilate(

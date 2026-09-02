@@ -6,12 +6,14 @@ from PIL import Image
 from manga_repaint.color import (
     composite_protected,
     composite_strict_colorization,
+    is_already_colorized,
     lab_l,
     preserve_ink_overlay,
     preserve_luminance_lab,
     replace_masked,
     validated_colorization_protection,
 )
+from manga_repaint.masks import ink_edge_mask
 
 
 def test_protected_pixels_are_exact() -> None:
@@ -125,6 +127,29 @@ def test_strict_colorization_keeps_protected_and_core_ink_exact() -> None:
     assert np.all(result[8, 8] == np.array([230, 95, 45]))
 
 
+def test_ink_edge_protection_keeps_antialias_without_protecting_gray_field() -> None:
+    source_pixels = np.full((32, 32, 3), 220, dtype=np.uint8)
+    source_pixels[14:18] = 120
+    source_pixels[15:17] = 0
+    source = Image.fromarray(source_pixels, mode="RGB")
+    generated = Image.new("RGB", source.size, (220, 80, 40))
+
+    mask = ink_edge_mask(source, core_threshold=64, edge_threshold=128)
+    assert mask[14].any()
+    assert not mask[0, 0]
+    result = np.asarray(
+        composite_strict_colorization(
+            source,
+            generated,
+            np.zeros((32, 32), dtype=bool),
+            ink_core_threshold=64,
+            ink_edge_threshold=128,
+        )
+    )
+    assert np.array_equal(result[14], source_pixels[14])
+    assert np.all(result[0, 0] == np.array([220, 80, 40]))
+
+
 def test_colorization_protection_rejects_white_mask_over_generated_skin() -> None:
     source_pixels = np.full((24, 24, 3), 255, dtype=np.uint8)
     source_pixels[4:8, 4:20] = 0
@@ -140,3 +165,12 @@ def test_colorization_protection_rejects_white_mask_over_generated_skin() -> Non
     assert validated[5, 10]
     assert not validated[10, 10]
     assert validated[16, 10]
+
+
+def test_already_colorized_source_is_detected() -> None:
+    pixels = np.full((96, 96, 3), 255, dtype=np.uint8)
+    pixels[16:80, 16:80] = np.array([60, 150, 220], dtype=np.uint8)
+    source = Image.fromarray(pixels, mode="RGB")
+
+    assert is_already_colorized(source)
+    assert not is_already_colorized(Image.new("RGB", source.size, (220, 220, 220)))

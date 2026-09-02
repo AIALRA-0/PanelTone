@@ -20,6 +20,7 @@ from .color import (
     apply_render_profile,
     composite_protected,
     composite_strict_colorization,
+    is_already_colorized,
     preserve_ink_overlay,
     validated_colorization_protection,
 )
@@ -33,6 +34,7 @@ from .masks import (
     apply_mask_corrections,
     deterministic_protection_mask,
     ink_detail_mask,
+    ink_edge_mask,
     save_mask,
 )
 from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode
@@ -779,13 +781,21 @@ class ProjectManager:
             render_profile(spec.color_preset, spec.style_preset)["chroma_multiplier"]
         )
         if spec.mode == JobMode.COLORIZE:
-            mask = validated_colorization_protection(source_rgb, generated_rgb, mask)
-            final = composite_strict_colorization(
-                source_rgb,
-                generated_rgb,
-                mask,
-                chroma_strength=effective_chroma,
-            )
+            if is_already_colorized(source_rgb):
+                # Do not let a colour cover/credits page turn into a different
+                # scene when the generation service invents structure.
+                final = source_rgb
+            else:
+                mask = validated_colorization_protection(
+                    source_rgb, generated_rgb, mask
+                )
+                final = composite_strict_colorization(
+                    source_rgb,
+                    generated_rgb,
+                    mask,
+                    chroma_strength=effective_chroma,
+                    ink_edge_threshold=128,
+                )
         elif (
             spec.mode == JobMode.STYLE_FULL
             or not spec.preserve_ink
@@ -814,6 +824,7 @@ class ProjectManager:
                 generated_rgb,
                 mask,
                 chroma_strength=effective_chroma,
+                ink_edge_threshold=128,
             )
 
         # For colourization, uncertainty is diagnostic only. Returning those
@@ -827,7 +838,13 @@ class ProjectManager:
             final = composite_protected(source_rgb, final, uncertain_mask)
         qa_mask = mask
         if spec.preserve_ink and spec.mode != JobMode.STYLE_FULL:
-            qa_mask = np.logical_or(mask, ink_detail_mask(source_rgb, threshold=64))
+            # Match the compositor's local antialiased-edge protection.  The
+            # blurred edge detector ignores most screentone dots, while the
+            # dark-pixel gate keeps the protected fringe narrow.
+            qa_mask = np.logical_or(
+                mask,
+                ink_edge_mask(source_rgb, core_threshold=64, edge_threshold=128),
+            )
         return final, qa_mask
 
     @staticmethod
@@ -1159,11 +1176,17 @@ class ProjectManager:
                             )
                             source_rgb = source_image.convert("RGB")
                             final.save(final_path, format="PNG")
+                            qa_generated = (
+                                source_rgb
+                                if spec.mode == JobMode.COLORIZE
+                                and is_already_colorized(source_rgb)
+                                else self._render_generated(generated_image, spec)
+                            )
                             qa = evaluate(
                                 source_rgb,
                                 final,
                                 qa_mask,
-                                generated=self._render_generated(generated_image, spec),
+                                generated=qa_generated,
                                 line_f1_min=(
                                     self.settings.qa_line_f1_min
                                     if spec.mode != JobMode.STYLE_FULL
@@ -1641,15 +1664,22 @@ class ProjectManager:
                         Image.open(source_path) as source_image,
                         Image.open(generated_path) as generated_image,
                     ):
+                        source_rgb = source_image.convert("RGB")
                         mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
                         final, qa_mask = self._compose_unit(
                             source_image, generated_image, mask, spec, uncertain_mask
                         )
+                        qa_generated = (
+                            source_rgb
+                            if spec.mode == JobMode.COLORIZE
+                            and is_already_colorized(source_rgb)
+                            else self._render_generated(generated_image, spec)
+                        )
                         qa = evaluate(
-                            source_image.convert("RGB"),
+                            source_rgb,
                             final,
                             qa_mask,
-                            generated=self._render_generated(generated_image, spec),
+                            generated=qa_generated,
                             line_f1_min=(
                                 self.settings.qa_line_f1_min
                                 if spec.mode != JobMode.STYLE_FULL

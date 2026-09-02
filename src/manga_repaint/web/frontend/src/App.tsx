@@ -678,7 +678,12 @@ function App() {
   }
 
   function handleCanvasPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if ((event.target as HTMLElement).closest('button, input, a')) return
+    const target = event.target as HTMLElement
+    if (target.closest('button, a')) return
+    // The compare range covers the whole stage so it can be dragged on desktop.
+    // Let touch pointers enter the same gesture state, otherwise a mobile
+    // swipe is consumed by the range and can never advance the page.
+    if (target.closest('input') && event.pointerType !== 'touch') return
     const gesture = gestureRef.current
     gesture.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
     gesture.startPan = canvasPan

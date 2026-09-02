@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from .masks import ink_edge_mask
+
 
 def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
     values = rgb.astype(np.float64) / 255.0
@@ -146,6 +148,36 @@ def apply_render_profile(
     return Image.fromarray(graded, mode="RGB")
 
 
+def is_already_colorized(
+    image: Image.Image,
+    *,
+    coverage_min: float = 0.90,
+    pixel_min: int = 4096,
+) -> bool:
+    """Return whether a source page is already a substantially colour image.
+
+    Covers, credits and publisher pages can be supplied as colour scans. They
+    must not be sent through a monochrome-to-colour model, especially when a
+    model invents structure that is absent from the source. White paper and
+    black line art are excluded from the coverage calculation.
+    """
+    if not 0.0 <= coverage_min <= 1.0:
+        raise ValueError("Colour coverage minimum must be between 0.0 and 1.0")
+    if pixel_min < 1:
+        raise ValueError("Colour coverage pixel minimum must be positive")
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    luma = rgb.mean(axis=-1)
+    roi = (luma > 8) & (luma < 248)
+    if int(roi.sum()) < pixel_min:
+        return False
+    maximum = rgb.max(axis=-1)
+    minimum = rgb.min(axis=-1)
+    chroma = maximum - minimum
+    saturation = chroma / np.maximum(maximum, 1)
+    colourful = (chroma >= 6) & (saturation >= 0.08)
+    return float(colourful[roi].mean()) >= coverage_min
+
+
 def composite_protected(
     source: Image.Image,
     generated: Image.Image,
@@ -181,6 +213,7 @@ def composite_strict_colorization(
     protected_mask: np.ndarray,
     chroma_strength: float = 1.0,
     ink_core_threshold: int = 64,
+    ink_edge_threshold: int | None = None,
 ) -> Image.Image:
     """Use the generated colour image while restoring protected manga structure.
 
@@ -199,7 +232,18 @@ def composite_strict_colorization(
         dtype=np.float32,
     )
     source_gray = np.asarray(source.convert("L"), dtype=np.uint8)
-    strict_mask = np.logical_or(protected_mask, source_gray <= ink_core_threshold)
+    if ink_edge_threshold is None:
+        # Keep the explicit legacy cutoff useful to callers that need the
+        # original narrow behavior. Production composition opts into the
+        # scale-aware local edge mask below.
+        ink_mask = source_gray <= ink_core_threshold
+    else:
+        ink_mask = ink_edge_mask(
+            source,
+            core_threshold=ink_core_threshold,
+            edge_threshold=ink_edge_threshold,
+        )
+    strict_mask = np.logical_or(protected_mask, ink_mask)
     # Keep every non-protected pixel from the full-colour generation. Dense
     # manga screentones are not safe soft-edge hints: even alignment-gated
     # multiplication can turn a shifted coloured limb back into gray.

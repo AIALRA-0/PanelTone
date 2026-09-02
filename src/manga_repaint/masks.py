@@ -36,6 +36,28 @@ def ink_detail_mask(image: Image.Image, threshold: int = 64) -> np.ndarray:
     return gray <= threshold
 
 
+def ink_edge_mask(
+    image: Image.Image,
+    *,
+    core_threshold: int = 64,
+    edge_threshold: int = 128,
+) -> np.ndarray:
+    """Protect antialiased ink edges without restoring whole screentones.
+
+    A grayscale cutoff alone misses the soft fringe around printed lines on
+    high-resolution scans.  Blurring before Canny suppresses halftone dots;
+    restricting detected edges to moderately dark source pixels keeps the
+    protection local instead of turning broad gray fields monochrome.
+    """
+    if not 0 <= core_threshold <= edge_threshold <= 255:
+        raise ValueError("Ink edge thresholds must be between 0 and 255")
+    gray = np.asarray(image.convert("L"))
+    core = gray <= core_threshold
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 20, 80) > 0
+    return core | (edges & (gray <= edge_threshold))
+
+
 def bubble_mask(image: Image.Image) -> np.ndarray:
     gray = np.asarray(image.convert("L"))
     height, width = gray.shape
