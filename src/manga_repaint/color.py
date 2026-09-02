@@ -383,30 +383,51 @@ def composite_geometry_locked_colorization(
     valid_color = np.logical_and(saturation >= 18.0, generated_hsv[..., 2] >= 8.0)
     filtered_hue = generated_hsv[..., 0].copy()
     filtered_saturation = saturation.copy()
-    component_count, labels = cv2.connectedComponents(
+    # Keep the normalized blur barrier-aware, but never run a full-canvas blur
+    # once per component.  Manga pages commonly contain thousands of small
+    # source-connected regions; doing the old operation on the whole canvas
+    # made repair time grow quadratically with the number of regions.
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
         traversable.astype(np.uint8), connectivity=8
     )
+    blur_margin = 4
 
     for component in range(1, component_count):
-        region = labels == component
-        area = int(region.sum())
+        x, y, component_width, component_height, area = stats[component]
+        area = int(area)
         if area < 4:
             continue
-        valid = np.logical_and(region, valid_color)
+        x0 = max(0, int(x) - blur_margin)
+        y0 = max(0, int(y) - blur_margin)
+        x1 = min(width, int(x + component_width) + blur_margin)
+        y1 = min(height, int(y + component_height) + blur_margin)
+        region = labels[y0:y1, x0:x1] == component
+        local_hue = filtered_hue[y0:y1, x0:x1]
+        local_saturation = filtered_saturation[y0:y1, x0:x1]
+        local_generated_hue = hue[y0:y1, x0:x1]
+        local_generated_saturation = saturation[y0:y1, x0:x1]
+        local_valid_color = valid_color[y0:y1, x0:x1]
+        valid = np.logical_and(region, local_valid_color)
         valid_count = int(valid.sum())
         if valid_count / area < 0.20:
-            filtered_saturation[region] = saturation[region] * chroma_strength
+            local_saturation[region] = (
+                local_generated_saturation[region] * chroma_strength
+            )
             continue
 
-        weights = np.where(valid, saturation / 255.0, 0.0).astype(np.float32)
-        cos_values = np.cos(hue) * weights
-        sin_values = np.sin(hue) * weights
+        weights = np.where(
+            valid, local_generated_saturation / 255.0, 0.0
+        ).astype(np.float32)
+        cos_values = np.cos(local_generated_hue) * weights
+        sin_values = np.sin(local_generated_hue) * weights
         # Masked normalized convolution is performed on each source-connected
         # component, so no generated colour can cross a source barrier.
         region_float = region.astype(np.float32)
         local_cos = cv2.GaussianBlur(cos_values * region_float, (0, 0), 1.15)
         local_sin = cv2.GaussianBlur(sin_values * region_float, (0, 0), 1.15)
-        local_sat = cv2.GaussianBlur(saturation * valid * region_float, (0, 0), 1.15)
+        local_sat = cv2.GaussianBlur(
+            local_generated_saturation * valid * region_float, (0, 0), 1.15
+        )
         local_weight = cv2.GaussianBlur(
             valid.astype(np.float32) * region_float, (0, 0), 1.15
         )
@@ -415,13 +436,15 @@ def composite_geometry_locked_colorization(
         stable_angle = float(np.arctan2(stable_sin, stable_cos))
         stable_strength = float(np.hypot(stable_cos, stable_sin) / max(1, valid_count))
         stable_hue = (stable_angle % (2.0 * np.pi)) * 180.0 / np.pi
-        stable_saturation = float(np.median(saturation[valid])) * chroma_strength
+        stable_saturation = (
+            float(np.median(local_generated_saturation[valid])) * chroma_strength
+        )
         good_local = np.logical_and(region, local_weight > 0.01)
         local_angle = np.mod(
             np.arctan2(local_sin, local_cos), 2.0 * np.pi
         ) * 180.0 / np.pi
-        filtered_hue[good_local] = local_angle[good_local] / 2.0
-        filtered_saturation[good_local] = (
+        local_hue[good_local] = local_angle[good_local] / 2.0
+        local_saturation[good_local] = (
             local_sat[good_local] / np.maximum(local_weight[good_local], 1e-3)
         ) * chroma_strength
         # Fill neutral holes only when the component has a coherent colour
@@ -429,10 +452,10 @@ def composite_geometry_locked_colorization(
         # tint while fixing the half-white skin/scene islands.
         if stable_strength >= 0.12:
             holes = np.logical_and(region, ~good_local)
-            filtered_hue[holes] = stable_hue / 2.0
-            filtered_saturation[holes] = stable_saturation
-        filtered_hue[region] %= 180.0
-        filtered_saturation[region] = np.clip(filtered_saturation[region], 0, 255)
+            local_hue[holes] = stable_hue / 2.0
+            local_saturation[holes] = stable_saturation
+        local_hue[region] %= 180.0
+        local_saturation[region] = np.clip(local_saturation[region], 0, 255)
 
     composed_hsv = np.empty((height, width, 3), dtype=np.uint8)
     composed_hsv[..., 0] = np.mod(filtered_hue, 180.0).astype(np.uint8)
