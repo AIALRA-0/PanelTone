@@ -1259,6 +1259,24 @@ button, input, select, textarea { font-size: 14px; }
   .workspace.right-collapsed { grid-template-columns: 218px minmax(0, 1fr) 0; }
   .workspace.left-collapsed.right-collapsed { grid-template-columns: 0 minmax(0, 1fr) 0; }
   .library-panel, .inspector-panel { min-width: 0; }
+  /* The legacy <=1279 block used a 56px icon rail.  Restore the normal
+     compact task rows here so 1100–1279px remains a real three-column layout. */
+  .library-panel .panel-heading > div,
+  .library-panel .count,
+  .library-panel .filter-row,
+  .library-panel .job-copy,
+  .library-panel .new-book {
+    display: revert;
+    visibility: visible;
+  }
+  .library-panel .panel-heading { justify-content: space-between; padding: 16px 12px 12px; }
+  .library-panel .filter-row { display: grid; }
+  .job-item { grid-template-columns: 16px minmax(0, 1fr); }
+  .job-item > input { display: block; }
+  .job-row { grid-template-columns: 38px minmax(0, 1fr) 10px; justify-content: stretch; padding: 8px; }
+  .job-row .status-shape { position: static; margin: 0; }
+  .batch-bar { display: grid; }
+  .new-book { display: block; }
   .preview-toolbar { gap: 7px; padding-inline: 10px; }
   .title-block { flex: 1 1 180px; }
   .toolbar-actions { flex: 0 1 auto; }

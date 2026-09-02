@@ -1,7 +1,7 @@
 <div align="center">
   <h1 align="center">PanelTone</h1>
   <p>本地漫画上色与画风重绘工作台</p>
-  <p><strong>0.2.0-alpha.2</strong> · Windows 11 优先 · 本机处理 · 中文优先</p>
+  <p><strong>0.2.0-alpha.3</strong> · Windows 11 优先 · 本机处理 · 中文优先</p>
   <p><a href="README.en.md">English</a> · <a href="SECURITY.md">安全报告</a> · <a href="CONTRIBUTING.md">参与贡献</a></p>
 </div>
 

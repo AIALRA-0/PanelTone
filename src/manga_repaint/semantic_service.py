@@ -35,7 +35,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="PanelTone Semantic Protection Service", version="0.2.0-alpha.2")
+app = FastAPI(title="PanelTone Semantic Protection Service", version="0.2.0-alpha.3")
 app.router.lifespan_context = lifespan
 
 

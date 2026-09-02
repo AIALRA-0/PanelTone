@@ -1,7 +1,7 @@
 <div align="center">
   <h1 align="center">PanelTone</h1>
   <p>A local workbench for manga colorization and style redraw</p>
-  <p><strong>0.2.0-alpha.2</strong> · Windows 11 first · Local processing · Chinese-first project</p>
+  <p><strong>0.2.0-alpha.3</strong> · Windows 11 first · Local processing · Chinese-first project</p>
   <p><a href="README.md">简体中文</a> · <a href="SECURITY.md">Security</a> · <a href="CONTRIBUTING.md">Contributing</a></p>
 </div>
 
