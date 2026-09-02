@@ -159,6 +159,17 @@ type EngineHealth = {
   message?: string | null
 }
 
+type DownloadInfo = {
+  ready: boolean
+  file_name: string
+  media_type: string
+  size_bytes: number
+  revision: string
+  download_url: string
+}
+
+type PageState = NonNullable<Progress['page_states']>[number]
+
 const statusLabel: Record<string, string> = {
   created: '正在建立', ingesting: '正在展开', ready: '可以开始', queued: '队列等待',
   running: '正在处理', paused: '已暂停', waiting_model: '等待模型',
@@ -246,8 +257,11 @@ async function uploadFile(file: File, clientUploadId: string, onProgress: (value
 }
 
 function formatBytes(bytes: number) {
-  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  const value = Math.max(0, bytes)
+  if (value < 1024) return `${Math.round(value)} B`
+  if (value < 1024 ** 2) return `${Math.max(1, Math.round(value / 1024))} KiB`
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MiB`
+  return `${(value / 1024 ** 3).toFixed(1)} GiB`
 }
 
 function formatEta(seconds: number | null) {
@@ -288,12 +302,81 @@ function freshAssetUrl(value: string, revision: string | number = Date.now()) {
 }
 
 function Icon({ name }: { name: string }) {
+  if (name === 'chevron-left' || name === 'chevron-right') {
+    const direction = name === 'chevron-left' ? 'M12.5 3.5 6 10l6.5 6.5' : 'M7.5 3.5 14 10l-6.5 6.5'
+    return <svg aria-hidden="true" className="icon icon-chevron" viewBox="0 0 20 20" focusable="false"><path d={direction} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" /></svg>
+  }
   const icons: Record<string, string> = {
     add: '+', settings: '⚙', books: '▤', preview: '◫', progress: '◒',
     play: '▶', pause: 'Ⅱ', more: '•••', close: '×', upload: '↑', check: '✓',
-    'chevron-left': '‹', 'chevron-right': '›',
   }
   return <span aria-hidden="true" className="icon">{icons[name] || '•'}</span>
+}
+
+function PageStatusOverview({
+  states,
+  currentPage,
+  onSelect,
+}: {
+  states: PageState[]
+  currentPage: number
+  onSelect: (pageIndex: number) => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const [windowStart, setWindowStart] = useState(0)
+  const complete = states.filter(page => page.status === 'qa_passed').length
+  const processing = states.filter(page => ['running', 'generating'].includes(page.status)).length
+  const failed = states.filter(page => ['failed', 'qa_failed', 'needs_attention'].includes(page.status)).length
+  const waiting = Math.max(0, states.length - complete - processing - failed)
+  const failures = states.filter(page => ['failed', 'qa_failed', 'needs_attention'].includes(page.status))
+  const visible = states.slice(windowStart, windowStart + 24)
+
+  function openList() {
+    const current = states.findIndex(page => page.page_index === currentPage)
+    setWindowStart(Math.max(0, Math.min(Math.max(0, states.length - 24), current - 10)))
+    setExpanded(value => !value)
+  }
+
+  function moveCursor(offset: number) {
+    if (!states.length) return
+    const current = Math.max(0, states.findIndex(page => page.page_index === currentPage))
+    const next = Math.max(0, Math.min(states.length - 1, current + offset))
+    const nextPage = states[next]
+    if (!nextPage) return
+    if (next < windowStart) setWindowStart(next)
+    if (next >= windowStart + 24) setWindowStart(Math.min(states.length - 24, next - 23))
+    onSelect(nextPage.page_index)
+  }
+
+  function handleKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'ArrowDown' || event.key === 'PageDown') { event.preventDefault(); moveCursor(event.key === 'PageDown' ? 12 : 1) }
+    else if (event.key === 'ArrowUp' || event.key === 'PageUp') { event.preventDefault(); moveCursor(event.key === 'PageUp' ? -12 : -1) }
+    else if (event.key === 'Home') { event.preventDefault(); setWindowStart(0); onSelect(states[0]?.page_index ?? 0) }
+    else if (event.key === 'End') { event.preventDefault(); setWindowStart(Math.max(0, states.length - 24)); onSelect(states.at(-1)?.page_index ?? 0) }
+  }
+
+  return <section className="page-status-overview" aria-label="处理页状态">
+    <div className="status-overview-head">
+      <div><strong>{complete} / {states.length} 页</strong><span>当前第 {currentPage + 1} 页</span></div>
+      <button className="status-list-toggle" onClick={openList} aria-expanded={expanded}>{expanded ? '收起逐页状态' : '查看逐页状态'}</button>
+    </div>
+    <div className="status-overview-counts" aria-label="状态数量">
+      <span><i className="status-dot complete" />完成 {complete}</span>
+      <span><i className="status-dot processing" />处理中 {processing}</span>
+      <span><i className="status-dot failed" />失败 {failed}</span>
+      <span><i className="status-dot waiting" />等待 {waiting}</span>
+    </div>
+    {failures.length > 0 && <div className="status-exceptions" aria-label="异常页面">
+      {failures.slice(0, 5).map(page => <button key={page.page_index} onClick={() => onSelect(page.page_index)} title={page.error || undefined}><i className="status-dot failed" />第 {page.page_index + 1} 页</button>)}
+      {failures.length > 5 && <span>另有 {failures.length - 5} 页异常</span>}
+    </div>}
+    {expanded && <div className="status-list" role="listbox" tabIndex={0} aria-label="逐页状态列表" onKeyDown={handleKeyDown}>
+      {visible.map(page => <button key={page.page_index} role="option" aria-selected={page.page_index === currentPage} className={page.page_index === currentPage ? 'current' : ''} onClick={() => onSelect(page.page_index)} title={page.error || undefined}>
+        <i className={`status-dot ${['failed', 'qa_failed', 'needs_attention'].includes(page.status) ? 'failed' : ['running', 'generating'].includes(page.status) ? 'processing' : page.status === 'qa_passed' ? 'complete' : 'waiting'}`} />
+        <strong>第 {page.page_index + 1} 页</strong><span>{statusLabel[page.status] || page.status}</span>{page.error && <small>{page.error}</small>}
+      </button>)}
+    </div>}
+  </section>
 }
 
 function OptionInfo({ item }: { item?: Descriptor }) {
@@ -340,6 +423,7 @@ function App() {
   const [canvasScale, setCanvasScale] = useState(1)
   const [canvasPan, setCanvasPan] = useState({ x: 0, y: 0 })
   const [pageLoading, setPageLoading] = useState(false)
+  const [downloadBusy, setDownloadBusy] = useState(false)
   const [readyNotice, setReadyNotice] = useState<number | null>(null)
   const [leftCollapsed, setLeftCollapsed] = useState(() => localStorage.getItem('paneltone.leftCollapsed') === '1')
   const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem('paneltone.rightCollapsed') === '1')
@@ -379,6 +463,9 @@ function App() {
   const prefetchQueueRef = useRef<string[]>([])
   const prefetchActiveRef = useRef(0)
   const prefetchedUrlsRef = useRef(new Set<string>())
+  const prefetchGenerationRef = useRef(0)
+  const decodedImagesRef = useRef(new Map<string, HTMLImageElement>())
+  const downloadBusyRef = useRef(false)
   const gestureRef = useRef({
     pointers: new Map<number, { x: number; y: number }>(),
     startPan: { x: 0, y: 0 },
@@ -434,7 +521,14 @@ function App() {
   useEffect(() => { localStorage.setItem('paneltone.largeText', largeText ? '1' : '0') }, [largeText])
   useEffect(() => {
     const handleKeyboard = (event: globalThis.KeyboardEvent) => {
-      if (event.key === 'Escape') { setTaskMenuOpen(false); setLibraryContext(null) }
+      if (event.key === 'Escape') {
+        setTaskMenuOpen(false)
+        setLibraryContext(null)
+        if (window.matchMedia('(min-width: 760px) and (max-width: 1099px)').matches) {
+          setLeftCollapsed(true)
+          setRightCollapsed(true)
+        }
+      }
       if (!event.ctrlKey || !event.shiftKey) return
       const target = event.target as HTMLElement | null
       if (target?.matches('input, textarea, select')) return
@@ -603,6 +697,7 @@ function App() {
     while (prefetchActiveRef.current < 2 && prefetchQueueRef.current.length) {
       const url = prefetchQueueRef.current.shift()
       if (!url) continue
+      const generation = prefetchGenerationRef.current
       prefetchActiveRef.current += 1
       const image = new Image()
       image.decoding = 'async'
@@ -610,10 +705,30 @@ function App() {
         prefetchActiveRef.current = Math.max(0, prefetchActiveRef.current - 1)
         pumpPrefetchQueue()
       }
-      image.onload = finish
+      image.onload = () => {
+        void image.decode().catch(() => undefined).finally(() => {
+          if (generation === prefetchGenerationRef.current) {
+            decodedImagesRef.current.delete(url)
+            decodedImagesRef.current.set(url, image)
+            while (decodedImagesRef.current.size > 8) {
+              const oldest = decodedImagesRef.current.keys().next().value
+              if (!oldest) break
+              decodedImagesRef.current.delete(oldest)
+            }
+          }
+          finish()
+        })
+      }
       image.onerror = finish
       image.src = url
     }
+  }
+
+  function clearPrefetchQueue() {
+    prefetchGenerationRef.current += 1
+    prefetchQueueRef.current = []
+    prefetchedUrlsRef.current.clear()
+    decodedImagesRef.current.clear()
   }
 
   function queueImagePrefetch(url: string | null | undefined) {
@@ -625,12 +740,18 @@ function App() {
 
   function prefetchPageAssets(jobId: string | null, index: number, sourcePages = pagesRef.current) {
     if (!jobId) return
-    const targets = sourcePages
-      .filter(page => Math.abs(page.page_index - index) <= 2)
-      .sort((left, right) => Math.abs(left.page_index - index) - Math.abs(right.page_index - index))
-    for (const page of targets) {
-      queueImagePrefetch(page.source_display_url || page.source_url)
-      queueImagePrefetch(page.final_display_url || page.final_url || page.preview_url)
+    const offsets = [0, 1, -1, 2, -2]
+    for (const offset of offsets) {
+      const page = sourcePages.find(item => item.page_index === index + offset)
+      if (!page) continue
+      if (previewMode === 'source' || previewMode === 'mask') {
+        queueImagePrefetch(page.source_display_url || page.source_url)
+      } else if (previewMode === 'final') {
+        queueImagePrefetch(page.final_display_url || page.final_url || page.preview_url)
+      } else {
+        queueImagePrefetch(page.source_display_url || page.source_url)
+        queueImagePrefetch(page.final_display_url || page.final_url || page.preview_url)
+      }
     }
   }
 
@@ -725,6 +846,10 @@ function App() {
     if (gesture.pointers.size < 2) gesture.startDistance = 0
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
   }
+
+  useEffect(() => {
+    clearPrefetchQueue()
+  }, [selected?.id, previewMode])
 
   useEffect(() => {
     if (!currentPage) return
@@ -896,7 +1021,28 @@ function App() {
     }
     if (name !== 'download') setMessage(name === 'pause' ? '暂停中，正在中断当前模型请求' : name === 'cancel' ? '取消中，正在清理当前请求' : `正在${labels[name] || '提交操作'}`)
     try {
-      if (name === 'download') return void (window.location.href = `/api/jobs/${jobId}/download`)
+      if (name === 'download') {
+        if (downloadBusyRef.current) return
+        downloadBusyRef.current = true
+        setDownloadBusy(true)
+        setMessage('正在检查成品')
+        try {
+          const info = await api<DownloadInfo>(`/api/jobs/${jobId}/download-info`)
+          if (!info.ready) throw new Error('成品尚未准备好，请稍后再试')
+          const anchor = document.createElement('a')
+          anchor.href = info.download_url
+          anchor.download = info.file_name
+          anchor.rel = 'noopener'
+          anchor.hidden = true
+          document.body.appendChild(anchor)
+          anchor.click()
+          anchor.remove()
+          setMessage(`下载已交给浏览器：${info.file_name} · ${formatBytes(info.size_bytes)}，请查看下载栏`)
+        } finally {
+          window.setTimeout(() => { downloadBusyRef.current = false; setDownloadBusy(false) }, 1800)
+        }
+        return
+      }
       const result = await api<{ message?: string }>(`/api/jobs/${jobId}/${name}`, { method: 'POST' })
       if (result.message) setMessage(result.message)
       await refreshJobs()
@@ -1090,7 +1236,7 @@ function App() {
   function renderJobRow(job: Job, depth = 0) {
     return <div className="job-item library-job-item" key={job.id} style={{ paddingLeft: `${depth * 10}px` }} draggable onDragStart={() => { setDraggedLibraryId(job.id); setDraggedFolderId(null) }} onDragEnd={() => setDraggedLibraryId(null)} onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }} onDrop={event => { event.preventDefault(); if (draggedLibraryId && draggedLibraryId !== job.id) moveLibraryJob(draggedLibraryId, job.folder_id || null, job.id) }} onContextMenu={event => openLibraryContext(event, 'job', job.id)}>
       <input type="checkbox" aria-label={`选择 ${job.display_name}`} checked={selectedJobs.has(job.id)} onChange={event => setSelectedJobs(current => { const next = new Set(current); if (event.target.checked) next.add(job.id); else next.delete(job.id); return next })} />
-      <button className={`job-row ${selected?.id === job.id ? 'selected' : ''}`} onClick={() => { pageSelectionRef.current.set(job.id, latestReadyPageIndex(job)); setPageLoading(true); setCanvasPan({ x: 0, y: 0 }); setPageIndex(latestReadyPageIndex(job)); setSelectedId(job.id); setMobileTab('preview') }} onKeyDown={event => openLibraryContextFromKeyboard(event, 'job', job.id)}>
+      <button className={`job-row ${selected?.id === job.id ? 'selected' : ''}`} onClick={() => { pageSelectionRef.current.set(job.id, latestReadyPageIndex(job)); setPageLoading(true); setCanvasPan({ x: 0, y: 0 }); setPageIndex(latestReadyPageIndex(job)); setSelectedId(job.id); setMobileTab('preview'); if (window.innerWidth < 1100) setLeftCollapsed(true) }} onKeyDown={event => openLibraryContextFromKeyboard(event, 'job', job.id)}>
         <span className="job-cover"><span className="cover-frame"><img key={`${job.id}-${job.status}-${job.page_count}-${job.progress.completed_pages}`} src={`/api/jobs/${job.id}/pages/0/thumbnail?v=${job.status}-${job.page_count}-${job.progress.completed_pages}`} alt="" onError={event => { const image = event.currentTarget; if (image.dataset.fallback !== '1') { image.dataset.fallback = '1'; image.src = `/api/jobs/${job.id}/pages/0/source?v=${job.status}-${job.page_count}` } else image.style.display = 'none' }} /></span><small>{job.progress.completed_pages || 0}/{job.page_count}</small></span>
         <span className="job-copy"><strong>{job.display_name}</strong><small>{statusLabel[job.status] || job.status}{job.progress.current_page != null ? ` · 第 ${job.progress.current_page + 1} 页` : ''}</small></span>
         <span className={`status-shape ${job.status}`} aria-label={statusLabel[job.status]} />
@@ -1183,6 +1329,8 @@ function App() {
           <button className="new-book" onClick={() => setImportOpen(true)}><Icon name="add" />导入新漫画</button>
         </aside>
 
+        <button className="workspace-scrim" aria-label="关闭侧栏" onClick={() => { setLeftCollapsed(true); setRightCollapsed(true) }} />
+
         <section className="preview-panel">
           {selected ? <>
             <div className="preview-toolbar">
@@ -1208,7 +1356,7 @@ function App() {
                     <h4>{group}</h4>
                     {names.map(name => {
                       const label = name === 'start' ? '开始或继续' : name === 'pause' ? '暂停' : name === 'cancel' ? '取消' : name === 'retry' ? '重试失败页' : name === 'repair-results' ? '修复已生成结果' : name === 'duplicate' ? '复制并调整' : name === 'rename' ? '修改书名' : name === 'archive' ? '移到回收站' : name === 'restore' ? '从回收站恢复' : '下载成品'
-                      const disabled = name === 'start' ? ['running', 'queued', 'completed', 'archived', 'ingesting', 'created'].includes(selected.status) : name === 'pause' || name === 'cancel' ? !['running', 'queued', 'waiting_model'].includes(selected.status) : name === 'retry' ? !['failed', 'needs_attention'].includes(selected.status) : name === 'repair-results' ? ['running', 'queued', 'ingesting', 'created', 'archived'].includes(selected.status) || selected.progress.completed_units === 0 : name === 'archive' ? ['created', 'ingesting', 'running', 'queued', 'waiting_model', 'archived'].includes(selected.status) : name === 'restore' ? selected.status !== 'archived' : name === 'download' ? selected.status !== 'completed' : false
+                       const disabled = name === 'start' ? ['running', 'queued', 'completed', 'archived', 'ingesting', 'created'].includes(selected.status) : name === 'pause' || name === 'cancel' ? !['running', 'queued', 'waiting_model'].includes(selected.status) : name === 'retry' ? !['failed', 'needs_attention'].includes(selected.status) : name === 'repair-results' ? ['running', 'queued', 'ingesting', 'created', 'archived'].includes(selected.status) || selected.progress.completed_units === 0 : name === 'archive' ? ['created', 'ingesting', 'running', 'queued', 'waiting_model', 'archived'].includes(selected.status) : name === 'restore' ? selected.status !== 'archived' : name === 'download' ? selected.status !== 'completed' || downloadBusy : false
                       const reason = disabled ? name === 'download' ? '整本完成后可下载' : name === 'retry' ? '没有可重试的失败页' : name === 'repair-results' ? '任务完成或暂停后才可修复' : name === 'restore' ? '任务不在回收站' : name === 'archive' ? '准备或运行中的任务不能归档' : name === 'start' && selected.status === 'ingesting' ? '建书完成后会自动开始处理' : '当前阶段不可用' : undefined
                       return <button key={name} role="menuitem" title={reason} disabled={disabled} onClick={() => { setTaskMenuOpen(false); if (name === 'retry') { const failed = selected.progress.page_states?.find(page => ['failed', 'qa_failed'].includes(page.status)); if (failed) retryPage(selected.id, failed.page_index).catch(error => setMessage(error.message)) } else if (name === 'duplicate') action(selected.id, 'duplicate'); else if (name === 'rename') setRenameTarget(selected); else action(selected.id, name) }}>{label}{reason && <small>{reason}</small>}</button>
                     })}
@@ -1218,24 +1366,25 @@ function App() {
             </div>
             <div className={`canvas canvas-gesture-zone ${previewDark ? 'dark' : ''} zoom-${zoom}`} onWheel={handleCanvasWheel} onPointerDown={handleCanvasPointerDown} onPointerMove={handleCanvasPointerMove} onPointerUp={handleCanvasPointerUp} onPointerCancel={handleCanvasPointerUp}>
               {currentPage ? <>
+                {pageLoading && currentPage.thumbnail_url && <img className="page-placeholder" src={freshAssetUrl(currentPage.thumbnail_url, currentPage.asset_revision || 'placeholder')} alt="" aria-hidden="true" />}
                 {previewMode === 'compare' && currentResultUrl ? <div className="compare-stage">
-                  <img style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} />
-                  <div className="compare-result" style={{ clipPath: `inset(0 0 0 ${compare}%)`, transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}><img src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /></div>
+                  <img loading="eager" decoding="async" fetchPriority="high" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} />
+                  <div className="compare-result" style={{ clipPath: `inset(0 0 0 ${compare}%)`, transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}><img loading="eager" decoding="async" fetchPriority="high" src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /></div>
                   <div className="compare-line" style={{ left: `${compare}%` }}><span /></div>
                   <input className="compare-range" aria-label="拖动比较原图和结果" type="range" min="0" max="100" value={compare} onChange={event => setCompare(Number(event.target.value))} />
-                </div> : previewMode === 'source' ? <img className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : previewMode === 'mask' ? <img className="single-page mask-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={`/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask`} alt={`第 ${currentPage.page_index + 1} 页保护遮罩`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : currentResultUrl ? <img className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : waitingForModel ? <div className="waiting-page model-waiting"><span className="waiting-symbol">!</span><strong>模型服务未连接</strong><span>当前没有页面在处理，服务恢复后会自动继续</span>{selected.error && <small className="waiting-detail">{selected.error}</small>}<button onClick={() => refreshHealth()}>重新检测模型</button></div> : <div className="waiting-page"><div className="spinner" /><strong>{modelLoading ? '正在加载模型权重' : waitingPageTitle}</strong><span>{modelLoading ? '首次启动需要准备模型，完成后才会生成第 1 页' : waitingPageHint}</span>{modelLoading && <div className="model-stage-progress">{typeof modelHealth?.progress === 'number' ? <><progress max="100" value={modelHealth.progress} /><strong>{modelHealth.progress.toFixed(0)}%</strong></> : <small>{modelHealth?.stage || modelHealth?.message || '当前服务只提供阶段状态，未提供可靠总量'}</small>}</div>}</div>}
-                <button className="canvas-page-nav previous" onClick={() => movePage(-1)} disabled={pages.findIndex(page => page.page_index === pageIndex) <= 0} aria-label="上一页" title="上一页"><Icon name="chevron-left" /></button>
-                <button className="canvas-page-nav next" onClick={() => movePage(1)} disabled={pages.findIndex(page => page.page_index === pageIndex) < 0 || pages.findIndex(page => page.page_index === pageIndex) >= pages.length - 1} aria-label="下一页" title="下一页"><Icon name="chevron-right" /></button>
-                <span className="canvas-page-count" aria-label="当前页码">{currentPage.page_index + 1} / {pages.length}</span>
-                {pageLoading && <div className="page-loading" role="status"><span className="spinner" />正在载入第 {currentPage.page_index + 1} 页</div>}
-              </> : <div className="waiting-page"><strong>正在准备页面</strong><span>页面展开后会显示缩略图</span></div>}
-            </div>
+                 </div> : previewMode === 'source' ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : previewMode === 'mask' ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page mask-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={`/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask`} alt={`第 ${currentPage.page_index + 1} 页保护遮罩`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : currentResultUrl ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : waitingForModel ? <div className="waiting-page model-waiting"><span className="waiting-symbol">!</span><strong>模型服务未连接</strong><span>当前没有页面在处理，服务恢复后会自动继续</span>{selected.error && <small className="waiting-detail">{selected.error}</small>}<button onClick={() => refreshHealth()}>重新检测模型</button></div> : <div className="waiting-page"><div className="spinner" /><strong>{modelLoading ? '正在加载模型权重' : waitingPageTitle}</strong><span>{modelLoading ? '首次启动需要准备模型，完成后才会生成第 1 页' : waitingPageHint}</span>{modelLoading && <div className="model-stage-progress">{typeof modelHealth?.progress === 'number' ? <><progress max="100" value={modelHealth.progress} /><strong>{modelHealth.progress.toFixed(0)}%</strong></> : <small>{modelHealth?.stage || modelHealth?.message || '当前服务只提供阶段状态，未提供可靠总量'}</small>}</div>}</div>}
+              <button className="canvas-page-nav previous" onClick={() => movePage(-1)} disabled={pages.findIndex(page => page.page_index === pageIndex) <= 0} aria-label="上一页" title="上一页"><Icon name="chevron-left" /></button>
+              <button className="canvas-page-nav next" onClick={() => movePage(1)} disabled={pages.findIndex(page => page.page_index === pageIndex) < 0 || pages.findIndex(page => page.page_index === pageIndex) >= pages.length - 1} aria-label="下一页" title="下一页"><Icon name="chevron-right" /></button>
+              <span className="canvas-page-count" aria-label="当前页码">{currentPage.page_index + 1} / {pages.length}</span>
+              {pageLoading && <div className="page-loading" role="status"><span className="spinner" />正在载入第 {currentPage.page_index + 1} 页</div>}
+            </> : <div className="waiting-page"><strong>正在准备页面</strong><span>页面展开后会显示缩略图</span></div>}
+          </div>
             {readyNotice != null && <div className="page-ready-notice" role="status" aria-live="polite"><span>第 {readyNotice + 1} 页已完成，可以预览</span><button onClick={() => { manualPageSelectionRef.current.add(selected.id); pageSelectionRef.current.set(selected.id, readyNotice); setPageIndex(readyNotice); setReadyNotice(null) }}>查看这一页</button><button className="notice-dismiss" aria-label="关闭新页面提示" onClick={() => setReadyNotice(null)}>×</button></div>}
             <div className="filmstrip filmstrip-shell" aria-label="漫画页面">
               <div className="filmstrip-viewport">
                 <div className="filmstrip-pages">
                   {pages.map(page => <button key={page.page_index} ref={page.page_index === pageIndex ? activeFilmstripPageRef : undefined} className={page.page_index === pageIndex ? 'active' : ''} onClick={() => selectPage(page.page_index)}>
-                    <img loading="lazy" decoding="async" src={page.thumbnail_url || page.source_url} alt={`第 ${page.page_index + 1} 页`} /><span>{page.page_index + 1}</span>{page.final_url ? <i className="page-state-mark completed" aria-label="已完成"><Icon name="check" /></i> : page.preview_url ? <i className="page-state-mark processing" title="已有预览，尚未通过整页检查" aria-label="处理中">◌</i> : page.status === 'failed' ? <i className="page-state-mark failed" aria-label="失败" /> : null}
+                    <img loading="lazy" decoding="async" src={page.thumbnail_url || page.source_url} alt={`第 ${page.page_index + 1} 页`} /><span>{page.page_index + 1}</span>{!page.final_url && page.preview_url ? <i className="page-state-mark processing" title="已有预览，尚未通过整页检查" aria-label="处理中">◌</i> : ['failed', 'qa_failed', 'needs_attention'].includes(page.status) ? <i className="page-state-mark failed" aria-label="失败" /> : null}
                   </button>)}
                 </div>
               </div>
@@ -1243,7 +1392,7 @@ function App() {
           </> : <div className="empty-workspace"><span className="empty-mark">PT</span><h2>从一本漫画开始</h2><p>拖入图片、PDF、ZIP、CBZ、RAR 或 CBR</p><button className="button primary" onClick={() => setImportOpen(true)}><Icon name="upload" />选择漫画</button></div>}
         </section>
 
-        <Inspector selected={selected} presets={presets} health={health} currentPage={currentPage} collapsed={rightCollapsed} onToggle={() => setRightCollapsed(value => !value)} onAction={action} onRename={() => selected && setRenameTarget(selected)} onDelete={() => selected && setDeleteTarget(selected)} onRetry={retryPage} />
+        <Inspector selected={selected} presets={presets} health={health} currentPage={currentPage} collapsed={rightCollapsed} downloadBusy={downloadBusy} onToggle={() => setRightCollapsed(value => !value)} onAction={action} onRename={() => selected && setRenameTarget(selected)} onDelete={() => selected && setDeleteTarget(selected)} onRetry={retryPage} />
       </main>
 
       {selected && <section className={`progress-drawer ${progressOpen ? 'open' : ''}`}>
@@ -1266,11 +1415,9 @@ function App() {
               <div><small>处理速度</small><strong>{selected.progress.seconds_per_megapixel == null ? '正在估算' : `${selected.progress.seconds_per_megapixel.toFixed(1)} 秒 / 百万像素`}</strong></div>
               <div><small>预计剩余</small><strong>{formatEta(selected.progress.eta_seconds)}</strong></div>
               <div><small>建书读取</small><strong>{selected.progress.bytes_total ? `${formatBytes(selected.progress.bytes_processed || 0)} / ${formatBytes(selected.progress.bytes_total)}` : '已完成'}</strong></div>
-              <div className="progress-actions">{selected.status === 'completed' ? <button onClick={() => action(selected.id, 'download')}>下载成品</button> : selected.status === 'archived' ? <span>已在回收站</span> : <><button onClick={() => action(selected.id, selected.status === 'running' || selected.status === 'queued' ? 'pause' : 'start')}><Icon name={selected.status === 'running' || selected.status === 'queued' ? 'pause' : 'play'} />{selected.status === 'running' || selected.status === 'queued' ? '暂停' : '运行或继续'}</button><button onClick={() => action(selected.id, 'cancel')}>取消</button></>}</div>
+              <div className="progress-actions">{selected.status === 'completed' ? <button disabled={downloadBusy} onClick={() => action(selected.id, 'download')}>{downloadBusy ? '正在检查成品…' : '下载成品'}</button> : selected.status === 'archived' ? <span>已在回收站</span> : <><button onClick={() => action(selected.id, selected.status === 'running' || selected.status === 'queued' ? 'pause' : 'start')}><Icon name={selected.status === 'running' || selected.status === 'queued' ? 'pause' : 'play'} />{selected.status === 'running' || selected.status === 'queued' ? '暂停' : '运行或继续'}</button><button onClick={() => action(selected.id, 'cancel')}>取消</button></>}</div>
             </div>
-            <div className="page-status-grid" aria-label="每页状态">
-              {(selected.progress.page_states || []).map(page => <button key={page.page_index} className={`page-state ${page.status} ${page.page_index === pageIndex ? 'current' : ''}`} title={page.error || `第 ${page.page_index + 1} 页`} aria-label={`第 ${page.page_index + 1} 页 ${page.status === 'qa_passed' ? '完成' : page.status === 'running' ? '处理中' : page.status === 'failed' || page.status === 'qa_failed' ? '失败' : '等待'}`} onClick={() => { selectPage(page.page_index); setMobileTab('preview') }}><span className={`page-state-mark ${page.status === 'qa_passed' ? 'completed' : page.status === 'running' ? 'processing' : page.status === 'failed' || page.status === 'qa_failed' ? 'failed' : 'pending'}`} aria-hidden="true" /></button>)}
-            </div>
+            <PageStatusOverview states={selected.progress.page_states || []} currentPage={pageIndex} onSelect={index => { selectPage(index); setMobileTab('preview') }} />
           </div>
           <section className="activity-log" aria-label="后台日志">
             <header>
@@ -1339,12 +1486,13 @@ function App() {
   )
 }
 
-function Inspector({ selected, presets, health, currentPage, collapsed, onToggle, onAction, onRename, onDelete, onRetry }: {
+function Inspector({ selected, presets, health, currentPage, collapsed, downloadBusy, onToggle, onAction, onRename, onDelete, onRetry }: {
   selected: Job | null
   presets: Presets | null
   health: Record<string, EngineHealth>
   currentPage?: Page
   collapsed: boolean
+  downloadBusy: boolean
   onToggle: () => void
   onAction: (jobId: string, name: string) => void
   onRename: () => void
@@ -1372,7 +1520,7 @@ function Inspector({ selected, presets, health, currentPage, collapsed, onToggle
     <section className={`setting-section semantic-state ${semanticStatus === 'fallback' ? 'warning' : ''}`} aria-label="语义分层状态"><h3>语义分层</h3><strong>{semanticLabel}</strong><small>{semanticStatus === 'fallback' ? '确定性保护文字、气泡、墨线和边框；人物与场景采用完整彩色合成' : semanticStatus === 'ready' ? 'Koharu 保护文字、气泡和框线，确定性检测补充核心墨线；不虚构人体分层' : '页面资产可用后显示遮罩状态'}</small></section>
     <section className="setting-section"><h3>本地引擎</h3><div className="engine-state"><span className={`health-dot ${health[selected.spec.engine as string]?.ok ? 'ready' : ''}`} /><strong>{selected.spec.engine}</strong></div></section>
     <div className="inspector-actions">
-      {selected.status === 'completed' && <button className="button primary" onClick={() => onAction(selected.id, 'download')}>下载成品</button>}
+      {selected.status === 'completed' && <button className="button primary" disabled={downloadBusy} onClick={() => onAction(selected.id, 'download')}>{downloadBusy ? '正在检查成品…' : '下载成品'}</button>}
       {selected.status === 'archived' ? <>
         <button className="button secondary" onClick={() => onAction(selected.id, 'restore')}>从回收站恢复</button>
         <button className="danger-button" onClick={onDelete}>永久删除</button>

@@ -79,6 +79,27 @@ def test_api_create_run_and_download(tmp_path: Path, manga_pages: Path) -> None:
             "application/vnd.comicbook+zip",
             "application/zip",
         }
+        info = client.get(f"/api/jobs/{job_id}/download-info")
+        assert info.status_code == 200
+        download_info = info.json()
+        assert download_info["ready"] is True
+        assert download_info["size_bytes"] == int(response.headers["content-length"])
+        head = client.head(f"/api/jobs/{job_id}/download")
+        assert head.status_code == 200
+        assert head.headers["accept-ranges"] == "bytes"
+        assert head.headers["content-length"] == str(download_info["size_bytes"])
+        ranged = client.get(
+            f"/api/jobs/{job_id}/download",
+            headers={"Range": "bytes=0-7"},
+        )
+        assert ranged.status_code == 206
+        assert len(ranged.content) == 8
+        assert ranged.headers["content-range"].startswith("bytes 0-7/")
+        invalid_range = client.get(
+            f"/api/jobs/{job_id}/download",
+            headers={"Range": "bytes=999999999-"},
+        )
+        assert invalid_range.status_code == 416
 
 
 @pytest.mark.parametrize(

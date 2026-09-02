@@ -28,7 +28,7 @@ from .engines import EngineRegistry
 from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode
 from .observability import RawLogStore, SystemTelemetry, redact_sensitive_text
 from .presets import presets_payload
-from .project import ProjectManager
+from .project import DisplayAssetPending, ProjectManager
 from .runtime import EventHub, JobQueue
 from .schemas import (
     FolderNode,
@@ -58,6 +58,27 @@ ALLOWED_UPLOADS = {
     ".rar": "book",
     ".cbr": "book",
 }
+
+DOWNLOAD_OUTPUT_NAMES = {
+    "book.cbz",
+    "book.pdf",
+    "book-images.zip",
+    "book-jpeg.zip",
+    "book-webp.zip",
+}
+
+
+def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
+    """Yield one bounded file range without buffering the complete archive."""
+    with path.open("rb") as stream:
+        stream.seek(start)
+        remaining = end - start
+        while remaining > 0:
+            chunk = stream.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
 
 
 class JobOptions(BaseModel):
@@ -137,7 +158,7 @@ def _option_payload() -> dict[str, list[dict[str, str]]]:
             {
                 "id": "colorize",
                 "name": "原作上色",
-                "description": "保留原作构图与线稿，只生成颜色和光影",
+                "description": "只添加颜色，原始构图和线稿不会改变",
                 "best_for": "黑白漫画批量上色",
                 "changes": "颜色、环境光和材质",
                 "tradeoff": "画风变化较小",
@@ -153,7 +174,7 @@ def _option_payload() -> dict[str, list[dict[str, str]]]:
             {
                 "id": "style_full",
                 "name": "完整画风重绘",
-                "description": "允许模型重画线条，只保护文字与分镜",
+                "description": "可能改变线条、表情、构图和细节",
                 "best_for": "画风变化优先的页面",
                 "changes": "线条、五官画法、阴影和材质",
                 "tradeoff": "人物细节可能发生变化",
@@ -1975,6 +1996,18 @@ def create_app(
                     / "thumbnails"
                     / f"page_{page['page_index']:05d}.jpg"
                 )
+                source_display_path = (
+                    manager._job_dir(job_id)
+                    / "display"
+                    / "source"
+                    / f"page_{page['page_index']:05d}.webp"
+                )
+                final_display_path = (
+                    manager._job_dir(job_id)
+                    / "display"
+                    / "final"
+                    / f"page_{page['page_index']:05d}.webp"
+                )
                 output_path = Path(page["output_path"] or "")
                 has_final = bool(page["output_path"] and output_path.is_file())
                 revision = page.get("asset_revision")
@@ -2020,7 +2053,9 @@ def create_app(
                         "source_display_url": (
                             f"/api/assets/jobs/{job_id}/pages/"
                             f"{page['page_index']}/source.webp?v={revision or 0}"
-                        ),
+                        )
+                        if source_display_path.is_file()
+                        else None,
                         "thumbnail_url": (
                             derived_asset_url(thumbnail_path, thumbnail_base, revision)
                             if has_final and thumbnail_path.is_file()
@@ -2036,7 +2071,7 @@ def create_app(
                         "final_display_url": (
                             f"/api/assets/jobs/{job_id}/pages/"
                             f"{page['page_index']}/final.webp?v={revision or 0}"
-                            if has_final
+                            if has_final and final_display_path.is_file()
                             else None
                         ),
                         "preview_url": derived_asset_url(preview_path, preview_base, revision)
@@ -2119,11 +2154,7 @@ def create_app(
                 ),
                 encoding="utf-8",
             )
-            page = next(
-                item
-                for item in manager._manifest(job_id).pages(job_id)
-                if int(item["page_index"]) == page_index
-            )
+            page = manager._manifest(job_id).page_by_index(job_id, page_index)
             manager._manifest(job_id).save_mask_correction(int(page["id"]), corrections)
             hub.publish(
                 "mask_correction_saved",
@@ -2188,9 +2219,7 @@ def create_app(
     ) -> FileResponse | Response:
         try:
             manifest = manager._manifest(job_id)
-            page = next(
-                item for item in manifest.pages(job_id) if int(item["page_index"]) == page_index
-            )
+            page = manifest.page_by_index(job_id, page_index)
             if variant == "thumbnail":
                 path = (
                     manager._job_dir(job_id) / "final" / "thumbnails" / f"page_{page_index:05d}.jpg"
@@ -2269,7 +2298,7 @@ def create_app(
         page_index: int,
         variant: Literal["source", "final"],
         v: str | None = None,
-    ) -> FileResponse:
+    ) -> FileResponse | Response:
         try:
             path = manager.display_asset(job_id, page_index, variant)
             cache_control = (
@@ -2282,11 +2311,22 @@ def create_app(
                 media_type="image/webp",
                 headers={"Cache-Control": cache_control},
             )
+        except DisplayAssetPending:
+            manager.schedule_display_asset(job_id, page_index, variant)
+            return JSONResponse(
+                {
+                    "status": "preparing",
+                    "page_index": page_index,
+                    "variant": variant,
+                    "message": "页面显示资源正在准备，请稍后重试",
+                },
+                status_code=202,
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
         except (KeyError, StopIteration, FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="页面显示图尚不可用") from exc
 
-    @app.get("/api/jobs/{job_id}/download")
-    def download(job_id: str) -> FileResponse:
+    def _download_output(job_id: str) -> Path:
         try:
             output_dir = manager._job_dir(job_id) / "output"
         except ValueError as exc:
@@ -2295,25 +2335,105 @@ def create_app(
             (
                 path
                 for path in output_dir.glob("book*")
-                if path.is_file() and path.name in {
-                    "book.cbz",
-                    "book.pdf",
-                    "book-images.zip",
-                    "book-jpeg.zip",
-                    "book-webp.zip",
-                }
+                if path.is_file() and path.name in DOWNLOAD_OUTPUT_NAMES
             ),
             key=lambda path: path.stat().st_mtime_ns,
             reverse=True,
         )
         if not outputs:
             raise HTTPException(status_code=404, detail="整本成品尚不可用")
-        media_type = {
+        return outputs[0]
+
+    def _download_media_type(path: Path) -> str:
+        return {
             ".cbz": "application/vnd.comicbook+zip",
             ".pdf": "application/pdf",
             ".zip": "application/zip",
-        }.get(outputs[0].suffix.casefold(), "application/octet-stream")
-        return FileResponse(outputs[0], filename=outputs[0].name, media_type=media_type)
+        }.get(path.suffix.casefold(), "application/octet-stream")
+
+    def _download_headers(path: Path) -> dict[str, str]:
+        size = path.stat().st_size
+        return {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(size),
+            "Content-Disposition": f'attachment; filename="{path.name}"',
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        }
+
+    @app.get("/api/jobs/{job_id}/download-info")
+    def download_info(job_id: str) -> dict[str, Any]:
+        path = _download_output(job_id)
+        stat = path.stat()
+        return {
+            "ready": True,
+            "file_name": path.name,
+            "media_type": _download_media_type(path),
+            "size_bytes": stat.st_size,
+            "revision": f"{stat.st_mtime_ns}-{stat.st_size}",
+            "download_url": f"/api/jobs/{job_id}/download",
+        }
+
+    @app.head("/api/jobs/{job_id}/download")
+    def download_head(job_id: str) -> Response:
+        path = _download_output(job_id)
+        return Response(
+            status_code=200,
+            media_type=_download_media_type(path),
+            headers=_download_headers(path),
+        )
+
+    @app.get("/api/jobs/{job_id}/download", response_model=None)
+    def download(job_id: str, request: Request) -> StreamingResponse | Response:
+        path = _download_output(job_id)
+        size = path.stat().st_size
+        headers = _download_headers(path)
+        range_header = request.headers.get("range")
+        if not range_header:
+            return StreamingResponse(
+                _iter_file_range(path, 0, size),
+                status_code=200,
+                media_type=_download_media_type(path),
+                headers=headers,
+            )
+        if not range_header.startswith("bytes=") or "," in range_header:
+            return Response(
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{size}"},
+            )
+        value = range_header[6:].strip()
+        try:
+            start_text, end_text = value.split("-", 1)
+            if not start_text:
+                suffix_length = int(end_text)
+                if suffix_length <= 0:
+                    raise ValueError
+                start = max(0, size - suffix_length)
+                end = size - 1
+            else:
+                start = int(start_text)
+                end = int(end_text) if end_text else size - 1
+                if start < 0 or end < start:
+                    raise ValueError
+                end = min(end, size - 1)
+            if start >= size or end < start:
+                raise ValueError
+        except (TypeError, ValueError):
+            return Response(
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{size}"},
+            )
+        ranged_headers = {
+            **headers,
+            "Content-Length": str(end - start + 1),
+            "Content-Range": f"bytes {start}-{end}/{size}",
+        }
+        return StreamingResponse(
+            _iter_file_range(path, start, end + 1),
+            status_code=206,
+            media_type=_download_media_type(path),
+            headers=ranged_headers,
+        )
 
     @app.get("/api/models")
     def models() -> list[ModelDescriptor]:
@@ -2326,6 +2446,15 @@ def create_app(
         result: list[dict[str, Any]] = []
         for descriptor in model_catalog["models"]:
             marker = settings.model_root / "installed" / f"{descriptor['id']}.json"
+            # The compatibility adapter was previously recorded under the
+            # provisional ``semantic-manga-v1`` filename. Read that marker
+            # during the transition, while exposing the truthful compatible
+            # model id in the catalog and download actions.
+            legacy_marker = (
+                settings.model_root / "installed" / "semantic-manga-v1.json"
+                if descriptor["id"] == "semantic-manga-v1-compatible"
+                else None
+            )
             item = dict(descriptor)
             service_state = next(
                 (
@@ -2338,7 +2467,7 @@ def create_app(
                 None,
             )
             connected = descriptor["repository"] in connected_repositories
-            if descriptor["id"] == "semantic-manga-v1":
+            if descriptor["id"] == "semantic-manga-v1-compatible":
                 semantic_url = getattr(manager.semantic_engine, "base_url", "")
                 if semantic_url:
                     try:
@@ -2349,7 +2478,7 @@ def create_app(
                         )
                     except (httpx.HTTPError, ValueError):
                         connected = False
-            item["installed"] = marker.is_file()
+            item["installed"] = marker.is_file() or bool(legacy_marker and legacy_marker.is_file())
             item["connected"] = connected
             item["supports_interrupt"] = bool(
                 service_state and service_state.get("supports_interrupt", False)
@@ -2358,7 +2487,7 @@ def create_app(
                 service_state and service_state.get("supports_release", False)
             )
             item["status"] = (
-                "ready" if connected else "installed" if marker.is_file() else "not_ready"
+                "ready" if connected else "installed" if item["installed"] else "not_ready"
             )
             with model_download_lock:
                 if not connected and descriptor["id"] in model_downloads:
@@ -2373,7 +2502,7 @@ def create_app(
 
             descriptor = next(item for item in model_catalog["models"] if item["id"] == model_id)
             local_dir = None
-            if model_id == "semantic-manga-v1":
+            if model_id == "semantic-manga-v1-compatible":
                 local_dir = settings.model_root / "semantic" / "koharu-yolo26s"
                 local_dir.mkdir(parents=True, exist_ok=True)
             snapshot_path = snapshot_download(
