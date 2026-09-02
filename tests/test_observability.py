@@ -27,6 +27,22 @@ def test_raw_log_filters_are_scoped_by_component_and_level(tmp_path: Path) -> No
     assert len(store.read(kind="gpu", level="WARNING", component="gpu")) == 1
 
 
+def test_tail_queries_use_bounded_memory_after_startup(tmp_path: Path, monkeypatch) -> None:
+    store = RawLogStore(tmp_path)
+    for index in range(20):
+        store.write(component="api", event="request", message=str(index))
+
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("tail query rescanned the file")
+        ),
+    )
+
+    assert [item["message"] for item in store.read(limit=3)] == ["17", "18", "19"]
+
+
 def test_raw_log_redacts_paths_and_secrets(tmp_path: Path) -> None:
     store = RawLogStore(tmp_path, redacted_roots=[tmp_path])
     entry = store.write(
@@ -87,3 +103,22 @@ def test_telemetry_reports_unavailable_gpu_without_fake_numbers(
         assert payload.get("memory_used_mib") is None
     finally:
         telemetry.stop()
+
+
+def test_telemetry_persists_at_lower_rate_than_live_samples(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = RawLogStore(tmp_path / "logs")
+    telemetry = SystemTelemetry(Settings(data_root=tmp_path / "jobs"), store)
+    telemetry.stop()
+    monkeypatch.setattr(telemetry, "_sample_gpu", lambda: (None, "测试环境没有 GPU"))
+    moments = iter((100.0, 100.0, 105.0, 111.0, 111.0))
+    monkeypatch.setattr("manga_repaint.observability.time.monotonic", lambda: next(moments))
+    telemetry._last_persisted = 0.0
+    before = len(store.read(kind="gpu"))
+
+    telemetry.sample()
+    telemetry.sample()
+    telemetry.sample()
+
+    assert len(store.read(kind="gpu")) == before + 2

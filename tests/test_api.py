@@ -61,6 +61,18 @@ def test_api_create_run_and_download(tmp_path: Path, manga_pages: Path) -> None:
         assert output.is_file()
         response = client.get(f"/api/jobs/{job_id}")
         assert response.json()["status"] == "completed"
+        pages = client.get(f"/api/jobs/{job_id}/pages").json()
+        assert pages[0]["source_display_url"].startswith("/api/assets/")
+        assert pages[0]["final_display_url"].startswith("/api/assets/")
+        display = client.get(pages[0]["final_display_url"])
+        assert display.status_code == 200
+        assert display.headers["content-type"] == "image/webp"
+        assert display.headers["cache-control"] == (
+            "private, max-age=31536000, immutable"
+        )
+        assert len(display.content) <= 900 * 1024
+        unversioned = client.get(pages[0]["final_display_url"].split("?", 1)[0])
+        assert unversioned.headers["cache-control"] == "no-store, max-age=0"
         response = client.get(f"/api/jobs/{job_id}/download")
         assert response.status_code == 200
         assert response.headers["content-type"] in {

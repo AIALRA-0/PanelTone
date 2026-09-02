@@ -126,8 +126,10 @@ class PageAsset(BaseModel):
     page_index: int
     status: str
     source_url: str
+    source_display_url: str | None = None
     preview_url: str | None = None
     final_url: str | None = None
+    final_display_url: str | None = None
     thumbnail_url: str | None = None
     asset_revision: str | None = None
     preview_only: bool = False

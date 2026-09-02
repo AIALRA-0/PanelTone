@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,22 +71,49 @@ class RawLogStore:
         # an application restart makes Last-Event-ID ambiguous and can cause
         # logs to disappear or be shown twice.  Recover the largest ID once at
         # startup so IDs remain monotonic across normal restarts and rotations.
-        self._sequence = self._read_last_sequence()
+        self._recent: deque[dict[str, Any]] = deque(
+            self._load_recent_records(2_000), maxlen=2_000
+        )
+        self._sequence = max(
+            (int(item.get("id", 0)) for item in self._recent), default=0
+        )
 
-    def _read_last_sequence(self) -> int:
-        last = 0
-        for path in self.root.glob("paneltone-*.jsonl*"):
-            try:
-                with path.open("rb") as stream:
-                    for line in stream:
-                        try:
-                            value = json.loads(line.decode("utf-8"))
-                            last = max(last, int(value.get("id", 0)))
-                        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-                            continue
-            except OSError:
-                continue
-        return last
+    @staticmethod
+    def _tail_lines(path: Path, limit: int) -> list[str]:
+        """Read only the end of a JSONL file instead of rescanning megabytes."""
+        if limit <= 0:
+            return []
+        try:
+            with path.open("rb") as stream:
+                stream.seek(0, 2)
+                position = stream.tell()
+                blocks: list[bytes] = []
+                newlines = 0
+                while position > 0 and newlines <= limit:
+                    size = min(64 * 1024, position)
+                    position -= size
+                    stream.seek(position)
+                    block = stream.read(size)
+                    blocks.append(block)
+                    newlines += block.count(b"\n")
+            return b"".join(reversed(blocks)).decode("utf-8", errors="replace").splitlines()[
+                -limit:
+            ]
+        except OSError:
+            return []
+
+    def _load_recent_records(self, limit: int) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for path in self._iter_paths():
+            for line in self._tail_lines(path, limit):
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    records.append(item)
+        records.sort(key=lambda item: int(item.get("id", 0)))
+        return records[-limit:]
 
     def redact(self, value: Any) -> Any:
         if isinstance(value, dict):
@@ -144,6 +172,7 @@ class RawLogStore:
                 "kind": kind,
             }
             entry = self.redact(entry)
+            self._recent.append(entry)
             encoded = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
                 "utf-8"
             )
@@ -185,6 +214,48 @@ class RawLogStore:
         limit: int = 200,
         after: int | None = None,
     ) -> list[dict[str, Any]]:
+        with self._lock:
+            records = list(self._recent)
+        return self._filter_records(
+            records,
+            kind=kind,
+            job_id=job_id,
+            level=level,
+            component=component,
+            limit=limit,
+            after=after,
+        )
+
+    @staticmethod
+    def _filter_records(
+        records: list[dict[str, Any]],
+        *,
+        kind: str,
+        job_id: str | None,
+        level: str | None,
+        component: str | None,
+        limit: int,
+        after: int | None,
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        for item in records:
+            if kind == "gpu" and item.get("kind") != "gpu" and item.get("component") != "gpu":
+                continue
+            if kind == "raw" and item.get("kind") == "gpu":
+                continue
+            if job_id and item.get("job_id") != job_id:
+                continue
+            if level and str(item.get("level", "")).upper() != level.upper():
+                continue
+            if component and item.get("component") != component:
+                continue
+            if after is not None and int(item.get("id", 0)) <= after:
+                continue
+            filtered.append(item)
+        filtered.sort(key=lambda item: int(item.get("id", 0)))
+        return filtered[-max(1, min(limit, 20_000)) :]
+
+    def _read_disk(self) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
         for path in self._iter_paths():
             try:
@@ -196,24 +267,20 @@ class RawLogStore:
                     item = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if kind == "gpu" and item.get("kind") != "gpu" and item.get("component") != "gpu":
-                    continue
-                if kind == "raw" and item.get("kind") == "gpu":
-                    continue
-                if job_id and item.get("job_id") != job_id:
-                    continue
-                if level and str(item.get("level", "")).upper() != level.upper():
-                    continue
-                if component and item.get("component") != component:
-                    continue
-                if after is not None and int(item.get("id", 0)) <= after:
-                    continue
-                records.append(item)
-        records.sort(key=lambda item: int(item.get("id", 0)))
-        return records[-max(1, min(limit, 20_000)) :]
+                if isinstance(item, dict):
+                    records.append(item)
+        return records
 
     def export(self, *, kind: str = "raw", job_id: str | None = None) -> bytes:
-        records = self.read(kind=kind, job_id=job_id, limit=20_000)
+        records = self._filter_records(
+            self._read_disk(),
+            kind=kind,
+            job_id=job_id,
+            level=None,
+            component=None,
+            limit=20_000,
+            after=None,
+        )
         return b"".join(
             (json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
             for item in records
@@ -254,6 +321,7 @@ class SystemTelemetry:
             "available": False,
             "reason": "尚未采集本机指标",
         }
+        self._last_persisted = 0.0
         self._thread = threading.Thread(
             target=self._run,
             name="paneltone-system-telemetry",
@@ -477,14 +545,17 @@ class SystemTelemetry:
         payload = self.store.redact(payload)
         with self._lock:
             self._latest = payload
-        self.store.write(
-            component="gpu",
-            event="metrics",
-            message="GPU 和系统指标已采集" if gpu else "GPU 指标不可用，已记录原因",
-            metrics=payload,
-            kind="gpu",
-            level="INFO" if gpu else "WARNING",
-        )
+        now = time.monotonic()
+        if now - self._last_persisted >= 10.0:
+            self.store.write(
+                component="gpu",
+                event="metrics",
+                message="GPU 和系统指标已采集" if gpu else "GPU 指标不可用，已记录原因",
+                metrics=payload,
+                kind="gpu",
+                level="INFO" if gpu else "WARNING",
+            )
+            self._last_persisted = now
         if self.event_callback:
             self.event_callback("gpu_metrics", payload, None)
         return payload

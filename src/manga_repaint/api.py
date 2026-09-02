@@ -426,35 +426,36 @@ def create_app(
 
     def publish(kind: str, payload: dict[str, Any], job_id: str | None = None) -> None:
         try:
-            log_store.write(
-                component=(
-                    "gpu"
-                    if kind == "gpu_metrics"
-                    else "model"
-                    if kind.startswith("model")
-                    else "task"
-                ),
-                event=kind,
-                message=str(payload.get("message") or kind),
-                error_code=(
-                    str(payload["error_code"])
-                    if payload.get("error_code") is not None
-                    else None
-                ),
-                job_id=job_id,
-                page_index=(
-                    int(payload["page_index"]) if payload.get("page_index") is not None else None
-                ),
-                unit_index=(
-                    int(payload["unit_index"]) if payload.get("unit_index") is not None else None
-                ),
-                metrics={
-                    key: value
-                    for key, value in payload.items()
-                    if key not in {"message", "page_index", "unit_index"}
-                },
-                kind="gpu" if kind == "gpu_metrics" else "raw",
-            )
+            # SystemTelemetry already persists GPU samples at a bounded rate.
+            # Publishing the SSE event must not write the same sample twice.
+            if kind != "gpu_metrics":
+                log_store.write(
+                    component="model" if kind.startswith("model") else "task",
+                    event=kind,
+                    message=str(payload.get("message") or kind),
+                    error_code=(
+                        str(payload["error_code"])
+                        if payload.get("error_code") is not None
+                        else None
+                    ),
+                    job_id=job_id,
+                    page_index=(
+                        int(payload["page_index"])
+                        if payload.get("page_index") is not None
+                        else None
+                    ),
+                    unit_index=(
+                        int(payload["unit_index"])
+                        if payload.get("unit_index") is not None
+                        else None
+                    ),
+                    metrics={
+                        key: value
+                        for key, value in payload.items()
+                        if key not in {"message", "page_index", "unit_index"}
+                    },
+                    kind="raw",
+                )
         except Exception:
             logger.exception("unable to write raw log event=%s", kind)
         if telemetry is not None and kind in {"job_status", "model_progress"}:
@@ -664,17 +665,22 @@ def create_app(
             )
             raise
         elapsed_ms = round((datetime.now(UTC) - started).total_seconds() * 1000, 1)
-        log_store.write(
-            component="api",
-            event="request",
-            message=f"{request.method} {request.url.path}",
-            metrics={
-                "method": request.method,
-                "path": request.url.path,
-                "status_code": response.status_code,
-                "elapsed_ms": elapsed_ms,
-            },
-        )
+        if not (
+            request.method == "GET"
+            and request.url.path.startswith("/api/assets/")
+            and response.status_code < 400
+        ):
+            log_store.write(
+                component="api",
+                event="request",
+                message=f"{request.method} {request.url.path}",
+                metrics={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": response.status_code,
+                    "elapsed_ms": elapsed_ms,
+                },
+            )
         if request.url.path.startswith("/api/") and request.method == "GET":
             response.headers.setdefault("Cache-Control", "no-store, max-age=0")
             response.headers.setdefault("Pragma", "no-cache")
@@ -767,7 +773,7 @@ def create_app(
                 RawLogEntry.model_validate(item).model_dump(exclude_none=True)
                 for item in log_store.read(
                     kind=kind,
-                    job_id=job_id,
+                    job_id=None if kind == "gpu" else job_id,
                     level=level,
                     component=component,
                     limit=limit,
@@ -1874,7 +1880,6 @@ def create_app(
                                 "latest_message": f"已重组第 {page_index + 1} 页",
                             },
                         )
-                        emit_page_ready(page_index)
 
                     repaired = manager.repair_completed_colorization(
                         job_id, progress_callback=report_page
@@ -2012,6 +2017,10 @@ def create_app(
                         "error": next((unit["error"] for unit in units if unit["error"]), None),
                         "asset_revision": revision,
                         "source_url": derived_asset_url(source_path, source_base, revision),
+                        "source_display_url": (
+                            f"/api/assets/jobs/{job_id}/pages/"
+                            f"{page['page_index']}/source.webp?v={revision or 0}"
+                        ),
                         "thumbnail_url": (
                             derived_asset_url(thumbnail_path, thumbnail_base, revision)
                             if has_final and thumbnail_path.is_file()
@@ -2024,6 +2033,12 @@ def create_app(
                         "final_url": derived_asset_url(output_path, final_base, revision)
                         if has_final
                         else None,
+                        "final_display_url": (
+                            f"/api/assets/jobs/{job_id}/pages/"
+                            f"{page['page_index']}/final.webp?v={revision or 0}"
+                            if has_final
+                            else None
+                        ),
                         "preview_url": derived_asset_url(preview_path, preview_base, revision)
                         if preview_path.is_file()
                         else None,
@@ -2244,6 +2259,31 @@ def create_app(
             )
         except (KeyError, StopIteration, FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="页面图像尚不可用") from exc
+
+    @app.get(
+        "/api/assets/jobs/{job_id}/pages/{page_index}/{variant}.webp",
+        response_model=None,
+    )
+    def page_display_image(
+        job_id: str,
+        page_index: int,
+        variant: Literal["source", "final"],
+        v: str | None = None,
+    ) -> FileResponse:
+        try:
+            path = manager.display_asset(job_id, page_index, variant)
+            cache_control = (
+                "private, max-age=31536000, immutable"
+                if v
+                else "no-store, max-age=0"
+            )
+            return FileResponse(
+                path,
+                media_type="image/webp",
+                headers={"Cache-Control": cache_control},
+            )
+        except (KeyError, StopIteration, FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="页面显示图尚不可用") from exc
 
     @app.get("/api/jobs/{job_id}/download")
     def download(job_id: str) -> FileResponse:
