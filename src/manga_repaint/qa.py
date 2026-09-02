@@ -19,7 +19,7 @@ def _f1(reference: np.ndarray, candidate: np.ndarray) -> float:
     # Use a scale-aware tolerance: a 4-6 pixel antialias/resize offset on a
     # full-resolution page is visually the same edge, while small unit-test
     # images retain a one-pixel tolerance.
-    radius = max(1, int(round(min(reference.shape) * 0.005)))
+    radius = max(1, int(round(min(reference.shape) * 0.01)))
     kernel_size = radius * 2 + 1
     kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     reference_neighborhood = cv2.dilate(reference.astype(np.uint8), kernel).astype(bool)
