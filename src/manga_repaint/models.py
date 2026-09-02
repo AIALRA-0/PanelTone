@@ -111,6 +111,10 @@ class QAResult:
     reasons: list[str] = field(default_factory=list)
     pure_black_preservation_rate: float = 1.0
     protected_area_ratio: float = 0.0
+    generated_color_coverage: float = 0.0
+    result_color_coverage: float = 0.0
+    color_retention_ratio: float = 1.0
+    color_dropout_tiles: int = 0
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)

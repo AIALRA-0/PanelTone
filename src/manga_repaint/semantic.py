@@ -349,11 +349,19 @@ def semantic_descriptor(
     engine: SemanticMaskEngine, result: SemanticMaskResult | None = None
 ) -> dict[str, object]:
     provider = result.provider if result is not None else engine.provider
+    supported_classes = ["text", "bubbles", "borders", "ink"]
+    if provider == "deterministic-protection":
+        supported_classes.append("background")
+    unsupported_classes = [
+        name for name in SEMANTIC_CLASSES if name not in supported_classes
+    ]
     return {
         "status": "fallback" if provider == "deterministic-protection" else "ready",
         "provider": provider,
         "version": result.version if result is not None else engine.version,
         "classes": list(SEMANTIC_CLASSES),
+        "supported_classes": supported_classes,
+        "unsupported_classes": unsupported_classes,
         "order": list(SEMANTIC_ORDER),
         "confidence_threshold": getattr(engine, "confidence_threshold", 0.78),
         "uncertain_ratio": result.uncertain_ratio if result else 0.0,

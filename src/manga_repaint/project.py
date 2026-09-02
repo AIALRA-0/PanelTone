@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import shutil
@@ -20,8 +21,6 @@ from .color import (
     composite_protected,
     composite_strict_colorization,
     preserve_ink_overlay,
-    preserve_luminance_lab,
-    replace_masked,
 )
 from .config import Settings, ensure_allowed_path
 from .engines import EngineInterrupted, EngineRegistry, EngineRequest
@@ -35,7 +34,7 @@ from .masks import (
     ink_detail_mask,
     save_mask,
 )
-from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode, UnitStatus
+from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode
 from .panels import extract_panels
 from .presets import build_prompt, get_color_preset, get_style_preset, render_profile
 from .qa import evaluate
@@ -709,8 +708,13 @@ class ProjectManager:
     def _corrected_unit_masks(
         self, job_id: str, unit: dict[str, Any]
     ) -> tuple[np.ndarray, np.ndarray]:
-        with Image.open(unit["mask_path"]) as mask_image:
-            mask = np.asarray(mask_image.convert("L")) > 0
+        # Recompute deterministic protection so a compositor repair is not
+        # forced to reuse an older, overly broad bubble/text mask.
+        spec = self._load_spec(job_id)
+        with Image.open(unit["source_path"]) as source_image:
+            mask = deterministic_protection_mask(
+                source_image.convert("RGB"), preserve_text=spec.preserve_text
+            )
         page_id = int(unit["page_id"])
         corrections = self._manifest(job_id).mask_corrections(page_id)
         corrected = apply_mask_corrections(
@@ -777,7 +781,14 @@ class ProjectManager:
             hue_shift=float(profile["hue_shift"]),
         )
         effective_chroma = spec.chroma_strength * float(profile["chroma_multiplier"])
-        if (
+        if spec.mode == JobMode.COLORIZE:
+            final = composite_strict_colorization(
+                source_rgb,
+                generated_rgb,
+                mask,
+                chroma_strength=effective_chroma,
+            )
+        elif (
             spec.mode == JobMode.STYLE_FULL
             or not spec.preserve_ink
             or spec.detail_mode == DetailMode.GENERATIVE
@@ -806,12 +817,15 @@ class ProjectManager:
                 mask,
                 chroma_strength=effective_chroma,
             )
-        # A semantic provider may explicitly mark pixels as uncertain.  Keep
-        # their source luminance even in the more permissive detail modes so a
-        # weak segmentation result cannot create large, flat colour blocks.
-        if uncertain_mask is not None and uncertain_mask.any():
-            luminance_safe = preserve_luminance_lab(source_rgb, final, effective_chroma)
-            final = replace_masked(final, luminance_safe, uncertain_mask)
+        # For colourization, uncertainty is diagnostic only. Returning those
+        # areas to source luminance caused large gray islands in otherwise
+        # valid generated colour. Style-transfer modes retain the old guard.
+        if (
+            spec.mode != JobMode.COLORIZE
+            and uncertain_mask is not None
+            and uncertain_mask.any()
+        ):
+            final = composite_protected(source_rgb, final, uncertain_mask)
         qa_mask = mask
         if spec.preserve_ink and spec.mode != JobMode.STYLE_FULL:
             qa_mask = np.logical_or(mask, ink_detail_mask(source_rgb, threshold=64))
@@ -1048,7 +1062,8 @@ class ProjectManager:
                             mode=spec.mode,
                             seed=spec.seed
                             + int(unit["page_index"]) * 1000
-                            + int(unit["unit_index"]),
+                            + int(unit["unit_index"])
+                            + max(0, attempts_used - 1) * 1_000_003,
                             prompt=prompt,
                             negative_prompt=(
                                 spec.negative_prompt.strip()
@@ -1138,6 +1153,7 @@ class ProjectManager:
                                 source_rgb,
                                 final,
                                 qa_mask,
+                                generated=generated_image,
                                 line_f1_min=(
                                     self.settings.qa_line_f1_min
                                     if spec.mode != JobMode.STYLE_FULL
@@ -1146,6 +1162,7 @@ class ProjectManager:
                                 luminance_mae_max=(
                                     self.settings.qa_luminance_mae_max
                                     if spec.detail_mode == DetailMode.STRICT
+                                    and spec.mode != JobMode.COLORIZE
                                     else 255.0
                                 ),
                                 pure_black_preservation_min=(
@@ -1440,6 +1457,56 @@ class ProjectManager:
             manifest.set_page_asset_revision(page_id, str(time.time_ns()))
             return output
 
+    def display_asset(self, job_id: str, page_index: int, variant: str) -> Path:
+        """Create a browser-sized WebP without altering the archival PNG."""
+        if variant not in {"source", "final"}:
+            raise ValueError("Unknown display asset variant")
+        manifest = self._manifest(job_id)
+        page = next(
+            item
+            for item in manifest.pages(job_id)
+            if int(item["page_index"]) == page_index
+        )
+        source_path = Path(
+            page["source_path"] if variant == "source" else page["output_path"] or ""
+        )
+        if not source_path.is_file():
+            raise FileNotFoundError(source_path)
+        output = (
+            self._job_dir(job_id)
+            / "display"
+            / variant
+            / f"page_{page_index:05d}.webp"
+        )
+        with self._preview_lock:
+            if output.is_file() and output.stat().st_mtime_ns >= source_path.stat().st_mtime_ns:
+                return output
+            with Image.open(source_path) as image:
+                display = image.convert("RGB")
+                display.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+                encoded = b""
+                for quality in (90, 87, 84):
+                    buffer = io.BytesIO()
+                    display.save(buffer, format="WEBP", quality=quality, method=6)
+                    encoded = buffer.getvalue()
+                    if len(encoded) <= 900 * 1024:
+                        break
+                while len(encoded) > 900 * 1024 and max(display.size) > 960:
+                    next_long_edge = max(960, int(max(display.size) * 0.88))
+                    resized = image.convert("RGB")
+                    resized.thumbnail(
+                        (next_long_edge, next_long_edge), Image.Resampling.LANCZOS
+                    )
+                    display = resized
+                    buffer = io.BytesIO()
+                    display.save(buffer, format="WEBP", quality=84, method=6)
+                    encoded = buffer.getvalue()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            temporary = output.with_suffix(".tmp.webp")
+            temporary.write_bytes(encoded)
+            temporary.replace(output)
+        return output
+
     def _paste_units_safely(
         self, canvas: Image.Image, units: list[dict[str, Any]], *, job_id: str
     ) -> int:
@@ -1506,147 +1573,174 @@ class ProjectManager:
         job_id: str,
         progress_callback: Callable[[int, int, int], None] | None = None,
     ) -> int:
-        """Rebuild completed color pages after a deterministic compositor fix.
+        """Stage, verify and atomically publish a deterministic CPU repair.
 
-        Generated model images are kept intact, so this operation never invokes
-        the GPU and can safely repair a paused or completed job in place.
+        Generated model images are kept intact. No live panel, page, manifest
+        row or export is changed until every staged unit and assembled page has
+        passed validation.
         """
         manifest = self._manifest(job_id)
         spec = self._load_spec(job_id)
-        repaired = 0
         pages = manifest.pages(job_id)
         total_pages = len(pages)
-        for page_number, page in enumerate(pages, start=1):
-            for unit in manifest.page_units(int(page["id"])):
-                # page_units(page_id) intentionally returns only unit columns;
-                # carry the already-known page index into the shared mask path
-                # so semantic crops and diagnostics address the right page.
-                unit = {**unit, "page_index": int(page["page_index"])}
-                generated_path = Path(unit["generated_path"] or "")
-                source_path = Path(unit["source_path"])
-                final_path = Path(unit["final_path"] or "")
-                if (
-                    not generated_path.is_file()
-                    or not source_path.is_file()
-                    or not final_path.is_file()
-                ):
-                    continue
-                with (
-                    Image.open(source_path) as source_image,
-                    Image.open(generated_path) as generated_image,
-                ):
-                    mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
-                    final, qa_mask = self._compose_unit(
-                        source_image, generated_image, mask, spec, uncertain_mask
-                    )
-                    source_rgb = source_image.convert("RGB")
-                    final_path.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = final_path.with_suffix(".repair.png")
-                    final.save(temporary, format="PNG")
-                    temporary.replace(final_path)
-                    qa = evaluate(
-                        source_rgb,
-                        final,
-                        qa_mask,
-                        line_f1_min=self.settings.qa_line_f1_min,
-                        luminance_mae_max=(
-                            self.settings.qa_luminance_mae_max
-                            if spec.detail_mode == DetailMode.STRICT
-                            else 255.0
-                        ),
-                        pure_black_preservation_min=(
-                            0.0 if spec.mode == JobMode.STYLE_FULL else 0.999
-                        ),
-                    )
-                    if qa.passed:
-                        # A repaired unit may have been marked failed by an
-                        # older compositor. Re-accept it only after the new
-                        # deterministic pixels pass the normal QA gate.
-                        manifest.accept_repaired_unit(
-                            int(unit["id"]), generated_path, final_path, qa
-                        )
-                    else:
-                        # Preserve an existing QA decision when recomposition
-                        # cannot improve it. The asset itself is still useful
-                        # for inspection and does not erase the failure cause.
-                        manifest.replace_unit_output(
-                            int(unit["id"]), generated_path, final_path
-                        )
-                    repaired += 1
-            ready_path = self._assemble_page_if_ready(
-                job_id, manifest, int(page["id"]), force=True
+        if not pages:
+            return 0
+        job_dir = self._job_dir(job_id)
+        live_final = job_dir / "final"
+        live_output = job_dir / "output"
+
+        def tree_size(path: Path) -> int:
+            if not path.exists():
+                return 0
+            return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+        estimated_bytes = int((tree_size(live_final) + tree_size(live_output)) * 1.15)
+        free_bytes = shutil.disk_usage(job_dir).free
+        if free_bytes - estimated_bytes < 5 * 1024**3:
+            raise RuntimeError(
+                "Insufficient disk space for transactional repair; live data was not changed"
             )
-            if ready_path is None or not ready_path.is_file():
-                preview_path = self._assemble_page_preview(job_id, manifest, int(page["id"]))
-                if preview_path is not None:
-                    page_id = int(page["id"])
-                    revision = manifest.page_asset_revision(page_id)
-                    asset_query = f"?v={revision}" if revision else ""
-                    preview_thumbnail = (
-                        self._job_dir(job_id)
-                        / "preview"
-                        / "thumbnails"
-                        / f"page_{int(page['page_index']):05d}.jpg"
+
+        token = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        staging_root = job_dir / f".repair-staging-{token}"
+        staging_final = staging_root / "final"
+        staging_output = staging_root / "output"
+        backup_root = job_dir / "repair-backups" / token
+        staged_units: list[dict[str, Any]] = []
+        staged_pages: list[dict[str, Any]] = []
+        committed = False
+        try:
+            for page_number, page in enumerate(pages, start=1):
+                page_index = int(page["page_index"])
+                page_units: list[dict[str, Any]] = []
+                for stored_unit in manifest.page_units(int(page["id"])):
+                    unit = {**stored_unit, "page_index": page_index}
+                    generated_path = Path(unit["generated_path"] or "")
+                    source_path = Path(unit["source_path"])
+                    if not generated_path.is_file() or not source_path.is_file():
+                        raise FileNotFoundError(
+                            f"Missing repair input for page {page_index + 1}, "
+                            f"unit {int(unit['unit_index']) + 1}"
+                        )
+                    final_name = (
+                        f"page_{page_index:05d}_panel_{int(unit['unit_index']):04d}.png"
                     )
-                    self._emit(
-                        "page_preview_ready",
-                        {
-                            "page_index": int(page["page_index"]),
-                            "asset_revision": revision,
-                            "status": "needs_attention",
-                            "completed_units": sum(
-                                item["status"] == "qa_passed"
-                                for item in manifest.page_units(int(page["id"]))
+                    staged_path = staging_final / "panels" / final_name
+                    staged_path.parent.mkdir(parents=True, exist_ok=True)
+                    with (
+                        Image.open(source_path) as source_image,
+                        Image.open(generated_path) as generated_image,
+                    ):
+                        mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
+                        final, qa_mask = self._compose_unit(
+                            source_image, generated_image, mask, spec, uncertain_mask
+                        )
+                        qa = evaluate(
+                            source_image.convert("RGB"),
+                            final,
+                            qa_mask,
+                            generated=generated_image,
+                            line_f1_min=(
+                                self.settings.qa_line_f1_min
+                                if spec.mode != JobMode.STYLE_FULL
+                                else 0.0
                             ),
-                            "total_units": len(manifest.page_units(int(page["id"]))),
-                            "source_url": (
-                                f"/api/jobs/{job_id}/pages/{int(page['page_index'])}/source"
-                                f"{asset_query}"
+                            luminance_mae_max=(
+                                self.settings.qa_luminance_mae_max
+                                if spec.detail_mode == DetailMode.STRICT
+                                and spec.mode != JobMode.COLORIZE
+                                else 255.0
                             ),
-                            "preview_url": (
-                                f"/api/jobs/{job_id}/pages/{int(page['page_index'])}/preview"
-                                f"{asset_query}"
+                            pure_black_preservation_min=(
+                                0.0 if spec.mode == JobMode.STYLE_FULL else 0.999
                             ),
-                            "thumbnail_url": (
-                                f"/api/jobs/{job_id}/pages/{int(page['page_index'])}/preview-thumbnail"
-                                f"{asset_query}"
+                        )
+                        if not qa.passed:
+                            raise RuntimeError(
+                                f"Repair QA failed for page {page_index + 1}: "
+                                f"{', '.join(qa.reasons)}"
                             )
-                            if preview_thumbnail.is_file()
-                            else None,
-                        },
-                        job_id,
-                    )
-            if progress_callback is not None:
-                progress_callback(int(page["page_index"]), page_number, total_pages)
-        if repaired:
-            output_pages = [
-                Path(page["output_path"])
-                for page in manifest.pages(job_id)
-                if page["output_path"] and Path(page["output_path"]).is_file()
-            ]
-            all_units_passed = all(
-                unit["status"] == UnitStatus.QA_PASSED.value
-                for page in manifest.pages(job_id)
-                for unit in manifest.page_units(int(page["id"]))
+                        final.save(staged_path, format="PNG")
+                    live_path = live_final / "panels" / final_name
+                    staged_unit = {
+                        "id": int(unit["id"]),
+                        "generated_path": generated_path,
+                        "final_path": live_path,
+                        "qa": qa,
+                    }
+                    staged_units.append(staged_unit)
+                    page_units.append({**unit, "final_path": str(staged_path)})
+
+                with Image.open(page["source_path"]) as source:
+                    canvas = source.convert("RGB")
+                if self._paste_units_safely(canvas, page_units, job_id=job_id) != len(
+                    page_units
+                ):
+                    raise RuntimeError(f"Staged page assembly failed for page {page_index + 1}")
+                staged_page_path = staging_final / "pages" / f"page_{page_index:05d}.png"
+                staged_page_path.parent.mkdir(parents=True, exist_ok=True)
+                canvas.save(staged_page_path, format="PNG")
+                thumbnail = (
+                    staging_final / "thumbnails" / f"page_{page_index:05d}.jpg"
+                )
+                thumbnail.parent.mkdir(parents=True, exist_ok=True)
+                preview = canvas.copy()
+                preview.thumbnail((240, 320), Image.Resampling.LANCZOS)
+                preview.save(thumbnail, format="JPEG", quality=82, optimize=True)
+                staged_pages.append(
+                    {
+                        "id": int(page["id"]),
+                        "output_path": live_final
+                        / "pages"
+                        / f"page_{page_index:05d}.png",
+                        "asset_revision": str(time.time_ns()),
+                        "staged_path": staged_page_path,
+                    }
+                )
+                if progress_callback is not None:
+                    progress_callback(page_index, page_number, total_pages)
+
+            export_book(
+                [Path(page["staged_path"]) for page in staged_pages],
+                staging_output,
+                spec.output_format,
             )
-            if len(output_pages) == total_pages and all_units_passed:
-                output_dir = self._job_dir(job_id) / "output"
-                staging_dir = output_dir / f".repair-export-{uuid.uuid4().hex}"
-                try:
-                    temporary_output = export_book(output_pages, staging_dir, spec.output_format)
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    repaired_output = output_dir / temporary_output.name
-                    temporary_output.replace(repaired_output)
-                    manifest.add_event(
-                        job_id,
-                        "book_exported",
-                        {"path": str(repaired_output), "reason": "results_repaired"},
-                    )
-                except Exception:
-                    logger.exception("job=%s repaired pages but book export failed", job_id)
-                finally:
-                    shutil.rmtree(staging_dir, ignore_errors=True)
-        return repaired
+            backup_root.mkdir(parents=True, exist_ok=False)
+            manifest.backup_to(backup_root / "manifest.sqlite")
+            old_final_moved = False
+            old_output_moved = False
+            new_final_published = False
+            new_output_published = False
+            try:
+                if live_final.exists():
+                    live_final.replace(backup_root / "final")
+                    old_final_moved = True
+                staging_final.replace(live_final)
+                new_final_published = True
+                if live_output.exists():
+                    live_output.replace(backup_root / "output")
+                    old_output_moved = True
+                staging_output.replace(live_output)
+                new_output_published = True
+                manifest.apply_repaired_outputs(
+                    job_id, staged_units, staged_pages, backup_path=backup_root
+                )
+            except Exception:
+                if new_final_published and live_final.exists():
+                    live_final.replace(staging_root / "failed-final")
+                if old_final_moved and (backup_root / "final").exists():
+                    (backup_root / "final").replace(live_final)
+                if new_output_published and live_output.exists():
+                    live_output.replace(staging_root / "failed-output")
+                if old_output_moved and (backup_root / "output").exists():
+                    (backup_root / "output").replace(live_output)
+                raise
+            committed = True
+            return len(staged_units)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            if not committed and backup_root.exists() and not any(backup_root.iterdir()):
+                backup_root.rmdir()
 
     def _assemble_pages(self, job_id: str, manifest: Manifest) -> list[Path]:
         output_pages: list[Path] = []

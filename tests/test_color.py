@@ -85,7 +85,7 @@ def test_strict_colorization_does_not_replace_screentones_with_grayscale() -> No
     assert int(result[10, 10].max()) - int(result[10, 10].min()) > 20
 
 
-def test_strict_colorization_preserves_antialiased_boundary_edges() -> None:
+def test_strict_colorization_softens_antialiased_edges_without_losing_color() -> None:
     source_pixels = np.full((32, 32, 3), 255, dtype=np.uint8)
     source_pixels[:, 15:17] = 132
     source_pixels[:, 16] = 82
@@ -102,4 +102,30 @@ def test_strict_colorization_preserves_antialiased_boundary_edges() -> None:
         )
     )
 
-    assert np.array_equal(result[:, 15:17], source_pixels[:, 15:17])
+    generated_pixels = np.asarray(generated)
+    assert np.all(result[:, 15:17, 0] < generated_pixels[:, 15:17, 0])
+    result_distance = np.linalg.norm(
+        result[:, 15:17].astype(np.float32) - source_pixels[:, 15:17], axis=-1
+    )
+    generated_distance = np.linalg.norm(
+        generated_pixels[:, 15:17].astype(np.float32) - source_pixels[:, 15:17],
+        axis=-1,
+    )
+    assert np.all(result_distance < generated_distance)
+    assert np.all(np.ptp(result[:, 15:17], axis=-1) > 20)
+
+
+def test_strict_colorization_keeps_protected_and_core_ink_exact() -> None:
+    source_pixels = np.full((20, 20, 3), 245, dtype=np.uint8)
+    source_pixels[2:5, :] = 4
+    source_pixels[12:17, 5:15] = 210
+    source = Image.fromarray(source_pixels, mode="RGB")
+    generated = Image.new("RGB", source.size, (230, 95, 45))
+    protected = np.zeros((20, 20), dtype=bool)
+    protected[12:17, 5:15] = True
+
+    result = np.asarray(composite_strict_colorization(source, generated, protected))
+
+    assert np.array_equal(result[2:5], source_pixels[2:5])
+    assert np.array_equal(result[protected], source_pixels[protected])
+    assert np.all(result[8, 8] == np.array([230, 95, 45]))

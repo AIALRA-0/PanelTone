@@ -26,6 +26,39 @@ def _f1(reference: np.ndarray, candidate: np.ndarray) -> float:
     return 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
 
 
+def _color_coverage(rgb: np.ndarray, roi: np.ndarray) -> float:
+    if not roi.any():
+        return 0.0
+    chroma = rgb.max(axis=-1) - rgb.min(axis=-1)
+    return float((chroma[roi] >= 15).mean())
+
+
+def _color_dropout_tiles(
+    generated_rgb: np.ndarray,
+    result_rgb: np.ndarray,
+    roi: np.ndarray,
+    grid_size: int = 6,
+) -> int:
+    height, width = roi.shape
+    dropouts = 0
+    for row in range(grid_size):
+        y0, y1 = height * row // grid_size, height * (row + 1) // grid_size
+        for column in range(grid_size):
+            x0, x1 = width * column // grid_size, width * (column + 1) // grid_size
+            tile_roi = roi[y0:y1, x0:x1]
+            if tile_roi.sum() < 64:
+                continue
+            generated_coverage = _color_coverage(
+                generated_rgb[y0:y1, x0:x1], tile_roi
+            )
+            result_coverage = _color_coverage(result_rgb[y0:y1, x0:x1], tile_roi)
+            if generated_coverage >= 0.25 and result_coverage < max(
+                0.10, generated_coverage * 0.50
+            ):
+                dropouts += 1
+    return dropouts
+
+
 def evaluate(
     source: Image.Image,
     result: Image.Image,
@@ -33,6 +66,9 @@ def evaluate(
     line_f1_min: float = 0.98,
     luminance_mae_max: float = 2.0,
     pure_black_preservation_min: float = 0.999,
+    generated: Image.Image | None = None,
+    color_retention_min: float = 0.70,
+    color_dropout_tiles_max: int = 0,
 ) -> QAResult:
     dimension_match = source.size == result.size
     if not dimension_match:
@@ -68,6 +104,27 @@ def evaluate(
         pure_black_preservation_rate = 1.0
     protected_area_ratio = float(protected_mask.mean())
 
+    generated_color_coverage = 0.0
+    result_color_coverage = 0.0
+    color_retention_ratio = 1.0
+    color_dropout_tiles = 0
+    if generated is not None:
+        generated_rgb = np.asarray(
+            generated.convert("RGB").resize(source.size, Image.Resampling.LANCZOS)
+        ).astype(np.int16)
+        generated_luma = generated_rgb.mean(axis=-1)
+        color_roi = np.logical_and(~protected_mask, generated_luma > 8)
+        color_roi = np.logical_and(color_roi, generated_luma < 248)
+        generated_color_coverage = _color_coverage(generated_rgb, color_roi)
+        result_color_coverage = _color_coverage(result_rgb, color_roi)
+        if generated_color_coverage >= 0.05:
+            color_retention_ratio = min(
+                1.0, result_color_coverage / generated_color_coverage
+            )
+            color_dropout_tiles = _color_dropout_tiles(
+                generated_rgb, result_rgb, color_roi
+            )
+
     reasons: list[str] = []
     if protected_diff != 0:
         reasons.append("protected_pixels_changed")
@@ -77,6 +134,10 @@ def evaluate(
         reasons.append("luminance_mae_above_threshold")
     if pure_black_preservation_rate < pure_black_preservation_min:
         reasons.append("pure_black_preservation_below_threshold")
+    if color_retention_ratio < color_retention_min:
+        reasons.append("color_retention_below_threshold")
+    if color_dropout_tiles > color_dropout_tiles_max:
+        reasons.append("regional_color_dropout")
     return QAResult(
         passed=not reasons,
         protected_pixel_diff=protected_diff,
@@ -86,4 +147,8 @@ def evaluate(
         reasons=reasons,
         pure_black_preservation_rate=pure_black_preservation_rate,
         protected_area_ratio=protected_area_ratio,
+        generated_color_coverage=generated_color_coverage,
+        result_color_coverage=result_color_coverage,
+        color_retention_ratio=color_retention_ratio,
+        color_dropout_tiles=color_dropout_tiles,
     )

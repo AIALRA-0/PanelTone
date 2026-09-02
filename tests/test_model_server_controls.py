@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import sys
 import time
+from types import SimpleNamespace
 
 from PIL import Image
 
@@ -60,7 +63,7 @@ def test_runtime_releases_pipeline_after_idle_grace_period() -> None:
     runtime.shutdown()
 
 
-def test_runtime_forwards_negative_mode_and_style_metadata() -> None:
+def test_runtime_forwards_negative_mode_and_style_metadata(monkeypatch) -> None:
     class FakePipeline:
         def __init__(self) -> None:
             self.received = {}
@@ -80,6 +83,22 @@ def test_runtime_forwards_negative_mode_and_style_metadata() -> None:
             return type("Output", (), {"images": [Image.new("RGB", (width, height), "white")]})()
 
     runtime = Flux2Runtime()
+    class FakeGenerator:
+        def __init__(self, device: str) -> None:
+            self.device = device
+
+        def manual_seed(self, seed: int):
+            self.seed = seed
+            return self
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            Generator=FakeGenerator,
+            inference_mode=lambda: contextlib.nullcontext(),
+        ),
+    )
     runtime.device = "cpu"
     runtime._pipeline = FakePipeline()
     runtime.state = "ready"

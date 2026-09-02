@@ -12,6 +12,8 @@ from PIL import Image
 
 from .semantic import SEMANTIC_CLASSES, KoharuSemanticMaskEngine
 
+SUPPORTED_CLASSES = ("text", "bubbles", "borders", "ink")
+
 
 def _encoded_png(image: Image.Image) -> str:
     buffer = io.BytesIO()
@@ -48,6 +50,10 @@ def health() -> dict[str, object]:
             for filename in ("model.safetensors", "config.json", "yolo26s-seg.yaml")
         ),
         "classes": list(SEMANTIC_CLASSES),
+        "supported_classes": list(SUPPORTED_CLASSES),
+        "unsupported_classes": [
+            name for name in SEMANTIC_CLASSES if name not in SUPPORTED_CLASSES
+        ],
     }
 
 

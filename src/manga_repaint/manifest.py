@@ -177,6 +177,84 @@ class Manifest:
         finally:
             connection.close()
 
+    def backup_to(self, destination: Path) -> None:
+        """Create a consistent SQLite backup, including committed WAL content."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            source = sqlite3.connect(self.path, timeout=30)
+            target = sqlite3.connect(destination, timeout=30)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+
+    def apply_repaired_outputs(
+        self,
+        job_id: str,
+        units: list[dict[str, Any]],
+        pages: list[dict[str, Any]],
+        *,
+        backup_path: Path,
+    ) -> None:
+        """Commit a fully staged repair in one manifest transaction."""
+        with self._lock, self.connect() as connection:
+            for unit in units:
+                qa = unit["qa"]
+                if not isinstance(qa, QAResult) or not qa.passed:
+                    raise ValueError("A staged unit does not have passing QA")
+                qa_data = qa.to_json_dict()
+                qa_data["repaired"] = True
+                cursor = connection.execute(
+                    """
+                    UPDATE units SET status='qa_passed',generated_path=?,final_path=?,
+                      qa_json=?,error=NULL WHERE id=?
+                    """,
+                    (
+                        str(unit["generated_path"]),
+                        str(unit["final_path"]),
+                        json.dumps(qa_data, ensure_ascii=False),
+                        int(unit["id"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Unknown repair unit: {unit['id']}")
+            for page in pages:
+                cursor = connection.execute(
+                    """
+                    UPDATE pages SET status='qa_passed',output_path=?,asset_revision=?
+                    WHERE id=? AND job_id=?
+                    """,
+                    (
+                        str(page["output_path"]),
+                        str(page["asset_revision"]),
+                        int(page["id"]),
+                        job_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Unknown repair page: {page['id']}")
+            now = _now()
+            connection.execute(
+                "UPDATE jobs SET updated_at=?,error=NULL WHERE id=?", (now, job_id)
+            )
+            connection.execute(
+                "INSERT INTO events(job_id,created_at,kind,payload_json) VALUES(?,?,?,?)",
+                (
+                    job_id,
+                    now,
+                    "results_repaired",
+                    json.dumps(
+                        {
+                            "units": len(units),
+                            "pages": len(pages),
+                            "backup_path": str(backup_path),
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+
     def create_job(self, job_id: str, spec: JobSpec) -> None:
         now = _now()
         with self._lock, self.connect() as connection:

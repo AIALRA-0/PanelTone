@@ -43,6 +43,7 @@ def bubble_mask(image: Image.Image) -> np.ndarray:
     white = (gray >= 245).astype(np.uint8) * 255
     contours, _ = cv2.findContours(white, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     result = np.zeros_like(white)
+    text = text_region_mask(image)
     for contour in contours:
         area = cv2.contourArea(contour)
         if not page_area * 0.001 <= area <= page_area * 0.18:
@@ -56,7 +57,16 @@ def bubble_mask(image: Image.Image) -> np.ndarray:
         compactness = 4 * np.pi * area / (perimeter * perimeter)
         if compactness < 0.08:
             continue
-        cv2.drawContours(result, [contour], -1, 255, thickness=cv2.FILLED)
+        candidate = np.zeros_like(white)
+        cv2.drawContours(candidate, [contour], -1, 255, thickness=cv2.FILLED)
+        # White hands, faces and clothing regions can be compact and enclosed
+        # by ink too. A deterministic bubble candidate is trusted only when a
+        # detected text region lies inside or immediately beside it. The
+        # optional Koharu adapter can still supply text-free balloon masks.
+        candidate_guard = cv2.dilate(candidate, np.ones((9, 9), np.uint8)) > 0
+        if not np.logical_and(candidate_guard, text).any():
+            continue
+        result = cv2.bitwise_or(result, candidate)
     return result.astype(bool)
 
 

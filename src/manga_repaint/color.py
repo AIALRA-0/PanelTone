@@ -182,26 +182,34 @@ def composite_strict_colorization(
     chroma_strength: float = 1.0,
     ink_core_threshold: int = 64,
 ) -> Image.Image:
-    """Keep source luminance while retaining generated color outside protected pixels.
+    """Use the generated colour image while restoring protected manga structure.
 
-    Only high-confidence dark ink cores are copied verbatim. Treating every gray
-    screentone pixel as line art would overwrite nearly the entire colorized page.
+    Older releases copied source luminance across the full page. That removed
+    most generated chroma on screentones and produced partially gray output.
+    The generated image is now the visual base; only explicit protection and
+    core ink are exact, while antialiased line edges are blended softly.
     """
     if not 0 <= ink_core_threshold <= 255:
         raise ValueError("Ink core threshold must be between 0 and 255")
-    colorized = preserve_luminance_lab(source, generated, chroma_strength)
-    source_gray = np.asarray(source.convert("L"))
+    if not 0.0 <= chroma_strength <= 2.5:
+        raise ValueError("Chroma strength must be between 0.0 and 2.5")
+    source_rgb = np.asarray(source.convert("RGB"), dtype=np.float32)
+    generated_rgb = np.asarray(
+        generated.convert("RGB").resize(source.size, Image.Resampling.LANCZOS),
+        dtype=np.float32,
+    )
+    source_gray = np.asarray(source.convert("L"), dtype=np.uint8)
     strict_mask = np.logical_or(protected_mask, source_gray <= ink_core_threshold)
-    # Scanned manga lines often have antialiased gray pixels above the ink
-    # threshold.  Preserve a narrow edge guard as well, otherwise generated
-    # chroma can bridge a light gray clothing/skin boundary and create a
-    # visible color block on the neighboring region.
     edge_low = max(8, ink_core_threshold // 2)
     edge_high = min(255, max(edge_low + 1, ink_core_threshold * 2))
     edges = cv2.Canny(source_gray, edge_low, edge_high)
-    edge_guard = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1)
-    strict_mask = np.logical_or(strict_mask, edge_guard.astype(bool))
-    return composite_protected(source, colorized, strict_mask)
+    edge_guard = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1) > 0
+    darkness = np.clip((160.0 - source_gray.astype(np.float32)) / 152.0, 0.0, 1.0)
+    soft_alpha = np.where(edge_guard & ~strict_mask, darkness**1.6, 0.0)[..., None]
+    result = generated_rgb * (1.0 - soft_alpha) + source_rgb * soft_alpha
+    result = np.clip(np.rint(result), 0, 255).astype(np.uint8)
+    result[strict_mask] = source_rgb.astype(np.uint8)[strict_mask]
+    return Image.fromarray(result, mode="RGB")
 
 
 def preserve_ink_overlay(

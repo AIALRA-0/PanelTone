@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -12,6 +15,10 @@ from manga_repaint.config import Settings
 from manga_repaint.engines import EngineInterrupted, EngineRegistry
 from manga_repaint.models import DetailMode, JobSpec
 from manga_repaint.project import ProjectManager
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_unconfigured_allowed_roots_accept_existing_local_path(
@@ -149,6 +156,60 @@ def test_balanced_detail_mode_preserves_protected_edges(tmp_path: Path, manga_pa
 
     assert output.is_file()
     assert manager.status(job_id)["unit_counts"] == {"qa_passed": 3}
+
+
+def test_completed_repair_is_staged_and_keeps_rollback_backup(
+    tmp_path: Path, manga_pages: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    job_id = manager.create(
+        JobSpec(source=manga_pages, workspace=settings.data_root, engine="palette")
+    )
+    manager.process(job_id)
+    monkeypatch.setattr(
+        "manga_repaint.project.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=10 * 1024**3),
+    )
+
+    repaired = manager.repair_completed_colorization(job_id)
+
+    assert repaired == 3
+    backup_roots = list((manager._job_dir(job_id) / "repair-backups").iterdir())
+    assert len(backup_roots) == 1
+    assert (backup_roots[0] / "manifest.sqlite").is_file()
+    assert (backup_roots[0] / "final" / "pages" / "page_00000.png").is_file()
+    assert manager.status(job_id)["status"] == "completed"
+
+
+def test_failed_staged_repair_does_not_change_live_results(
+    tmp_path: Path, manga_pages: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    job_id = manager.create(
+        JobSpec(source=manga_pages, workspace=settings.data_root, engine="palette")
+    )
+    manager.process(job_id)
+    monkeypatch.setattr(
+        "manga_repaint.project.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=10 * 1024**3),
+    )
+    first_page = Path(manager._manifest(job_id).pages(job_id)[0]["output_path"])
+    before = _sha256(first_page)
+
+    def grayscale_result(source, _generated, _mask, _spec, _uncertain):
+        return (
+            Image.new("RGB", source.size, (160, 160, 160)),
+            np.zeros((source.height, source.width), dtype=bool),
+        )
+
+    monkeypatch.setattr(manager, "_compose_unit", grayscale_result)
+    with pytest.raises(RuntimeError, match="Repair QA failed"):
+        manager.repair_completed_colorization(job_id)
+
+    assert _sha256(first_page) == before
+    assert not (manager._job_dir(job_id) / "repair-backups").exists()
 
 
 def test_pause_request_at_queue_boundary_does_not_start_job(
