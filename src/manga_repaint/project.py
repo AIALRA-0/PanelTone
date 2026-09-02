@@ -774,14 +774,10 @@ class ProjectManager:
         normal GPU run, including balanced and generative detail modes.
         """
         source_rgb = source.convert("RGB")
-        profile = render_profile(spec.color_preset, spec.style_preset)
-        generated_rgb = apply_render_profile(
-            generated.convert("RGB"),
-            saturation=float(profile["saturation"]),
-            contrast=float(profile["contrast"]),
-            hue_shift=float(profile["hue_shift"]),
+        generated_rgb = self._render_generated(generated, spec)
+        effective_chroma = spec.chroma_strength * float(
+            render_profile(spec.color_preset, spec.style_preset)["chroma_multiplier"]
         )
-        effective_chroma = spec.chroma_strength * float(profile["chroma_multiplier"])
         if spec.mode == JobMode.COLORIZE:
             mask = validated_colorization_protection(source_rgb, generated_rgb, mask)
             final = composite_strict_colorization(
@@ -819,6 +815,7 @@ class ProjectManager:
                 mask,
                 chroma_strength=effective_chroma,
             )
+
         # For colourization, uncertainty is diagnostic only. Returning those
         # areas to source luminance caused large gray islands in otherwise
         # valid generated colour. Style-transfer modes retain the old guard.
@@ -832,6 +829,17 @@ class ProjectManager:
         if spec.preserve_ink and spec.mode != JobMode.STYLE_FULL:
             qa_mask = np.logical_or(mask, ink_detail_mask(source_rgb, threshold=64))
         return final, qa_mask
+
+    @staticmethod
+    def _render_generated(generated: Image.Image, spec: JobSpec) -> Image.Image:
+        """Return the exact style-graded image used as the colour base."""
+        profile = render_profile(spec.color_preset, spec.style_preset)
+        return apply_render_profile(
+            generated.convert("RGB"),
+            saturation=float(profile["saturation"]),
+            contrast=float(profile["contrast"]),
+            hue_shift=float(profile["hue_shift"]),
+        )
 
     def queue(self, job_id: str) -> None:
         # Starting or resuming a job explicitly clears controls left by a
@@ -1155,7 +1163,7 @@ class ProjectManager:
                                 source_rgb,
                                 final,
                                 qa_mask,
-                                generated=generated_image,
+                                generated=self._render_generated(generated_image, spec),
                                 line_f1_min=(
                                     self.settings.qa_line_f1_min
                                     if spec.mode != JobMode.STYLE_FULL
@@ -1641,7 +1649,7 @@ class ProjectManager:
                             source_image.convert("RGB"),
                             final,
                             qa_mask,
-                            generated=generated_image,
+                            generated=self._render_generated(generated_image, spec),
                             line_f1_min=(
                                 self.settings.qa_line_f1_min
                                 if spec.mode != JobMode.STYLE_FULL

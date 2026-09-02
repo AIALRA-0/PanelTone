@@ -200,15 +200,10 @@ def composite_strict_colorization(
     )
     source_gray = np.asarray(source.convert("L"), dtype=np.uint8)
     strict_mask = np.logical_or(protected_mask, source_gray <= ink_core_threshold)
-    # Print the source screentone and antialiased line strength over the colour
-    # base instead of blending gray source pixels into it. Multiplication keeps
-    # the generated hue while restoring the original manga structure.
-    ink_factor = np.where(
-        source_gray >= 240,
-        1.0,
-        np.power(source_gray.astype(np.float32) / 255.0, 0.42),
-    )[..., None]
-    result = generated_rgb * ink_factor
+    # Keep every non-protected pixel from the full-colour generation. Dense
+    # manga screentones are not safe soft-edge hints: even alignment-gated
+    # multiplication can turn a shifted coloured limb back into gray.
+    result = generated_rgb.copy()
     result = np.clip(np.rint(result), 0, 255).astype(np.uint8)
     result[strict_mask] = source_rgb.astype(np.uint8)[strict_mask]
     return Image.fromarray(result, mode="RGB")
@@ -219,7 +214,7 @@ def validated_colorization_protection(
     generated: Image.Image,
     protected_mask: np.ndarray,
     *,
-    dark_structure_threshold: int = 192,
+    dark_structure_threshold: int = 128,
     neutral_chroma_threshold: int = 24,
 ) -> np.ndarray:
     """Reject bright protection pixels that contradict generated colour.
