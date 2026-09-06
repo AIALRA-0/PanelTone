@@ -16,6 +16,8 @@ node_modules/
 .playwright-cli/
 output/playwright/
 docs/audits/
+src/manga_repaint/web/frontend/test-results/
+src/manga_repaint/web/frontend/playwright-report/
 
 # Runtime data, generated books, models, logs, and databases
 jobs/

@@ -9,6 +9,7 @@ from manga_repaint.color import (
     classify_source_page,
     composite_geometry_locked_colorization,
     composite_protected,
+    composite_reference_locked_colorization,
     composite_strict_colorization,
     geometry_barrier_mask,
     is_already_colorized,
@@ -61,6 +62,20 @@ def test_ink_overlay_preserves_black_without_white_halo() -> None:
     result = np.asarray(preserve_ink_overlay(source, generated))
     assert np.all(result[11:13, 4:20] == 0)
     assert np.all(result[0, 0] == np.array([220, 120, 70]))
+
+
+def test_reference_locked_composition_keeps_source_geometry_and_transfers_chroma() -> None:
+    pixels = np.full((32, 32, 3), 255, dtype=np.uint8)
+    pixels[4:28, 15:17] = 0
+    source = Image.fromarray(pixels, mode="RGB")
+    generated = Image.new("RGB", source.size, (220, 80, 40))
+    protected = np.zeros((32, 32), dtype=bool)
+    protected[4:28, 15:17] = True
+
+    result = np.asarray(composite_reference_locked_colorization(source, generated, protected))
+
+    assert np.array_equal(result[4:28, 15:17], pixels[4:28, 15:17])
+    assert int(result[10, 10].max()) - int(result[10, 10].min()) > 20
 
 
 def test_ink_overlay_preserves_near_black_print_pixels_exactly() -> None:
@@ -207,9 +222,7 @@ def test_geometry_locked_colorization_uses_source_value_and_not_generated_edges(
     protected = np.zeros((64, 64), dtype=bool)
     protected[29:33, 10:54] = True
 
-    result = np.asarray(
-        composite_geometry_locked_colorization(source, generated, protected)
-    )
+    result = np.asarray(composite_geometry_locked_colorization(source, generated, protected))
     result_value = cv2.cvtColor(result, cv2.COLOR_RGB2HSV)[..., 2]
     source_value = np.asarray(source.convert("L"))
 
@@ -225,9 +238,7 @@ def test_geometry_locked_colorization_preserves_value_of_coloured_scan() -> None
     generated = Image.new("RGB", source.size, (210, 90, 70))
 
     result = np.asarray(
-        composite_geometry_locked_colorization(
-            source, generated, np.zeros((48, 48), dtype=bool)
-        )
+        composite_geometry_locked_colorization(source, generated, np.zeros((48, 48), dtype=bool))
     )
     source_value = cv2.cvtColor(source_pixels, cv2.COLOR_RGB2HSV)[..., 2]
     result_value = cv2.cvtColor(result, cv2.COLOR_RGB2HSV)[..., 2]
@@ -239,9 +250,7 @@ def test_geometry_locked_colorization_rejects_dimension_mismatch() -> None:
     source = Image.new("RGB", (32, 32), "white")
     generated = Image.new("RGB", (31, 32), "red")
     with pytest.raises(ValueError, match="dimensions"):
-        composite_geometry_locked_colorization(
-            source, generated, np.zeros((32, 32), dtype=bool)
-        )
+        composite_geometry_locked_colorization(source, generated, np.zeros((32, 32), dtype=bool))
 
 
 def test_geometry_barrier_matches_locked_composer_protection() -> None:

@@ -53,9 +53,7 @@ def classify_source_page(image: Image.Image) -> SourceClassification:
 
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     height, width = gray.shape
-    border = np.concatenate(
-        (gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1])
-    )
+    border = np.concatenate((gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]))
     background = float(np.median(border)) if border.size else 255.0
     deviation = np.abs(gray.astype(np.float32) - background)
     foreground = deviation >= max(12.0, float(np.std(border)) * 2.0)
@@ -185,9 +183,7 @@ def preserve_luminance_lab(
     source_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB)
     generated_lab = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2LAB)
     target_l = source_lab[..., 0].astype(np.float32)
-    base_chroma = 128.0 + (
-        generated_lab[..., 1:].astype(np.float32) - 128.0
-    ) * chroma_strength
+    base_chroma = 128.0 + (generated_lab[..., 1:].astype(np.float32) - 128.0) * chroma_strength
     chroma_scale = np.ones(target_l.shape, dtype=np.float32)
     result = generated_rgb
 
@@ -205,9 +201,7 @@ def preserve_luminance_lab(
             255,
         ).astype(np.uint8)
         result = cv2.cvtColor(composed_lab, cv2.COLOR_LAB2RGB)
-        result_l = cv2.cvtColor(result, cv2.COLOR_RGB2LAB)[..., 0].astype(
-            np.float32
-        )
+        result_l = cv2.cvtColor(result, cv2.COLOR_RGB2LAB)[..., 0].astype(np.float32)
         out_of_tolerance = np.abs(result_l - target_l) > 1.0
         if not out_of_tolerance.any():
             break
@@ -409,14 +403,10 @@ def composite_geometry_locked_colorization(
         valid = np.logical_and(region, local_valid_color)
         valid_count = int(valid.sum())
         if valid_count / area < 0.20:
-            local_saturation[region] = (
-                local_generated_saturation[region] * chroma_strength
-            )
+            local_saturation[region] = local_generated_saturation[region] * chroma_strength
             continue
 
-        weights = np.where(
-            valid, local_generated_saturation / 255.0, 0.0
-        ).astype(np.float32)
+        weights = np.where(valid, local_generated_saturation / 255.0, 0.0).astype(np.float32)
         cos_values = np.cos(local_generated_hue) * weights
         sin_values = np.sin(local_generated_hue) * weights
         # Masked normalized convolution is performed on each source-connected
@@ -427,21 +417,15 @@ def composite_geometry_locked_colorization(
         local_sat = cv2.GaussianBlur(
             local_generated_saturation * valid * region_float, (0, 0), 1.15
         )
-        local_weight = cv2.GaussianBlur(
-            valid.astype(np.float32) * region_float, (0, 0), 1.15
-        )
+        local_weight = cv2.GaussianBlur(valid.astype(np.float32) * region_float, (0, 0), 1.15)
         stable_cos = float(cos_values[valid].sum())
         stable_sin = float(sin_values[valid].sum())
         stable_angle = float(np.arctan2(stable_sin, stable_cos))
         stable_strength = float(np.hypot(stable_cos, stable_sin) / max(1, valid_count))
         stable_hue = (stable_angle % (2.0 * np.pi)) * 180.0 / np.pi
-        stable_saturation = (
-            float(np.median(local_generated_saturation[valid])) * chroma_strength
-        )
+        stable_saturation = float(np.median(local_generated_saturation[valid])) * chroma_strength
         good_local = np.logical_and(region, local_weight > 0.01)
-        local_angle = np.mod(
-            np.arctan2(local_sin, local_cos), 2.0 * np.pi
-        ) * 180.0 / np.pi
+        local_angle = np.mod(np.arctan2(local_sin, local_cos), 2.0 * np.pi) * 180.0 / np.pi
         local_hue[good_local] = local_angle[good_local] / 2.0
         local_saturation[good_local] = (
             local_sat[good_local] / np.maximum(local_weight[good_local], 1e-3)
@@ -468,6 +452,61 @@ def composite_geometry_locked_colorization(
     return Image.fromarray(result_rgb, mode="RGB")
 
 
+def composite_reference_locked_colorization(
+    source: Image.Image,
+    generated: Image.Image,
+    protected_mask: np.ndarray,
+    *,
+    chroma_strength: float = 1.0,
+    ink_core_threshold: int = 64,
+) -> Image.Image:
+    """Transfer reference colour while keeping source luminance and geometry.
+
+    The candidate contributes only HSV hue and saturation.  The source
+    contributes the complete value channel plus protected and near-black
+    pixels.  Circular hue and saturation smoothing makes the colour field
+    stable, while excluding candidate RGB, edges, texture, and geometry keeps
+    shifted eyes, limbs, lettering, and panels out of the result.
+    """
+    if not 0.0 <= chroma_strength <= 2.5:
+        raise ValueError("Chroma strength must be between 0.0 and 2.5")
+    source_rgb = _composited_rgb(source)
+    generated_rgb = _composited_rgb(generated)
+    if generated_rgb.shape[:2] != source_rgb.shape[:2]:
+        raise ValueError("source and generated images must have identical dimensions")
+    if protected_mask.shape != source_rgb.shape[:2]:
+        raise ValueError("protection mask shape does not match source image")
+    source_hsv = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2HSV)
+    candidate_hsv = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2HSV)
+    source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
+    # Cobra supplies colour only.  Hue uses a circular representation before
+    # smoothing so red does not average through the 0/179 seam.  The source V
+    # channel is copied exactly; this keeps every original contour, halftone,
+    # shadow and panel geometry in place.
+    hue = candidate_hsv[..., 0].astype(np.float32)
+    hue_sin = cv2.GaussianBlur(np.sin(hue * np.pi / 90.0), (0, 0), 0.55)
+    hue_cos = cv2.GaussianBlur(np.cos(hue * np.pi / 90.0), (0, 0), 0.55)
+    result_hue = (np.arctan2(hue_sin, hue_cos) * 90.0 / np.pi) % 180.0
+    result_sat = cv2.GaussianBlur(
+        candidate_hsv[..., 1].astype(np.float32), (0, 0), 0.55
+    )
+    result_sat = np.clip(result_sat * float(chroma_strength), 0, 255)
+    composed = np.dstack(
+        (
+            result_hue.astype(np.uint8),
+            result_sat.astype(np.uint8),
+            source_hsv[..., 2],
+        )
+    )
+    result_rgb = cv2.cvtColor(composed, cv2.COLOR_HSV2RGB)
+    # Semantic protection is the hard boundary.  Pure black source pixels are
+    # also restored exactly so missed semantic ink cannot be recoloured.
+    black_source = source_gray <= 5
+    exact = protected_mask | black_source
+    result_rgb[exact] = source_rgb[exact]
+    return Image.fromarray(result_rgb, mode="RGB")
+
+
 def geometry_barrier_mask(
     source: Image.Image,
     protected_mask: np.ndarray,
@@ -481,12 +520,16 @@ def geometry_barrier_mask(
         raise ValueError("protection mask shape does not match source image")
     source_rgb = _composited_rgb(source)
     source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
-    source_edges = cv2.Canny(source_gray, 60, 150) > 0
-    ink = ink_edge_mask(
-        Image.fromarray(source_rgb, mode="RGB"),
-        core_threshold=ink_core_threshold,
-        edge_threshold=128,
-    )
+    # Blur before edge extraction so halftone dots do not become a near-solid
+    # barrier across the page.
+    blurred = cv2.GaussianBlur(source_gray, (5, 5), 0)
+    source_edges = cv2.Canny(blurred, 60, 150) > 0
+    # A raw grayscale cutoff treats screentone dots and dark shading as if
+    # they were walls.  That strands most of a manga page in monochrome. Use
+    # blurred structural edges for the diffusion barrier; exact dark ink is
+    # restored separately after compositing, while semantic protection keeps
+    # text, balloons and borders pixel exact.
+    ink = (cv2.Canny(blurred, 20, 80) > 0) & (source_gray <= 128)
     barrier = np.logical_or.reduce((protected_mask, source_edges, ink))
     # A one-pixel guard prevents the colour diffusion kernel from sampling on
     # the opposite side of a source line or panel boundary.

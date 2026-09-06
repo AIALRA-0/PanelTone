@@ -38,6 +38,21 @@
       "storage": "PanelTone 模型目录",
       "purpose": "保护文字、气泡、版面和拟声词，并叠加确定性墨线与边框保护",
       "downloadable": true
+    },
+    {
+      "id": "cobra-candidate",
+      "name": "Cobra 参考图线稿上色候选",
+      "repository": "JunhaoZhuang/Cobra",
+      "revision": "48d6168838e05fbb707f393441219069aa33733b",
+      "allow_patterns": [],
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/JunhaoZhuang/Cobra",
+      "memory": "独立本机候选服务，首次加载可能占用较多显存和系统内存",
+      "download_size": "官方权重约 4.8 GB，按本机缓存实际记录",
+      "storage": "本机 PanelTone 模型缓存目录",
+      "purpose": "参考图检索驱动的线稿上色候选，默认不替换现有 FLUX 结果",
+      "downloadable": false,
+      "unavailable_reason": "候选服务需按官方仓库单独安装并启动"
     }
   ]
 }

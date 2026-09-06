@@ -194,6 +194,11 @@ def evaluate(
         generated_luma = generated_rgb.mean(axis=-1)
         color_roi = np.logical_and(~protected_mask, generated_luma > 8)
         color_roi = np.logical_and(color_roi, generated_luma < 248)
+        # Missed black ink is restored by every geometry-locked compositor and
+        # is not a colour dropout. Exclude it from chroma coverage diagnostics
+        # even when the semantic mask did not classify that pixel.
+        source_luma = np.asarray(source.convert("L"))
+        color_roi = np.logical_and(color_roi, source_luma > 8)
         generated_color_coverage = _color_coverage(generated_rgb, color_roi)
         result_color_coverage = _color_coverage(result_rgb, color_roi)
         if generated_color_coverage >= 0.05:

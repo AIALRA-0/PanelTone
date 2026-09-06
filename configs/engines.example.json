@@ -5,6 +5,12 @@
       "kind": "http_image",
       "base_url": "http://127.0.0.1:8781",
       "timeout_seconds": 1800
+    },
+    {
+      "name": "cobra-candidate",
+      "kind": "cobra_http",
+      "base_url": "http://127.0.0.1:8783",
+      "timeout_seconds": 1800
     }
   ]
 }

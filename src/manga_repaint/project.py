@@ -20,6 +20,7 @@ from .color import (
     classify_source_page,
     composite_geometry_locked_colorization,
     composite_protected,
+    composite_reference_locked_colorization,
     geometry_barrier_mask,
     image_sha256,
     is_already_colorized,
@@ -40,6 +41,7 @@ from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode
 from .panels import extract_panels
 from .presets import build_prompt, get_color_preset, get_style_preset, render_profile
 from .qa import evaluate
+from .reference_library import ColorReferenceLibrary
 from .semantic import (
     ConservativeSemanticMaskEngine,
     SemanticMaskEngine,
@@ -92,6 +94,7 @@ class ProjectManager:
         # book. Keep only a tiny hot cache so a 300-page run cannot retain one
         # full-resolution mask set per page in the worker process.
         self._semantic_cache_limit = 2
+        self.reference_library = ColorReferenceLibrary(settings.data_root)
         self._event_callback = event_callback
         self.recover_interrupted_jobs()
 
@@ -220,9 +223,7 @@ class ProjectManager:
         # user configured a narrower allow-list for local-path imports.
         allowed_roots = self._allowed_source_roots()
         source = ensure_allowed_path(spec.source, allowed_roots)
-        references = [
-            ensure_allowed_path(path, allowed_roots) for path in spec.style_references
-        ]
+        references = [ensure_allowed_path(path, allowed_roots) for path in spec.style_references]
         spec.source = source
         spec.style_references = references
         self.registry.get(spec.engine)
@@ -366,9 +367,7 @@ class ProjectManager:
                     source_size = source.stat().st_size
                 elif source.is_dir():
                     source_size = sum(
-                        path.stat().st_size
-                        for path in source.rglob("*")
-                        if path.is_file()
+                        path.stat().st_size for path in source.rglob("*") if path.is_file()
                     )
                 else:
                     source_size = 0
@@ -472,8 +471,7 @@ class ProjectManager:
                 )
                 copied_references: list[Path] = []
                 references = [
-                    ensure_allowed_path(path, allowed_roots)
-                    for path in spec.style_references
+                    ensure_allowed_path(path, allowed_roots) for path in spec.style_references
                 ]
                 for index, reference in enumerate(references):
                     target = (
@@ -702,18 +700,42 @@ class ProjectManager:
     def _identity_guidance(self, job_id: str) -> str:
         """Turn locked identity records into a short, deterministic prompt hint."""
         records = self._manifest(job_id).identities(job_id)
-        locked = [item for item in records if item.get("locked") and item.get("color")]
-        if not locked:
+        hints = self.reference_library.identity_hints(records)
+        if not hints:
             return ""
-        hints = []
-        for item in locked[:40]:
-            label = str(item.get("label") or item.get("identity_id") or "object")
-            region = str(item.get("region") or "region")
-            color = str(item["color"])
-            shadow = str(item.get("shadow_color") or "")
-            suffix = f" with shadow {shadow}" if shadow else ""
-            hints.append(f"{label} {region} uses base color {color}{suffix}")
         return "Locked color records: " + "; ".join(hints)
+
+    def _reference_paths(self, job_id: str, source_path: Path, spec: JobSpec) -> list[Path]:
+        """Combine explicit references with local automatic retrieval.
+
+        Cobra benefits from several same-work visual examples. Existing
+        engines keep their explicit references only; the candidate engine gets
+        local retrieval as an additive input and never sends the index itself.
+        """
+        explicit = [path.resolve() for path in spec.style_references if path.is_file()]
+        if spec.engine != "cobra-candidate":
+            return explicit
+        matches = self.reference_library.retrieve(
+            source_path,
+            limit=6,
+            exclude=(source_path, *explicit),
+        )
+        paths: list[Path] = []
+        for path in (*explicit, *(match.path for match in matches)):
+            if path.is_file() and path not in paths:
+                paths.append(path)
+        return paths[:32]
+
+    @staticmethod
+    def _model_tier(spec: JobSpec, source_classification: Any) -> str:
+        """Return an auditable tier label for each unit request."""
+        if source_classification is not None and source_classification.source_passthrough:
+            return "bypass"
+        if spec.engine == "cobra-candidate":
+            return "cobra-candidate"
+        if spec.engine == "palette":
+            return "deterministic"
+        return "stable-production"
 
     def _corrected_unit_masks(
         self, job_id: str, unit: dict[str, Any]
@@ -793,10 +815,13 @@ class ProjectManager:
                 # scene when the generation service invents structure.
                 final = source_rgb
             else:
-                mask = validated_colorization_protection(
-                    source_rgb, generated_rgb, mask
+                mask = validated_colorization_protection(source_rgb, generated_rgb, mask)
+                compositor = (
+                    composite_reference_locked_colorization
+                    if spec.engine == "cobra-candidate"
+                    else composite_geometry_locked_colorization
                 )
-                final = composite_geometry_locked_colorization(
+                final = compositor(
                     source_rgb,
                     generated_rgb,
                     mask,
@@ -810,11 +835,7 @@ class ProjectManager:
         # Returning those areas to source luminance caused large gray islands
         # in otherwise valid generated colour. Explicit STYLE_FULL remains the
         # only mode allowed to import generated structure into the result.
-        if (
-            spec.mode == JobMode.STYLE_FULL
-            and uncertain_mask is not None
-            and uncertain_mask.any()
-        ):
+        if spec.mode == JobMode.STYLE_FULL and uncertain_mask is not None and uncertain_mask.any():
             final = composite_protected(source_rgb, final, uncertain_mask)
         qa_mask = mask
         if spec.mode != JobMode.STYLE_FULL:
@@ -1126,9 +1147,7 @@ class ProjectManager:
                                 job_id,
                             )
                             if passed:
-                                self._assemble_page_if_ready(
-                                    job_id, manifest, int(unit["page_id"])
-                                )
+                                self._assemble_page_if_ready(job_id, manifest, int(unit["page_id"]))
                                 self._emit("job_progress", self.status(job_id)["progress"], job_id)
                             break
                         prompt = build_prompt(
@@ -1141,9 +1160,7 @@ class ProjectManager:
                                 if item
                             ),
                         )
-                        render_settings = render_profile(
-                            spec.color_preset, spec.style_preset
-                        )
+                        render_settings = render_profile(spec.color_preset, spec.style_preset)
                         request = EngineRequest(
                             source_path=source_path,
                             output_path=generated_path,
@@ -1163,13 +1180,14 @@ class ProjectManager:
                                 "extra fingers, missing fingers, merged body parts, inconsistent "
                                 "hair or eye colors"
                             ),
-                            references=spec.style_references,
+                            references=self._reference_paths(job_id, source_path, spec),
                             attempt=attempts_used,
                             metadata={
                                 **spec.metadata,
                                 "style_preset": spec.style_preset,
                                 "color_preset": spec.color_preset,
                                 "detail_mode": spec.detail_mode.value,
+                                "model_tier": self._model_tier(spec, source_classification),
                                 **render_settings,
                                 # FLUX.2 Klein's colourization baseline is
                                 # deliberately fixed at the official 4-step,
@@ -1405,26 +1423,22 @@ class ProjectManager:
                     if int(item["id"]) == int(unit["page_id"])
                 )
                 final_available = bool(
-                    page_record["output_path"]
-                    and Path(page_record["output_path"]).is_file()
+                    page_record["output_path"] and Path(page_record["output_path"]).is_file()
                 )
                 preview_path = (
                     None
                     if final_available
-                    else self._assemble_page_preview(
-                        job_id, manifest, int(unit["page_id"])
-                    )
+                    else self._assemble_page_preview(job_id, manifest, int(unit["page_id"]))
                 )
                 if preview_path is not None:
                     page_units = manifest.page_units(int(unit["page_id"]))
                     page_index = int(unit["page_index"])
-                    asset_revision = manifest.page_asset_revision(
-                        int(unit["page_id"])
-                    ) or str(time.time_ns())
+                    asset_revision = manifest.page_asset_revision(int(unit["page_id"])) or str(
+                        time.time_ns()
+                    )
                     asset_query = f"?v={asset_revision}"
                     page_has_failure = any(
-                        item["status"] in {"failed", "qa_failed"}
-                        for item in page_units
+                        item["status"] in {"failed", "qa_failed"} for item in page_units
                     )
                     preview_thumbnail = (
                         self._job_dir(job_id)
@@ -1530,9 +1544,7 @@ class ProjectManager:
         self.prebuild_display_assets(job_id, int(page["page_index"]))
         return output
 
-    def _assemble_page_preview(
-        self, job_id: str, manifest: Manifest, page_id: int
-    ) -> Path | None:
+    def _assemble_page_preview(self, job_id: str, manifest: Manifest, page_id: int) -> Path | None:
         """Compose all available unit outputs for an inspectable live preview.
 
         A page preview may contain a mixture of generated panels and original
@@ -1554,21 +1566,13 @@ class ProjectManager:
                 canvas = source.convert("RGB")
             self._paste_units_safely(canvas, available, job_id=job_id)
             page_index = int(page["page_index"])
-            output = (
-                self._job_dir(job_id)
-                / "preview"
-                / "pages"
-                / f"page_{page_index:05d}.png"
-            )
+            output = self._job_dir(job_id) / "preview" / "pages" / f"page_{page_index:05d}.png"
             output.parent.mkdir(parents=True, exist_ok=True)
             temporary = output.with_suffix(".tmp.png")
             canvas.save(temporary, format="PNG")
             temporary.replace(output)
             thumbnail = (
-                self._job_dir(job_id)
-                / "preview"
-                / "thumbnails"
-                / f"page_{page_index:05d}.jpg"
+                self._job_dir(job_id) / "preview" / "thumbnails" / f"page_{page_index:05d}.jpg"
             )
             thumbnail.parent.mkdir(parents=True, exist_ok=True)
             preview = canvas.copy()
@@ -1591,12 +1595,7 @@ class ProjectManager:
         )
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
-        output = (
-            self._job_dir(job_id)
-            / "display"
-            / variant
-            / f"page_{page_index:05d}.webp"
-        )
+        output = self._job_dir(job_id) / "display" / variant / f"page_{page_index:05d}.webp"
         with self._preview_lock:
             if output.is_file() and output.stat().st_mtime_ns >= source_path.stat().st_mtime_ns:
                 return output
@@ -1653,12 +1652,7 @@ class ProjectManager:
                 )
                 if not source_path.is_file():
                     continue
-                output = (
-                    self._job_dir(job_id)
-                    / "display"
-                    / variant
-                    / f"page_{page_index:05d}.webp"
-                )
+                output = self._job_dir(job_id) / "display" / variant / f"page_{page_index:05d}.webp"
                 if output.is_file() and output.stat().st_mtime_ns >= source_path.stat().st_mtime_ns:
                     continue
                 self._write_display_asset(source_path, output)
@@ -1684,18 +1678,13 @@ class ProjectManager:
                 page_index = int(page["page_index"])
                 for variant in variants:
                     source_value = (
-                        page["source_path"]
-                        if variant == "source"
-                        else page["output_path"] or ""
+                        page["source_path"] if variant == "source" else page["output_path"] or ""
                     )
                     source_path = Path(source_value)
                     if not source_path.is_file():
                         continue
                     output = (
-                        self._job_dir(job_id)
-                        / "display"
-                        / variant
-                        / f"page_{page_index:05d}.webp"
+                        self._job_dir(job_id) / "display" / variant / f"page_{page_index:05d}.webp"
                     )
                     if (
                         output.is_file()
@@ -1768,9 +1757,7 @@ class ProjectManager:
                 with Image.open(final_path) as result:
                     result_rgb = result.convert("RGB")
                     if result_rgb.size != (width, height):
-                        raise ValueError(
-                            f"result size {result_rgb.size} != crop {(width, height)}"
-                        )
+                        raise ValueError(f"result size {result_rgb.size} != crop {(width, height)}")
                     target = occupied[y : y + height, x : x + width]
                     write_mask = ~target
                     if not write_mask.all():
@@ -1840,9 +1827,7 @@ class ProjectManager:
                     unit = {**stored_unit, "page_index": page_index}
                     current_unit_index = int(unit["unit_index"])
                     generated_path = (
-                        Path(unit["generated_path"])
-                        if unit["generated_path"]
-                        else None
+                        Path(unit["generated_path"]) if unit["generated_path"] else None
                     )
                     source_path = Path(unit["source_path"])
                     if not source_path.is_file():
@@ -1850,9 +1835,7 @@ class ProjectManager:
                             f"Missing repair input for page {page_index + 1}, "
                             f"unit {int(unit['unit_index']) + 1}"
                         )
-                    final_name = (
-                        f"page_{page_index:05d}_panel_{int(unit['unit_index']):04d}.png"
-                    )
+                    final_name = f"page_{page_index:05d}_panel_{int(unit['unit_index']):04d}.png"
                     staged_path = staging_final / "panels" / final_name
                     staged_path.parent.mkdir(parents=True, exist_ok=True)
                     with Image.open(source_path) as source_image:
@@ -1936,16 +1919,12 @@ class ProjectManager:
 
                 with Image.open(page["source_path"]) as source:
                     canvas = source.convert("RGB")
-                if self._paste_units_safely(canvas, page_units, job_id=job_id) != len(
-                    page_units
-                ):
+                if self._paste_units_safely(canvas, page_units, job_id=job_id) != len(page_units):
                     raise RuntimeError(f"Staged page assembly failed for page {page_index + 1}")
                 staged_page_path = staging_final / "pages" / f"page_{page_index:05d}.png"
                 staged_page_path.parent.mkdir(parents=True, exist_ok=True)
                 canvas.save(staged_page_path, format="PNG")
-                thumbnail = (
-                    staging_final / "thumbnails" / f"page_{page_index:05d}.jpg"
-                )
+                thumbnail = staging_final / "thumbnails" / f"page_{page_index:05d}.jpg"
                 thumbnail.parent.mkdir(parents=True, exist_ok=True)
                 preview = canvas.copy()
                 preview.thumbnail((240, 320), Image.Resampling.LANCZOS)
@@ -1961,9 +1940,7 @@ class ProjectManager:
                 staged_pages.append(
                     {
                         "id": int(page["id"]),
-                        "output_path": live_final
-                        / "pages"
-                        / f"page_{page_index:05d}.png",
+                        "output_path": live_final / "pages" / f"page_{page_index:05d}.png",
                         "asset_revision": str(time.time_ns()),
                         "staged_path": staged_page_path,
                     }
@@ -2098,9 +2075,7 @@ class ProjectManager:
         with self._active_job_lock:
             active_for_job = self._active_job_id == job_id
         requested_at = datetime.now(UTC).isoformat()
-        deadline_at = datetime.fromtimestamp(
-            datetime.now(UTC).timestamp() + 15, UTC
-        ).isoformat()
+        deadline_at = datetime.fromtimestamp(datetime.now(UTC).timestamp() + 15, UTC).isoformat()
         state = self._set_control_state(
             job_id,
             "pause_requested",
@@ -2111,9 +2086,7 @@ class ProjectManager:
         )
         interrupted = self._interrupt_active_engine(job_id)
         if not active_for_job:
-            reset = self._manifest(job_id).reset_running_units(
-                job_id, "任务暂停时清理遗留运行单元"
-            )
+            reset = self._manifest(job_id).reset_running_units(job_id, "任务暂停时清理遗留运行单元")
             if reset:
                 logger.info("job=%s reset stale running units=%s on pause", job_id, reset)
             self._manifest(job_id).set_job_status(job_id, JobStatus.PAUSED)
@@ -2145,9 +2118,7 @@ class ProjectManager:
         with self._active_job_lock:
             active_for_job = self._active_job_id == job_id
         requested_at = datetime.now(UTC).isoformat()
-        deadline_at = datetime.fromtimestamp(
-            datetime.now(UTC).timestamp() + 15, UTC
-        ).isoformat()
+        deadline_at = datetime.fromtimestamp(datetime.now(UTC).timestamp() + 15, UTC).isoformat()
         state = self._set_control_state(
             job_id,
             "cancel_requested",
@@ -2158,9 +2129,7 @@ class ProjectManager:
         )
         interrupted = self._interrupt_active_engine(job_id)
         if not active_for_job:
-            reset = self._manifest(job_id).reset_running_units(
-                job_id, "任务取消时清理遗留运行单元"
-            )
+            reset = self._manifest(job_id).reset_running_units(job_id, "任务取消时清理遗留运行单元")
             if reset:
                 logger.info("job=%s reset stale running units=%s on cancel", job_id, reset)
             self._manifest(job_id).set_job_status(job_id, JobStatus.CANCELLED)

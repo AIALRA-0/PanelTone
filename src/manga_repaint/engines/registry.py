@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import Engine
+from .cobra import CobraCandidateEngine
 from .comfyui import ComfyUIEngine
 from .external import ExternalCommandEngine
 from .http_service import HTTPImageEngine
@@ -67,6 +68,15 @@ class EngineRegistry:
             elif kind == "http_image":
                 registry.register(
                     HTTPImageEngine(
+                        name=item["name"],
+                        base_url=item["base_url"],
+                        timeout_seconds=int(item.get("timeout_seconds", 1800)),
+                        api_key=item.get("api_key"),
+                    )
+                )
+            elif kind == "cobra_http":
+                registry.register(
+                    CobraCandidateEngine(
                         name=item["name"],
                         base_url=item["base_url"],
                         timeout_seconds=int(item.get("timeout_seconds", 1800)),
