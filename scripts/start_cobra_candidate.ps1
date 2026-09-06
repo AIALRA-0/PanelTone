@@ -28,5 +28,12 @@ $env:PANELTONE_COBRA_MODEL_CACHE = $ModelCachePath
 $env:HF_HOME = $HfCachePath
 $env:PANELTONE_COBRA_HEADLESS = "1"
 $env:PANELTONE_COBRA_TMP = Join-Path $env:LOCALAPPDATA "PanelTone\cobra-candidate"
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$sourceRoot = Join-Path $projectRoot "src"
+$env:PYTHONPATH = if ($env:PYTHONPATH) {
+    "$projectRoot;$sourceRoot;$env:PYTHONPATH"
+} else {
+    "$projectRoot;$sourceRoot"
+}
 New-Item -ItemType Directory -Force -Path $env:PANELTONE_COBRA_TMP | Out-Null
-& $pythonPath -m uvicorn scripts.cobra_http_service:app --app-dir (Resolve-Path (Join-Path $PSScriptRoot "..")) --host 127.0.0.1 --port $Port
+& $pythonPath -m uvicorn scripts.cobra_http_service:app --app-dir $projectRoot --host 127.0.0.1 --port $Port

@@ -507,6 +507,29 @@ def composite_reference_locked_colorization(
     return Image.fromarray(result_rgb, mode="RGB")
 
 
+def normalize_color_candidate_size(
+    candidate: Image.Image,
+    source_size: tuple[int, int],
+    *,
+    max_aspect_error: float = 0.01,
+) -> Image.Image:
+    """Put a colour-only candidate on the source pixel grid safely.
+
+    A candidate model may use a smaller internal canvas.  Since only its
+    colour channels cross the boundary, a small aspect-preserving resize is
+    safe; a crop or visible distortion is rejected before compositing.
+    """
+    if tuple(candidate.size) == tuple(source_size):
+        return candidate
+    source_ratio = source_size[0] / max(1, source_size[1])
+    candidate_ratio = candidate.size[0] / max(1, candidate.size[1])
+    if abs(source_ratio - candidate_ratio) / max(source_ratio, 1e-6) > max_aspect_error:
+        raise ValueError(
+            f"candidate output aspect ratio mismatch: {candidate.size} vs {source_size}"
+        )
+    return candidate.resize(source_size, resample=Image.Resampling.LANCZOS)
+
+
 def geometry_barrier_mask(
     source: Image.Image,
     protected_mask: np.ndarray,

@@ -15,6 +15,8 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+from manga_repaint.color import normalize_color_candidate_size
+
 logger = logging.getLogger("paneltone.cobra")
 # FastAPI's dependency declarations intentionally call File/Form at definition
 # time; this is the framework's documented multipart signature.
@@ -169,9 +171,9 @@ def generate(
             query_origin,
             extracted_original,
         )
-        output = result[0]
+        output = normalize_color_candidate_size(result[0].convert("RGB"), source_image.size)
         output_path = temp_root / "result.png"
-        output.convert("RGB").save(output_path, format="PNG")
+        output.save(output_path, format="PNG")
         elapsed_ms = round((time.monotonic() - started) * 1000, 1)
         with lock:
             state.update({"state": "idle", "loaded": True, "active_requests": 0})
