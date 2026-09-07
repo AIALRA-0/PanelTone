@@ -181,6 +181,32 @@ def test_geometry_locked_project_aligns_model_canvas_without_importing_edges(
     )
 
 
+def test_cobra_prefers_reviewed_curated_references_over_live_retrieval(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    job_id = "a" * 32
+    job_dir = settings.data_root / job_id
+    curated = job_dir / "references" / "curated"
+    curated.mkdir(parents=True)
+    source = tmp_path / "source.png"
+    Image.new("RGB", (32, 32), "white").save(source)
+    first = curated / "anchor-a.png"
+    second = curated / "anchor-b.png"
+    Image.new("RGB", (32, 32), "red").save(first)
+    Image.new("RGB", (32, 32), "blue").save(second)
+    spec = JobSpec(
+        source=source,
+        workspace=settings.data_root,
+        engine="cobra-candidate",
+    )
+
+    paths = manager._reference_paths(job_id, source, spec)
+
+    assert paths == [first, second]
+
+
 def test_page_ready_event_precedes_completed(tmp_path: Path, manga_pages: Path) -> None:
     events: list[tuple[str, dict[str, object]]] = []
     manager = ProjectManager(

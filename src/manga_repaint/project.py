@@ -95,6 +95,9 @@ class ProjectManager:
         # full-resolution mask set per page in the worker process.
         self._semantic_cache_limit = 2
         self.reference_library = ColorReferenceLibrary(settings.data_root)
+        self._palette_cache: dict[
+            tuple[tuple[str, int, int], ...], list[tuple[float, float, float]]
+        ] = {}
         self._event_callback = event_callback
         self.recover_interrupted_jobs()
 
@@ -715,16 +718,76 @@ class ProjectManager:
         explicit = [path.resolve() for path in spec.style_references if path.is_file()]
         if spec.engine != "cobra-candidate":
             return explicit
+        # A reviewed book-level anchor set is stronger than automatically
+        # retrieved final pages.  Automatic retrieval is useful for discovering
+        # candidates, but a previous page can itself contain dropped colour and
+        # would otherwise teach Cobra the same defect on every later page.
+        curated_root = self._job_dir(job_id) / "references" / "curated"
+        curated = sorted(
+            path
+            for path in curated_root.glob("*")
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        if curated:
+            paths: list[Path] = []
+            for path in (*explicit, *curated):
+                if path.is_file() and path not in paths:
+                    paths.append(path)
+            return paths[:12]
+        # Reference colours must be scoped to the current book. The previous
+        # global index could select a page from another manga, which made a
+        # character's palette drift even when the candidate itself was stable.
+        scope_root = self._job_dir(job_id) / "final" / "pages"
         matches = self.reference_library.retrieve(
             source_path,
-            limit=6,
+            limit=12,
             exclude=(source_path, *explicit),
+            scope_root=scope_root,
+            use_payload_cache=True,
+            min_colour_coverage=0.12,
         )
+        if not matches:
+            matches = self.reference_library.retrieve(
+                source_path,
+                limit=6,
+                exclude=(source_path, *explicit),
+                scope_root=scope_root,
+                use_payload_cache=True,
+            )
+        # A brand-new book may have no completed colour page yet. Keep the
+        # candidate usable in that case, but make the fallback small and
+        # explicit; once the first page is committed, same-book references are
+        # always preferred.
+        if not matches and not explicit:
+            matches = self.reference_library.retrieve(
+                source_path,
+                limit=12,
+                exclude=(source_path,),
+                use_payload_cache=True,
+                min_colour_coverage=0.20,
+            )
         paths: list[Path] = []
         for path in (*explicit, *(match.path for match in matches)):
             if path.is_file() and path not in paths:
                 paths.append(path)
-        return paths[:32]
+        return paths[:64]
+
+    def _reference_palette(
+        self, paths: list[Path] | None
+    ) -> list[tuple[float, float, float]]:
+        if not paths:
+            return []
+        signature: list[tuple[str, int, int]] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+        key = tuple(signature)
+        if key not in self._palette_cache:
+            self._palette_cache[key] = self.reference_library.palette_anchors(paths)
+        return self._palette_cache[key]
 
     @staticmethod
     def _model_tier(spec: JobSpec, source_classification: Any) -> str:
@@ -797,6 +860,7 @@ class ProjectManager:
         mask: np.ndarray,
         spec: JobSpec,
         uncertain_mask: np.ndarray | None = None,
+        reference_paths: list[Path] | None = None,
     ) -> tuple[Image.Image, np.ndarray]:
         """Compose one generated unit and return its QA protection mask.
 
@@ -809,6 +873,7 @@ class ProjectManager:
         effective_chroma = spec.chroma_strength * float(
             render_profile(spec.color_preset, spec.style_preset)["chroma_multiplier"]
         )
+        compositor = None
         if spec.mode != JobMode.STYLE_FULL:
             if is_already_colorized(source_rgb):
                 # Do not let a colour cover/credits page turn into a different
@@ -816,9 +881,14 @@ class ProjectManager:
                 final = source_rgb
             else:
                 mask = validated_colorization_protection(source_rgb, generated_rgb, mask)
+                # Every COLORIZE engine is now geometry-locked and colour-only.
+                # Cobra additionally receives the book palette; the stable
+                # FLUX route uses the same compositor without those anchors so
+                # it does not retain the old barrier path that produced gray
+                # islands on small panels.
                 compositor = (
                     composite_reference_locked_colorization
-                    if spec.engine == "cobra-candidate"
+                    if spec.mode == JobMode.COLORIZE
                     else composite_geometry_locked_colorization
                 )
                 final = compositor(
@@ -827,6 +897,14 @@ class ProjectManager:
                     mask,
                     chroma_strength=effective_chroma,
                     ink_core_threshold=64,
+                    **(
+                        {
+                            "palette_anchors": self._reference_palette(reference_paths),
+                            "palette_strength": 0.28,
+                        }
+                        if spec.engine == "cobra-candidate"
+                        else {}
+                    ),
                 )
         else:
             final = composite_protected(source_rgb, generated_rgb, mask)
@@ -839,10 +917,16 @@ class ProjectManager:
             final = composite_protected(source_rgb, final, uncertain_mask)
         qa_mask = mask
         if spec.mode != JobMode.STYLE_FULL:
-            # QA must exclude the same one-pixel source geometry guard that the
-            # compositor restores. Otherwise protected border pixels look like
-            # a false colour dropout, especially on small stress-test pages.
-            qa_mask = geometry_barrier_mask(source_rgb, mask, ink_core_threshold=64)
+            # The legacy barrier compositor restores its one-pixel geometry
+            # guard, while the reference compositor keeps that guard only as a
+            # diagnostic boundary to avoid gray islands on small panels.
+            if compositor is composite_reference_locked_colorization:
+                # The reference compositor intentionally keeps the barrier as
+                # a diagnostic boundary, not a broad source-pixel restore. A
+                # broad restore recreates the gray islands this route removes.
+                qa_mask = mask
+            else:
+                qa_mask = geometry_barrier_mask(source_rgb, mask, ink_core_threshold=64)
         return final, qa_mask
 
     @staticmethod
@@ -1161,6 +1245,7 @@ class ProjectManager:
                             ),
                         )
                         render_settings = render_profile(spec.color_preset, spec.style_preset)
+                        reference_paths = self._reference_paths(job_id, source_path, spec)
                         request = EngineRequest(
                             source_path=source_path,
                             output_path=generated_path,
@@ -1180,7 +1265,7 @@ class ProjectManager:
                                 "extra fingers, missing fingers, merged body parts, inconsistent "
                                 "hair or eye colors"
                             ),
-                            references=self._reference_paths(job_id, source_path, spec),
+                            references=reference_paths,
                             attempt=attempts_used,
                             metadata={
                                 **spec.metadata,
@@ -1204,6 +1289,8 @@ class ProjectManager:
                                     if spec.mode == JobMode.COLORIZE
                                     else render_settings["num_inference_steps"]
                                 ),
+                                "cobra_top_k": 6,
+                                "cobra_steps": 10,
                             },
                         )
                         cached_generated = Path(unit["generated_path"] or "")
@@ -1268,9 +1355,23 @@ class ProjectManager:
                             Image.open(generated_path) as generated_image,
                         ):
                             mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
-                            final, qa_mask = self._compose_unit(
-                                source_image, generated_image, mask, spec, uncertain_mask
-                            )
+                            if spec.engine == "cobra-candidate":
+                                final, qa_mask = self._compose_unit(
+                                    source_image,
+                                    generated_image,
+                                    mask,
+                                    spec,
+                                    uncertain_mask,
+                                    reference_paths,
+                                )
+                            else:
+                                final, qa_mask = self._compose_unit(
+                                    source_image,
+                                    generated_image,
+                                    mask,
+                                    spec,
+                                    uncertain_mask,
+                                )
                             source_rgb = source_image.convert("RGB")
                             final.save(final_path, format="PNG")
                             qa_generated = (
@@ -1866,11 +1967,28 @@ class ProjectManager:
                                     f"Missing generated repair input for page {page_index + 1}, "
                                     f"unit {int(unit['unit_index']) + 1}"
                                 )
+                            reference_paths = self._reference_paths(
+                                job_id, source_path, spec
+                            )
                             with Image.open(generated_path) as generated_image:
                                 mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
-                                final, qa_mask = self._compose_unit(
-                                    source_image, generated_image, mask, spec, uncertain_mask
-                                )
+                                if spec.engine == "cobra-candidate":
+                                    final, qa_mask = self._compose_unit(
+                                        source_image,
+                                        generated_image,
+                                        mask,
+                                        spec,
+                                        uncertain_mask,
+                                        reference_paths,
+                                    )
+                                else:
+                                    final, qa_mask = self._compose_unit(
+                                        source_image,
+                                        generated_image,
+                                        mask,
+                                        spec,
+                                        uncertain_mask,
+                                    )
                                 qa = evaluate(
                                     source_rgb,
                                     final,

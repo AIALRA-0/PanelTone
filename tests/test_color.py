@@ -78,6 +78,28 @@ def test_reference_locked_composition_keeps_source_geometry_and_transfers_chroma
     assert int(result[10, 10].max()) - int(result[10, 10].min()) > 20
 
 
+def test_reference_locked_composition_fills_local_neutral_hole_without_painting_background(
+) -> None:
+    source = Image.new("RGB", (64, 64), "white")
+    generated_pixels = np.full((64, 64, 3), 255, dtype=np.uint8)
+    generated_pixels[20:45, 20:45] = (220, 80, 40)
+    generated_pixels[30:35, 30:35] = (245, 245, 245)
+    generated = Image.fromarray(generated_pixels, mode="RGB")
+
+    result = np.asarray(
+        composite_reference_locked_colorization(
+            source,
+            generated,
+            np.zeros((64, 64), dtype=bool),
+            palette_anchors=[(8.0, 180.0, 1.0)],
+        )
+    )
+    result_hsv = cv2.cvtColor(result, cv2.COLOR_RGB2HSV)
+
+    assert int(result_hsv[32, 32, 1]) >= 22
+    assert int(result_hsv[5, 5, 1]) < 10
+
+
 def test_ink_overlay_preserves_near_black_print_pixels_exactly() -> None:
     source = Image.new("RGB", (12, 12), (255, 255, 255))
     pixels = np.asarray(source).copy()

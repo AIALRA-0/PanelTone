@@ -459,6 +459,8 @@ def composite_reference_locked_colorization(
     *,
     chroma_strength: float = 1.0,
     ink_core_threshold: int = 64,
+    palette_anchors: list[tuple[float, float, float]] | None = None,
+    palette_strength: float = 0.28,
 ) -> Image.Image:
     """Transfer reference colour while keeping source luminance and geometry.
 
@@ -476,6 +478,8 @@ def composite_reference_locked_colorization(
         raise ValueError("source and generated images must have identical dimensions")
     if protected_mask.shape != source_rgb.shape[:2]:
         raise ValueError("protection mask shape does not match source image")
+    if not 0.0 <= palette_strength <= 1.0:
+        raise ValueError("Palette strength must be between 0.0 and 1.0")
     source_hsv = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2HSV)
     candidate_hsv = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2HSV)
     source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
@@ -491,6 +495,30 @@ def composite_reference_locked_colorization(
         candidate_hsv[..., 1].astype(np.float32), (0, 0), 0.55
     )
     result_sat = np.clip(result_sat * float(chroma_strength), 0, 255)
+
+    # A reference library is a book-level colour vocabulary, not a semantic
+    # segmentation model. Softly pull nearby candidate hues toward that
+    # vocabulary so skin, hair, and clothing do not drift between pages while
+    # preserving genuinely distinct colours that are absent from the book.
+    if palette_anchors:
+        result_hue, result_sat = _stabilize_palette(
+            result_hue,
+            result_sat,
+            palette_anchors,
+            strength=palette_strength,
+        )
+
+    # Cobra can leave neutral islands inside an otherwise coloured local area.
+    # Fill only holes close to a coherent candidate colour field. This is
+    # deliberately local: it cannot paint a whole white speech balloon or page
+    # background merely because a different region on the page is colourful.
+    result_hue, result_sat = _fill_neutral_holes(
+        result_hue,
+        result_sat,
+        candidate_hsv[..., 2].astype(np.float32),
+        protected_mask,
+        source_gray,
+    )
     composed = np.dstack(
         (
             result_hue.astype(np.uint8),
@@ -505,6 +533,91 @@ def composite_reference_locked_colorization(
     exact = protected_mask | black_source
     result_rgb[exact] = source_rgb[exact]
     return Image.fromarray(result_rgb, mode="RGB")
+
+
+def _stabilize_palette(
+    hue: np.ndarray,
+    saturation: np.ndarray,
+    anchors: list[tuple[float, float, float]],
+    *,
+    strength: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Softly regularize candidate colours against a local book palette."""
+    if not anchors or strength <= 0:
+        return hue, saturation
+    anchor_hue = np.asarray([item[0] for item in anchors], dtype=np.float32)
+    anchor_sat = np.asarray([item[1] for item in anchors], dtype=np.float32)
+    anchor_weight = np.asarray([max(0.0, item[2]) for item in anchors], dtype=np.float32)
+    anchor_weight /= max(float(anchor_weight.max()), 1e-6)
+    pixels = hue.reshape(-1)
+    sat = saturation.reshape(-1)
+    angle = pixels[:, None] * np.pi / 90.0
+    anchor_angle = anchor_hue[None, :] * np.pi / 90.0
+    distance = np.abs(pixels[:, None] - anchor_hue[None, :])
+    distance = np.minimum(distance, 180.0 - distance)
+    nearest = np.argmin(distance, axis=1)
+    nearest_distance = distance[np.arange(distance.shape[0]), nearest]
+    # Large hue jumps are more likely to be a meaningful distinct colour than
+    # palette drift. Only regularize a nearby colour family.
+    apply = (sat >= 20.0) & (nearest_distance <= 32.0)
+    local_strength = strength * anchor_weight[nearest] * np.clip(
+        1.0 - nearest_distance / 32.0, 0.0, 1.0
+    )
+    local_strength = np.where(apply, local_strength, 0.0).astype(np.float32)
+    target = anchor_angle[0, nearest]
+    sin_value = np.sin(angle[:, 0]) * (1.0 - local_strength) + np.sin(target) * local_strength
+    cos_value = np.cos(angle[:, 0]) * (1.0 - local_strength) + np.cos(target) * local_strength
+    pixels = (np.arctan2(sin_value, cos_value) * 90.0 / np.pi) % 180.0
+    target_sat = anchor_sat[nearest]
+    sat = np.where(
+        apply,
+        sat * (1.0 - local_strength * 0.45) + target_sat * local_strength * 0.45,
+        sat,
+    )
+    return pixels.reshape(hue.shape), np.clip(sat, 0, 255).reshape(saturation.shape)
+
+
+def _fill_neutral_holes(
+    hue: np.ndarray,
+    saturation: np.ndarray,
+    candidate_value: np.ndarray,
+    protected_mask: np.ndarray,
+    source_gray: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fill small neutral gaps surrounded by a coherent candidate colour."""
+    coloured = (saturation >= 28.0) & (candidate_value >= 18.0)
+    if not coloured.any():
+        return hue, saturation
+    kernel = np.ones((11, 11), dtype=np.uint8)
+    near_colour = cv2.dilate(coloured.astype(np.uint8), kernel) > 0
+    support = cv2.GaussianBlur(coloured.astype(np.float32), (0, 0), 3.0)
+    distance = cv2.distanceTransform((~coloured).astype(np.uint8), cv2.DIST_L2, 3)
+    # Do not fill exact protection, pure black ink, or pixels far from a local
+    # colour signal. A 12px radius is enough for holes in hair/skin/clothing
+    # without turning a neighbouring speech balloon into a painted block.
+    holes = (
+        near_colour
+        & (support >= 0.08)
+        & (distance <= 12.0)
+        & (saturation < 18.0)
+        & ~protected_mask
+        & (source_gray > 8)
+    )
+    if not holes.any():
+        return hue, saturation
+    angle = hue * np.pi / 90.0
+    weights = coloured.astype(np.float32)
+    local_sin = cv2.GaussianBlur(np.sin(angle) * weights, (0, 0), 3.0)
+    local_cos = cv2.GaussianBlur(np.cos(angle) * weights, (0, 0), 3.0)
+    local_sat = cv2.GaussianBlur(saturation * weights, (0, 0), 3.0)
+    local_weight = cv2.GaussianBlur(weights, (0, 0), 3.0)
+    stable = local_weight > 0.08
+    filled_hue = (np.arctan2(local_sin, local_cos) * 90.0 / np.pi) % 180.0
+    filled_sat = local_sat / np.maximum(local_weight, 1e-4)
+    apply = holes & stable
+    hue = np.where(apply, filled_hue, hue)
+    saturation = np.where(apply, np.maximum(filled_sat * 0.78, 22.0), saturation)
+    return hue, np.clip(saturation, 0, 255)
 
 
 def normalize_color_candidate_size(
