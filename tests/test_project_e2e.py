@@ -340,7 +340,7 @@ def test_failed_staged_repair_does_not_change_live_results(
     first_page = Path(manager._manifest(job_id).pages(job_id)[0]["output_path"])
     before = _sha256(first_page)
 
-    def grayscale_result(source, _generated, _mask, _spec, _uncertain):
+    def grayscale_result(source, _generated, _mask, _spec, _uncertain, *_args):
         return (
             Image.new("RGB", source.size, (160, 160, 160)),
             np.zeros((source.height, source.width), dtype=bool),

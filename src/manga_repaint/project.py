@@ -2315,6 +2315,8 @@ class ProjectManager:
                                         mask,
                                         spec,
                                         uncertain_mask,
+                                        reference_paths,
+                                        palette_anchors,
                                     )
                                 qa = evaluate(
                                     source_rgb,
