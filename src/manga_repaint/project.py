@@ -862,6 +862,7 @@ class ProjectManager:
         references: list[Path],
         qa: Any,
         render_seed: int | None = None,
+        engine_metadata: dict[str, Any] | None = None,
     ) -> None:
         if context is None:
             return
@@ -873,6 +874,15 @@ class ProjectManager:
                     reference_hashes.append(image_sha256(reference_image))
             except (OSError, ValueError):
                 continue
+        evidence_metadata = [
+            ("mode", spec.mode.value),
+            ("color_preset", spec.color_preset),
+            ("style_preset", spec.style_preset),
+        ]
+        if engine_metadata:
+            evidence_metadata.extend(
+                (str(key), str(value)) for key, value in sorted(engine_metadata.items())
+            )
         evidence = RenderEvidence(
             version=1,
             job_id=job_id,
@@ -880,7 +890,11 @@ class ProjectManager:
             unit_index=unit_index,
             plan_hash=plan_hash,
             model_id=str(spec.engine),
-            model_revision=None,
+            model_revision=(
+                str(engine_metadata.get("model_revision"))
+                if engine_metadata and engine_metadata.get("model_revision") is not None
+                else None
+            ),
             renderer_version=RENDERER_VERSION,
             source_hash=source_hash,
             generated_hash=generated_hash,
@@ -893,11 +907,7 @@ class ProjectManager:
                 if plan is not None
                 else spec.seed
             ),
-            metadata=(
-                ("mode", spec.mode.value),
-                ("color_preset", spec.color_preset),
-                ("style_preset", spec.style_preset),
-            ),
+            metadata=tuple(evidence_metadata),
             qa_hash=artifact_digest(qa.to_json_dict()) if qa is not None else None,
         )
         context["store"].write(
@@ -1426,6 +1436,7 @@ class ProjectManager:
                         / f"page_{unit['page_index']:05d}_panel_{unit['unit_index']:04d}.png"
                     )
                     final_path.parent.mkdir(parents=True, exist_ok=True)
+                    engine_metadata: dict[str, Any] = {}
                     try:
                         if source_classification and source_classification.source_passthrough:
                             with Image.open(source_path) as source_image:
@@ -1569,7 +1580,8 @@ class ProjectManager:
                                 job_id,
                             )
                             try:
-                                engine.generate(request)
+                                engine_result = engine.generate(request)
+                                engine_metadata = dict(engine_result.engine_metadata or {})
                             except EngineInterrupted as exc:
                                 interrupted_status = (
                                     JobStatus.CANCELLED
@@ -1683,6 +1695,7 @@ class ProjectManager:
                                 references=reference_paths,
                                 qa=qa,
                                 render_seed=request.seed,
+                                engine_metadata=engine_metadata,
                             )
                         manifest.finish_unit(unit_id, generated_path, final_path, qa)
                         if qa.passed:
