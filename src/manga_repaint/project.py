@@ -26,6 +26,18 @@ from .color import (
     is_already_colorized,
     validated_colorization_protection,
 )
+from .color_state import (
+    RENDERER_VERSION,
+    ColorBookState,
+    ColorStateStore,
+    RegionColorPlan,
+    RenderEvidence,
+    artifact_digest,
+    build_color_book_state,
+    build_identity_graph,
+    build_segment_graph,
+    make_region_color_plan,
+)
 from .config import Settings, ensure_allowed_path
 from .engines import EngineInterrupted, EngineRegistry, EngineRequest
 from .export import export_book
@@ -98,6 +110,10 @@ class ProjectManager:
         self._palette_cache: dict[
             tuple[tuple[str, int, int], ...], list[tuple[float, float, float]]
         ] = {}
+        # One immutable book context is reused by normal processing, retries,
+        # and CPU repair.  The cache is process-local; the JSON sidecars are
+        # the durable source for later runs and audit tooling.
+        self._color_context_cache: dict[str, dict[str, Any]] = {}
         self._event_callback = event_callback
         self.recover_interrupted_jobs()
 
@@ -708,6 +724,187 @@ class ProjectManager:
             return ""
         return "Locked color records: " + "; ".join(hints)
 
+    def _book_color_anchor_paths(self, job_id: str, spec: JobSpec) -> list[Path]:
+        """Return deliberately curated book anchors for the color state.
+
+        Automatic retrieval remains available to the candidate engine, but it
+        is never promoted to a locked identity palette merely because a page
+        happened to be visually similar.  Only explicit references and the
+        reviewed ``references/curated`` directory enter the durable state.
+        """
+        curated_root = self._job_dir(job_id) / "references" / "curated"
+        curated = sorted(
+            path
+            for path in curated_root.glob("*")
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        paths: list[Path] = []
+        for path in (*spec.style_references, *curated):
+            resolved = Path(path).resolve()
+            if resolved.is_file() and resolved not in paths:
+                paths.append(resolved)
+        return paths[:64]
+
+    def _prepare_color_context(
+        self, job_id: str, manifest: Manifest, spec: JobSpec
+    ) -> dict[str, Any]:
+        """Build or reuse the durable book-level color planning context.
+
+        The context is intentionally conservative: identity observations are
+        empty until a detector or curator provides evidence, while existing
+        manifest identity records can still contribute explicit palette slots.
+        This makes uncertainty visible instead of turning a weak visual match
+        into a false character lock.
+        """
+        pages = manifest.pages(job_id)
+        source_snapshot: dict[int, str] = {}
+        for page in pages:
+            source_path = Path(page["source_path"])
+            with Image.open(source_path) as image:
+                source_snapshot[int(page["page_index"])] = image_sha256(image)
+        snapshot_hash = stable_hash(source_snapshot)
+        cached = self._color_context_cache.get(job_id)
+        if cached is not None and cached["source_snapshot_hash"] == snapshot_hash:
+            return cached
+
+        store = ColorStateStore(self._job_dir(job_id))
+        segment_graphs: dict[int, Any] = {}
+        for page in pages:
+            page_index = int(page["page_index"])
+            with Image.open(page["source_path"]) as image:
+                segment = build_segment_graph(
+                    image.convert("RGB"), job_id=job_id, page_index=page_index
+                )
+            segment_graphs[page_index] = segment
+            store.write_page("segments", page_index, segment)
+        segment_graph_hash = stable_hash(
+            {str(index): graph.analysis_hash for index, graph in segment_graphs.items()}
+        )
+        identity_graph = build_identity_graph(job_id)
+        anchor_paths = self._book_color_anchor_paths(job_id, spec)
+        observed_anchors = self._reference_palette(anchor_paths)
+        state = build_color_book_state(
+            job_id,
+            source_snapshot,
+            identity_graph,
+            segment_graph_hash,
+            identities=manifest.identities(job_id),
+            observed_palette_anchors=observed_anchors,
+        )
+        store.write(
+            "source_snapshot.json",
+            {"job_id": job_id, "snapshot_hash": snapshot_hash, "pages": source_snapshot},
+        )
+        store.write("identity_graph.json", identity_graph)
+        store.write("color_book_state.json", state)
+        context = {
+            "source_snapshot_hash": snapshot_hash,
+            "source_snapshot": source_snapshot,
+            "segment_graphs": segment_graphs,
+            "segment_graph_hash": segment_graph_hash,
+            "state": state,
+            "store": store,
+        }
+        self._color_context_cache[job_id] = context
+        return context
+
+    def _page_color_plan(
+        self,
+        context: dict[str, Any],
+        *,
+        source_path: Path,
+        page_index: int,
+        references: list[Path],
+        page_seed: int,
+    ) -> RegionColorPlan:
+        """Create the page plan consumed by both inference and CPU repair."""
+        with Image.open(source_path) as image:
+            source_hash = image_sha256(image)
+        segment = context["segment_graphs"][page_index]
+        plan = make_region_color_plan(
+            context["state"],
+            segment,
+            page_source_hash=source_hash,
+            page_index=page_index,
+            references=references,
+            page_seed=page_seed,
+        )
+        context["store"].write_page("plans", page_index, plan)
+        return plan
+
+    def _combined_palette_anchors(
+        self,
+        state: ColorBookState, references: list[Path]
+    ) -> list[tuple[float, float, float]]:
+        """Combine durable book vocabulary with page-local evidence."""
+        anchors = list(state.observed_palette_anchors)
+        # Automatic page references are local suggestions, while durable book
+        # anchors remain first. Keep a stable ordering and avoid duplicates;
+        # the compositor still treats these as soft hints, never as masks.
+        for anchor in self._reference_palette(references):
+            if anchor not in anchors:
+                anchors.append(anchor)
+        return anchors
+
+    def _write_render_evidence(
+        self,
+        context: dict[str, Any] | None,
+        *,
+        job_id: str,
+        page_index: int,
+        unit_index: int,
+        attempt: int,
+        plan: RegionColorPlan | None,
+        spec: JobSpec,
+        source_hash: str,
+        generated_hash: str | None,
+        final_hash: str | None,
+        references: list[Path],
+        qa: Any,
+        render_seed: int | None = None,
+    ) -> None:
+        if context is None:
+            return
+        plan_hash = plan.plan_hash if plan is not None else "bypass"
+        reference_hashes: list[str] = []
+        for path in references:
+            try:
+                with Image.open(path) as reference_image:
+                    reference_hashes.append(image_sha256(reference_image))
+            except (OSError, ValueError):
+                continue
+        evidence = RenderEvidence(
+            version=1,
+            job_id=job_id,
+            page_index=page_index,
+            unit_index=unit_index,
+            plan_hash=plan_hash,
+            model_id=str(spec.engine),
+            model_revision=None,
+            renderer_version=RENDERER_VERSION,
+            source_hash=source_hash,
+            generated_hash=generated_hash,
+            final_hash=final_hash,
+            reference_hashes=tuple(reference_hashes),
+            seed=(
+                render_seed
+                if render_seed is not None
+                else plan.seed
+                if plan is not None
+                else spec.seed
+            ),
+            metadata=(
+                ("mode", spec.mode.value),
+                ("color_preset", spec.color_preset),
+                ("style_preset", spec.style_preset),
+            ),
+            qa_hash=artifact_digest(qa.to_json_dict()) if qa is not None else None,
+        )
+        context["store"].write(
+            f"evidence/page_{page_index:05d}_unit_{unit_index:04d}_a{attempt}.json",
+            evidence,
+        )
+
     def _reference_paths(self, job_id: str, source_path: Path, spec: JobSpec) -> list[Path]:
         """Combine explicit references with local automatic retrieval.
 
@@ -861,6 +1058,7 @@ class ProjectManager:
         spec: JobSpec,
         uncertain_mask: np.ndarray | None = None,
         reference_paths: list[Path] | None = None,
+        palette_anchors: list[tuple[float, float, float]] | None = None,
     ) -> tuple[Image.Image, np.ndarray]:
         """Compose one generated unit and return its QA protection mask.
 
@@ -899,10 +1097,12 @@ class ProjectManager:
                     ink_core_threshold=64,
                     **(
                         {
-                            "palette_anchors": self._reference_palette(reference_paths),
+                            "palette_anchors": palette_anchors
+                            if palette_anchors is not None
+                            else self._reference_palette(reference_paths),
                             "palette_strength": 0.28,
                         }
-                        if spec.engine == "cobra-candidate"
+                        if spec.mode == JobMode.COLORIZE
                         else {}
                     ),
                 )
@@ -1111,6 +1311,11 @@ class ProjectManager:
             return self._job_dir(job_id) / "final"
         if not manifest.pages(job_id):
             raise RuntimeError("建书完成后没有可处理的页面")
+        color_context = (
+            self._prepare_color_context(job_id, manifest, spec)
+            if spec.mode == JobMode.COLORIZE
+            else None
+        )
         manifest.set_job_status(job_id, JobStatus.RUNNING)
         logger.info(
             "job=%s started engine=%s units=%s",
@@ -1135,10 +1340,32 @@ class ProjectManager:
                 attempts_this_run = 0
                 passed = False
                 source_path = Path(unit["source_path"])
+                page_source_path = Path(unit.get("page_source_path") or source_path)
                 source_classification = None
                 if spec.mode == JobMode.COLORIZE:
                     with Image.open(source_path) as source_image:
                         source_classification = classify_source_page(source_image)
+                reference_paths = (
+                    self._reference_paths(job_id, page_source_path, spec)
+                    if spec.mode == JobMode.COLORIZE
+                    else []
+                )
+                color_plan = (
+                    self._page_color_plan(
+                        color_context,
+                        source_path=page_source_path,
+                        page_index=int(unit["page_index"]),
+                        references=reference_paths,
+                        page_seed=spec.seed,
+                    )
+                    if color_context is not None
+                    else None
+                )
+                palette_anchors = (
+                    self._combined_palette_anchors(color_context["state"], reference_paths)
+                    if color_context is not None
+                    else None
+                )
                 if not source_classification or not source_classification.source_passthrough:
                     engine_health = self.registry.health().get(spec.engine, {})
                     if not engine_health.get("ok", False):
@@ -1217,6 +1444,20 @@ class ProjectManager:
                                 source_sha256=image_sha256(source_rgb),
                                 final_sha256=image_sha256(source_rgb),
                             )
+                            self._write_render_evidence(
+                                color_context,
+                                job_id=job_id,
+                                page_index=int(unit["page_index"]),
+                                unit_index=int(unit["unit_index"]),
+                                attempt=attempts_used,
+                                plan=color_plan,
+                                spec=spec,
+                                source_hash=image_sha256(source_rgb),
+                                generated_hash=None,
+                                final_hash=image_sha256(source_rgb),
+                                references=reference_paths,
+                                qa=qa,
+                            )
                             manifest.finish_bypassed_unit(unit_id, final_path, qa)
                             passed = qa.passed
                             self._emit(
@@ -1245,7 +1486,6 @@ class ProjectManager:
                             ),
                         )
                         render_settings = render_profile(spec.color_preset, spec.style_preset)
-                        reference_paths = self._reference_paths(job_id, source_path, spec)
                         request = EngineRequest(
                             source_path=source_path,
                             output_path=generated_path,
@@ -1254,9 +1494,13 @@ class ProjectManager:
                             # materializing the request.  Keeping this seed
                             # as the page/unit base prevents retry paths from
                             # accidentally applying the attempt offset twice.
-                            seed=spec.seed
-                            + int(unit["page_index"]) * 1000
-                            + int(unit["unit_index"]),
+                            seed=(
+                                color_plan.seed + int(unit["unit_index"])
+                                if color_plan is not None
+                                else spec.seed
+                                + int(unit["page_index"]) * 1000
+                                + int(unit["unit_index"])
+                            ),
                             prompt=prompt,
                             negative_prompt=(
                                 spec.negative_prompt.strip()
@@ -1291,6 +1535,18 @@ class ProjectManager:
                                 ),
                                 "cobra_top_k": 6,
                                 "cobra_steps": 10,
+                                **(
+                                    {
+                                        "color_plan_hash": color_plan.plan_hash,
+                                        "palette_state_hash": color_plan.palette_state_hash,
+                                        "identity_graph_hash": color_plan.identity_graph_hash,
+                                        "segment_graph_hash": color_plan.segment_graph_hash,
+                                        "renderer_version": RENDERER_VERSION,
+                                        "color_plan_seed": color_plan.seed,
+                                    }
+                                    if color_plan is not None
+                                    else {}
+                                ),
                             },
                         )
                         cached_generated = Path(unit["generated_path"] or "")
@@ -1363,6 +1619,7 @@ class ProjectManager:
                                     spec,
                                     uncertain_mask,
                                     reference_paths,
+                                    palette_anchors,
                                 )
                             else:
                                 final, qa_mask = self._compose_unit(
@@ -1371,6 +1628,8 @@ class ProjectManager:
                                     mask,
                                     spec,
                                     uncertain_mask,
+                                    reference_paths,
+                                    palette_anchors,
                                 )
                             source_rgb = source_image.convert("RGB")
                             final.save(final_path, format="PNG")
@@ -1409,6 +1668,21 @@ class ProjectManager:
                                 source_sha256=image_sha256(source_rgb),
                                 final_sha256=image_sha256(final),
                                 geometry_locked=spec.mode != JobMode.STYLE_FULL,
+                            )
+                            self._write_render_evidence(
+                                color_context,
+                                job_id=job_id,
+                                page_index=int(unit["page_index"]),
+                                unit_index=int(unit["unit_index"]),
+                                attempt=attempts_used,
+                                plan=color_plan,
+                                spec=spec,
+                                source_hash=image_sha256(source_rgb),
+                                generated_hash=image_sha256(generated_image),
+                                final_hash=image_sha256(final),
+                                references=reference_paths,
+                                qa=qa,
+                                render_seed=request.seed,
                             )
                         manifest.finish_unit(unit_id, generated_path, final_path, qa)
                         if qa.passed:
@@ -1903,6 +2177,11 @@ class ProjectManager:
         total_pages = len(pages)
         if not pages:
             return 0
+        color_context = (
+            self._prepare_color_context(job_id, manifest, spec)
+            if spec.mode == JobMode.COLORIZE
+            else None
+        )
         job_dir = self._job_dir(job_id)
         live_final = job_dir / "final"
         live_output = job_dir / "output"
@@ -1936,6 +2215,29 @@ class ProjectManager:
                             f"Missing repair input for page {page_index + 1}, "
                             f"unit {int(unit['unit_index']) + 1}"
                         )
+                    reference_paths = (
+                        self._reference_paths(job_id, Path(page["source_path"]), spec)
+                        if spec.mode == JobMode.COLORIZE
+                        else []
+                    )
+                    color_plan = (
+                        self._page_color_plan(
+                            color_context,
+                            source_path=Path(page["source_path"]),
+                            page_index=page_index,
+                            references=reference_paths,
+                            page_seed=spec.seed,
+                        )
+                        if color_context is not None
+                        else None
+                    )
+                    palette_anchors = (
+                        self._combined_palette_anchors(
+                            color_context["state"], reference_paths
+                        )
+                        if color_context is not None
+                        else None
+                    )
                     final_name = f"page_{page_index:05d}_panel_{int(unit['unit_index']):04d}.png"
                     staged_path = staging_final / "panels" / final_name
                     staged_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1961,15 +2263,26 @@ class ProjectManager:
                                 source_sha256=image_sha256(source_rgb),
                                 final_sha256=image_sha256(final),
                             )
+                            self._write_render_evidence(
+                                color_context,
+                                job_id=job_id,
+                                page_index=page_index,
+                                unit_index=int(unit["unit_index"]),
+                                attempt=int(unit["attempt"]),
+                                plan=color_plan,
+                                spec=spec,
+                                source_hash=image_sha256(source_rgb),
+                                generated_hash=None,
+                                final_hash=image_sha256(final),
+                                references=reference_paths,
+                                qa=qa,
+                            )
                         else:
                             if generated_path is None or not generated_path.is_file():
                                 raise FileNotFoundError(
                                     f"Missing generated repair input for page {page_index + 1}, "
                                     f"unit {int(unit['unit_index']) + 1}"
                                 )
-                            reference_paths = self._reference_paths(
-                                job_id, source_path, spec
-                            )
                             with Image.open(generated_path) as generated_image:
                                 mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
                                 if spec.engine == "cobra-candidate":
@@ -1980,6 +2293,7 @@ class ProjectManager:
                                         spec,
                                         uncertain_mask,
                                         reference_paths,
+                                        palette_anchors,
                                     )
                                 else:
                                     final, qa_mask = self._compose_unit(
@@ -2018,6 +2332,25 @@ class ProjectManager:
                                     source_sha256=image_sha256(source_rgb),
                                     final_sha256=image_sha256(final),
                                     geometry_locked=spec.mode != JobMode.STYLE_FULL,
+                                )
+                                self._write_render_evidence(
+                                    color_context,
+                                    job_id=job_id,
+                                    page_index=page_index,
+                                    unit_index=int(unit["unit_index"]),
+                                    attempt=int(unit["attempt"]),
+                                    plan=color_plan,
+                                    spec=spec,
+                                    source_hash=image_sha256(source_rgb),
+                                    generated_hash=image_sha256(generated_image),
+                                    final_hash=image_sha256(final),
+                                    references=reference_paths,
+                                    qa=qa,
+                                    render_seed=(
+                                        color_plan.seed + int(unit["unit_index"])
+                                        if color_plan is not None
+                                        else spec.seed
+                                    ),
                                 )
                         if not qa.passed:
                             raise RuntimeError(

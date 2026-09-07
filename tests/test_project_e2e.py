@@ -22,6 +22,26 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_color_processing_writes_book_plan_and_render_evidence(
+    tmp_path: Path, manga_pages: Path
+) -> None:
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    job_id = manager.create(
+        JobSpec(source=manga_pages, workspace=settings.data_root, engine="palette")
+    )
+
+    manager.process(job_id)
+
+    state_root = manager._job_dir(job_id) / "analysis" / "color-state"
+    assert (state_root / "source_snapshot.json").is_file()
+    assert (state_root / "identity_graph.json").is_file()
+    assert (state_root / "color_book_state.json").is_file()
+    assert list((state_root / "segments").glob("page_*.json"))
+    assert list((state_root / "plans").glob("page_*.json"))
+    assert list((state_root / "evidence").glob("page_*_unit_*_a*.json"))
+
+
 def test_unconfigured_allowed_roots_accept_existing_local_path(
     tmp_path: Path, manga_pages: Path
 ) -> None:
