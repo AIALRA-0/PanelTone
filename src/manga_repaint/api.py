@@ -703,8 +703,20 @@ def create_app(
                 },
             )
         if request.url.path.startswith("/api/") and request.method == "GET":
+            versioned_display_asset = (
+                request.url.path.startswith("/api/assets/")
+                and bool(request.query_params.get("v"))
+                and response.status_code < 400
+            )
             response.headers.setdefault("Cache-Control", "no-store, max-age=0")
-            response.headers.setdefault("Pragma", "no-cache")
+            if versioned_display_asset:
+                # ``Pragma: no-cache`` is an HTTP/1.0 compatibility directive
+                # that some browsers still honour ahead of immutable caching.
+                # A revisioned private asset must not carry both policies.
+                if "Pragma" in response.headers:
+                    del response.headers["Pragma"]
+            else:
+                response.headers.setdefault("Pragma", "no-cache")
         return response
 
     app.state.manager = manager

@@ -70,9 +70,11 @@ def test_api_create_run_and_download(tmp_path: Path, manga_pages: Path) -> None:
         assert display.headers["cache-control"] == (
             "private, max-age=31536000, immutable"
         )
+        assert "pragma" not in display.headers
         assert len(display.content) <= 900 * 1024
         unversioned = client.get(pages[0]["final_display_url"].split("?", 1)[0])
         assert unversioned.headers["cache-control"] == "no-store, max-age=0"
+        assert unversioned.headers["pragma"] == "no-cache"
         response = client.get(f"/api/jobs/{job_id}/download")
         assert response.status_code == 200
         assert response.headers["content-type"] in {
