@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $scriptPath = (Resolve-Path (Join-Path $PSScriptRoot "maintain_local_services.ps1")).Path
+$launcherPath = (Resolve-Path (Join-Path $PSScriptRoot "start_local_services.ps1")).Path
 if (-not $ProjectRoot) {
     $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }
@@ -70,5 +71,45 @@ Register-ScheduledTask `
     -Principal $principal `
     -Description "Maintains the local loopback-only PanelTone services" `
     -Force | Out-Null
+
+function Write-LauncherShortcut(
+    [string]$Path,
+    [string]$Arguments,
+    [string]$Description,
+    [int]$WindowStyle
+) {
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($Path)
+    $shortcut.TargetPath = (Get-Command powershell.exe).Source
+    $shortcut.Arguments = $Arguments
+    $shortcut.WorkingDirectory = [IO.Path]::GetFullPath($ProjectRoot)
+    $shortcut.Description = $Description
+    $shortcut.WindowStyle = $WindowStyle
+    $shortcut.Save()
+}
+
+$desktopShortcut = Join-Path (
+    [Environment]::GetFolderPath("Desktop")
+) "PanelTone 强制启动.lnk"
+$startupShortcut = Join-Path (
+    [Environment]::GetFolderPath("Startup")
+) "PanelTone 自动启动.lnk"
+$launcherArgument = Quote-TaskArgument $launcherPath
+Write-LauncherShortcut `
+    $desktopShortcut `
+    "-NoProfile -ExecutionPolicy Bypass -File $launcherArgument -Force -WaitForInput" `
+    "强制重启并检查 PanelTone 本机服务" `
+    1
+Write-LauncherShortcut `
+    $startupShortcut `
+    "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File $launcherArgument" `
+    "登录后确保 PanelTone 计划任务正在运行" `
+    7
+
 Start-ScheduledTask -TaskName $TaskName
-Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State
+[pscustomobject]@{
+    TaskName = $TaskName
+    State = (Get-ScheduledTask -TaskName $TaskName).State
+    DesktopShortcut = $desktopShortcut
+    StartupShortcut = $startupShortcut
+}

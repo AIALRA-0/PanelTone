@@ -218,6 +218,14 @@ def test_already_colorized_source_is_detected() -> None:
     assert not is_already_colorized(Image.new("RGB", source.size, (220, 220, 220)))
 
 
+def test_already_colorized_source_allows_neutral_cover_details() -> None:
+    pixels = np.full((100, 100, 3), 210, dtype=np.uint8)
+    pixels[:84] = np.array([198, 96, 54], dtype=np.uint8)
+    source = Image.fromarray(pixels, mode="RGB")
+
+    assert is_already_colorized(source)
+
+
 def test_source_classifier_bypasses_blank_sparse_and_already_colour_pages() -> None:
     blank = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
     sparse = Image.new("RGB", (96, 96), "white")

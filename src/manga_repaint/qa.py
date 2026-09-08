@@ -34,8 +34,8 @@ def _f1(reference: np.ndarray, candidate: np.ndarray) -> float:
 
 def _geometry_metrics(
     source_edges: np.ndarray, result_edges: np.ndarray
-) -> tuple[float, float, float]:
-    """Return source recall, added-edge ratio and edge alignment."""
+) -> tuple[float, float]:
+    """Return source-edge recall and added luminance-edge ratio."""
     source_neighborhood = cv2.dilate(source_edges.astype(np.uint8), np.ones((3, 3), np.uint8))
     result_neighborhood = cv2.dilate(result_edges.astype(np.uint8), np.ones((3, 3), np.uint8))
     source_edge_recall = (
@@ -46,10 +46,62 @@ def _geometry_metrics(
     result_count = int(result_edges.sum())
     added_edges = np.logical_and(result_edges, source_neighborhood == 0)
     added_edge_ratio = float(added_edges.sum() / max(1, result_count))
-    chroma_edge_alignment = float(
-        np.logical_and(result_edges, source_neighborhood > 0).sum() / max(1, result_count)
+    return source_edge_recall, added_edge_ratio
+
+
+def _chroma_edge_alignment(
+    source_edges: np.ndarray,
+    result_rgb: np.ndarray,
+    protected_mask: np.ndarray,
+) -> float:
+    """Score how little page area contains colour edges absent from the source.
+
+    Geometry-locked rendering copies the source value channel, so a shifted
+    red/blue candidate contour is invisible to ordinary luminance-edge QA.
+    Strong YCrCb chroma gradients expose that failure.  Normalising unaligned
+    chroma edges by the full page area, rather than by every chroma edge, avoids
+    rejecting legitimate sky, clothing and lighting colour boundaries on pages
+    whose source line density is low.
+    """
+    hsv = cv2.cvtColor(result_rgb.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(
+        np.float32
     )
-    return source_edge_recall, added_edge_ratio, chroma_edge_alignment
+    angle = hsv[..., 0] * np.pi / 90.0
+    saturation = hsv[..., 1] / 255.0
+    # Circular H/S vectors measure colour boundaries independently of value.
+    # YCrCb gradients are unsuitable here because ordinary black screentone
+    # changes their magnitude even when hue and saturation stay constant.
+    chroma_channels = (
+        np.cos(angle) * saturation * 255.0,
+        np.sin(angle) * saturation * 255.0,
+    )
+    magnitude_squared = np.zeros(source_edges.shape, dtype=np.float32)
+    for chroma in chroma_channels:
+        gradient_x = cv2.Sobel(chroma, cv2.CV_32F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(chroma, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude_squared += gradient_x * gradient_x + gradient_y * gradient_y
+    # Only strong H/S discontinuities represent a visible coloured contour.
+    # This threshold rejects the old RGB ghost outlines while leaving benign
+    # low-amplitude palette gradients and printed screentone out of the gate.
+    chroma_edges = magnitude_squared >= 192.0**2
+    if not chroma_edges.any():
+        return 1.0
+    allowed_neighborhood = cv2.dilate(
+        source_edges.astype(np.uint8), np.ones((3, 3), np.uint8)
+    ).astype(bool)
+    # Exact semantic restoration intentionally creates a colour transition at
+    # the edge of a protected text/balloon/ink mask.  Count that known boundary
+    # as aligned, while keeping candidate-only contours elsewhere measurable.
+    protected_boundary = cv2.morphologyEx(
+        protected_mask.astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)
+    )
+    allowed_neighborhood |= cv2.dilate(
+        protected_boundary, np.ones((3, 3), np.uint8)
+    ).astype(bool)
+    unaligned_ratio = float(
+        np.logical_and(chroma_edges, ~allowed_neighborhood).sum() / chroma_edges.size
+    )
+    return max(0.0, 1.0 - unaligned_ratio)
 
 
 def _neutral_island_metrics(
@@ -103,7 +155,11 @@ def _color_dropout_tiles(
         for column in range(grid_size):
             x0, x1 = width * column // grid_size, width * (column + 1) // grid_size
             tile_roi = roi[y0:y1, x0:x1]
-            if tile_roi.sum() < 64:
+            # A handful of unprotected pixels beside a speech balloon or page
+            # border cannot represent a regional colour failure. Require a
+            # meaningful share of the tile before comparing coverage.
+            minimum_roi = max(64, int(tile_roi.size * 0.05))
+            if tile_roi.sum() < minimum_roi:
                 continue
             generated_coverage = _color_coverage(
                 generated_rgb[y0:y1, x0:x1], tile_roi
@@ -130,6 +186,7 @@ def evaluate(
     source_passthrough: bool = False,
     source_edge_recall_min: float = 0.995,
     added_edge_ratio_max: float = 0.005,
+    chroma_edge_alignment_min: float = 0.995,
     neutral_island_ratio_max: float = 0.08,
     largest_neutral_island_ratio_max: float = 0.03,
     panel_boundary_mask: np.ndarray | None = None,
@@ -181,8 +238,9 @@ def evaluate(
     source_edges = _edge_map(source)
     result_edges = _edge_map(result)
     line_edge_f1 = _f1(source_edges, result_edges)
-    source_edge_recall, added_edge_ratio, chroma_edge_alignment = _geometry_metrics(
-        source_edges, result_edges
+    source_edge_recall, added_edge_ratio = _geometry_metrics(source_edges, result_edges)
+    chroma_edge_alignment = _chroma_edge_alignment(
+        source_edges, result_rgb, protected_mask
     )
 
     pure_black = np.all(source_rgb <= 8, axis=-1)
@@ -259,6 +317,8 @@ def evaluate(
             reasons.append("source_edge_recall_below_threshold")
         if added_edge_ratio > added_edge_ratio_max:
             reasons.append("added_edge_ratio_above_threshold")
+        if chroma_edge_alignment < chroma_edge_alignment_min:
+            reasons.append("chroma_edge_alignment_below_threshold")
         if neutral_island_ratio > neutral_island_ratio_max:
             reasons.append("neutral_island_above_threshold")
         if largest_neutral_island_ratio > largest_neutral_island_ratio_max:

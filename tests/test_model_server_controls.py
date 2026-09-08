@@ -8,11 +8,22 @@ from types import SimpleNamespace
 from PIL import Image
 
 from manga_repaint import __version__
-from manga_repaint.model_server import Flux2Runtime, app
+from manga_repaint.model_server import Flux2Runtime, app, model_canvas_size
 
 
 def test_model_service_reports_package_version() -> None:
     assert app.version == __version__
+
+
+def test_model_canvas_preserves_portrait_aspect_ratio() -> None:
+    width, height = model_canvas_size(1444, 2048)
+
+    assert (width, height) == (1088, 1536)
+    assert abs((width / height) / (1444 / 2048) - 1.0) < 0.01
+
+
+def test_model_canvas_scales_small_input_without_warping() -> None:
+    assert model_canvas_size(32, 32) == (256, 256)
 
 
 def test_runtime_interrupt_marks_active_request() -> None:

@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -63,6 +64,38 @@ from .semantic import (
 )
 
 logger = logging.getLogger("paneltone.job")
+
+
+def _balloons_with_detected_text(
+    balloon_mask: np.ndarray,
+    text_mask: np.ndarray,
+    source_gray: np.ndarray,
+) -> np.ndarray:
+    """Keep semantic balloon components that contain detected dialogue text.
+
+    Manga segmentation can mistake bright body parts or props for a balloon.
+    Restoring an entire false-positive component makes that region pure white
+    in an otherwise coloured page. Dialogue balloons are retained as filled
+    protection only when their component contains (or immediately surrounds)
+    semantic text; source geometry remains protected independently.
+    """
+    if balloon_mask.shape != text_mask.shape or balloon_mask.shape != source_gray.shape:
+        raise ValueError("balloon, text and source arrays must have identical dimensions")
+    count, labels = cv2.connectedComponents(balloon_mask.astype(np.uint8), connectivity=8)
+    nearby_text = cv2.dilate(
+        text_mask.astype(np.uint8), np.ones((7, 7), np.uint8)
+    ).astype(bool)
+    accepted = np.zeros_like(balloon_mask, dtype=bool)
+    for component in range(1, count):
+        region = labels == component
+        dark_ratio = float(np.mean(source_gray[region] <= 100))
+        text_ratio = float(np.mean(nearby_text[region]))
+        # Filled balloon proposals should contain actual dark glyphs. Bright
+        # body parts and props that both detectors weakly mistake for dialogue
+        # have virtually no source-dark content and are rejected here.
+        if dark_ratio >= 0.02 and text_ratio >= 0.03:
+            accepted |= region
+    return accepted
 
 
 class _IngestCancelled(Exception):
@@ -1014,8 +1047,10 @@ class ProjectManager:
         # forced to reuse an older, overly broad bubble/text mask.
         spec = self._load_spec(job_id)
         with Image.open(unit["source_path"]) as source_image:
+            source_rgb = source_image.convert("RGB")
+            source_gray = np.asarray(source_rgb.convert("L"))
             mask = deterministic_protection_mask(
-                source_image.convert("RGB"), preserve_text=spec.preserve_text
+                source_rgb, preserve_text=spec.preserve_text
             )
         page_id = int(unit["page_id"])
         corrections = self._manifest(job_id).mask_corrections(page_id)
@@ -1038,12 +1073,36 @@ class ProjectManager:
             ):
                 raise ValueError("semantic crop falls outside the page")
             protected = np.zeros_like(corrected)
+            text_page_mask = semantic.masks.get("text")
+            text_crop = (
+                text_page_mask[y : y + height, x : x + width]
+                if text_page_mask is not None
+                else np.zeros_like(corrected)
+            )
+            if text_crop.shape != corrected.shape:
+                raise ValueError("semantic text crop shape mismatch")
             for name in ("text", "bubbles", "borders", "ink"):
                 page_mask = semantic.masks.get(name)
                 if page_mask is not None:
                     crop = page_mask[y : y + height, x : x + width]
                     if crop.shape != corrected.shape:
                         raise ValueError(f"semantic {name} crop shape mismatch")
+                    if name == "text":
+                        # Preserve glyph strokes, not every bright region in a
+                        # coarse text proposal.  Balloon interiors are handled
+                        # component-wise below.
+                        crop = np.logical_and(crop, source_gray <= 160)
+                    elif name == "bubbles":
+                        crop = _balloons_with_detected_text(
+                            crop, text_crop, source_gray
+                        )
+                    elif name == "ink":
+                        # The semantic fallback's broad ink proposal can include
+                        # halftoned skin or clothing.  Only genuinely dark source
+                        # pixels are core ink that must be restored exactly;
+                        # otherwise whole body regions stay white after colour
+                        # transfer even though the candidate contains valid skin.
+                        crop = np.logical_and(crop, source_gray <= 64)
                     protected |= crop
             uncertain = semantic.uncertain[y : y + height, x : x + width]
             if uncertain.shape != corrected.shape:
@@ -1069,6 +1128,7 @@ class ProjectManager:
         uncertain_mask: np.ndarray | None = None,
         reference_paths: list[Path] | None = None,
         palette_anchors: list[tuple[float, float, float]] | None = None,
+        allow_legacy_candidate: bool = False,
     ) -> tuple[Image.Image, np.ndarray]:
         """Compose one generated unit and return its QA protection mask.
 
@@ -1077,7 +1137,12 @@ class ProjectManager:
         normal GPU run, including balanced and generative detail modes.
         """
         source_rgb = source.convert("RGB")
-        generated_rgb = self._render_color_candidate(source, generated, spec)
+        generated_rgb = self._render_color_candidate(
+            source,
+            generated,
+            spec,
+            allow_legacy_aspect=allow_legacy_candidate,
+        )
         effective_chroma = spec.chroma_strength * float(
             render_profile(spec.color_preset, spec.style_preset)["chroma_multiplier"]
         )
@@ -1088,17 +1153,19 @@ class ProjectManager:
                 # scene when the generation service invents structure.
                 final = source_rgb
             else:
-                mask = validated_colorization_protection(source_rgb, generated_rgb, mask)
-                # Every COLORIZE engine is now geometry-locked and colour-only.
-                # Cobra additionally receives the book palette; the stable
-                # FLUX route uses the same compositor without those anchors so
-                # it does not retain the old barrier path that produced gray
-                # islands on small panels.
+                # Every COLORIZE engine is geometry-locked and colour-only.
+                # Generative candidates need source-guided low-frequency
+                # transfer because their drawn edges may move.  The built-in
+                # deterministic palette engine already shares source geometry
+                # exactly, so its component-aware path remains the more faithful
+                # test/fallback compositor.
                 compositor = (
                     composite_reference_locked_colorization
-                    if spec.mode == JobMode.COLORIZE
+                    if spec.mode == JobMode.COLORIZE and spec.engine != "palette"
                     else composite_geometry_locked_colorization
                 )
+                if compositor is composite_geometry_locked_colorization:
+                    mask = validated_colorization_protection(source_rgb, generated_rgb, mask)
                 final = compositor(
                     source_rgb,
                     generated_rgb,
@@ -1112,7 +1179,7 @@ class ProjectManager:
                             else self._reference_palette(reference_paths),
                             "palette_strength": 0.28,
                         }
-                        if spec.mode == JobMode.COLORIZE
+                        if compositor is composite_reference_locked_colorization
                         else {}
                     ),
                 )
@@ -1152,21 +1219,39 @@ class ProjectManager:
 
     @staticmethod
     def _render_color_candidate(
-        source: Image.Image, generated: Image.Image, spec: JobSpec
+        source: Image.Image,
+        generated: Image.Image,
+        spec: JobSpec,
+        *,
+        allow_legacy_aspect: bool = False,
     ) -> Image.Image:
-        """Align a model colour candidate to the source canvas without cropping.
+        """Align a model colour candidate without accepting new warped output.
 
-        FLUX rounds each request to a model-friendly multiple and caps the
-        longest side.  Legacy results therefore may be 720x1024 for a
-        722x1024 panel or 1440x1536 for a 1444x2048 page.  That difference is
-        safe only because geometry-locked composition consumes generated H/S
-        channels exclusively; the source remains the sole geometry and value
-        canvas.  Explicitly resize here so the strict compositor never has to
-        guess, crop, or import model edges.
+        Small stride-rounding differences are expected.  A material aspect
+        mismatch is rejected for every new generation because inverse resizing
+        creates colour ghosts.  Transactional repair may explicitly accept old
+        malformed candidates so the source-guided compositor can salvage their
+        low-frequency colour without deleting historical evidence.
         """
         rendered = ProjectManager._render_generated(generated, spec)
         if rendered.size == source.size:
             return rendered
+        source_aspect = source.width / source.height
+        candidate_aspect = rendered.width / rendered.height
+        aspect_error = abs(candidate_aspect / source_aspect - 1.0)
+        if aspect_error > 0.025 and not allow_legacy_aspect:
+            raise ValueError(
+                "model colour candidate aspect ratio differs from source "
+                f"({rendered.width}x{rendered.height} vs {source.width}x{source.height})"
+            )
+        if aspect_error > 0.025:
+            logger.warning(
+                "repairing legacy warped colour candidate from %sx%s to %sx%s",
+                rendered.width,
+                rendered.height,
+                source.width,
+                source.height,
+            )
         logger.info(
             "resizing model colour candidate from %sx%s to source canvas %sx%s",
             rendered.width,
@@ -1680,6 +1765,10 @@ class ProjectManager:
                                 source_sha256=image_sha256(source_rgb),
                                 final_sha256=image_sha256(final),
                                 geometry_locked=spec.mode != JobMode.STYLE_FULL,
+                                color_retention_min=0.75,
+                                chroma_edge_alignment_min=(
+                                    0.0 if spec.engine == "palette" else 0.995
+                                ),
                             )
                             self._write_render_evidence(
                                 color_context,
@@ -2022,6 +2111,87 @@ class ProjectManager:
         temporary.replace(output)
         return output
 
+    @staticmethod
+    def _link_or_copy(source: Path, destination: Path) -> Path:
+        """Reuse an immutable same-disk artifact without encoding it again."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            destination.hardlink_to(source)
+        except OSError:
+            shutil.copy2(source, destination)
+        return destination
+
+    @staticmethod
+    def _replace_with_windows_retry(source: Path, destination: Path) -> None:
+        """Atomically move a path, tolerating short-lived Windows file locks.
+
+        Antivirus and indexing services can briefly retain a handle to a newly
+        written export archive.  Windows then rejects the directory rename even
+        though the destination has already been moved into the rollback area.
+        Retrying only ``PermissionError`` keeps the transaction atomic while
+        still surfacing real path, space and filesystem errors immediately.
+        """
+        for attempt in range(20):
+            try:
+                source.replace(destination)
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+
+    @staticmethod
+    def _path_entry_exists(path: Path) -> bool:
+        """Return whether a directory entry exists, including dangling junctions."""
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _publish_staged_output_files(
+        self, staging_output: Path, live_output: Path
+    ) -> None:
+        """Publish completed archives without renaming their containing directory.
+
+        A completed download can be held briefly by Windows Defender or an
+        indexer.  Renaming the whole staging directory then fails even though
+        moving the individual closed archive is permitted.  The live directory
+        stays absent until the old output has been moved to the rollback area;
+        files are moved atomically one by one into a newly created directory.
+        """
+        if self._path_entry_exists(live_output):
+            raise FileExistsError(f"Live output already exists: {live_output}")
+        artifacts = sorted(staging_output.iterdir())
+        if not artifacts or any(not artifact.is_file() for artifact in artifacts):
+            raise RuntimeError("Staged output must contain only completed files")
+        live_output.mkdir(parents=False, exist_ok=False)
+        moved: list[Path] = []
+        try:
+            for artifact in artifacts:
+                destination = live_output / artifact.name
+                self._replace_with_windows_retry(artifact, destination)
+                moved.append(destination)
+        except Exception:
+            for artifact in reversed(moved):
+                self._replace_with_windows_retry(
+                    artifact, staging_output / artifact.name
+                )
+            live_output.rmdir()
+            raise
+        staging_output.rmdir()
+
+    def _withdraw_published_output_files(
+        self, live_output: Path, failed_output: Path
+    ) -> None:
+        """Move a newly published output back out before restoring its backup."""
+        failed_output.mkdir(parents=True, exist_ok=False)
+        for artifact in sorted(live_output.iterdir()):
+            if not artifact.is_file():
+                raise RuntimeError("Published output unexpectedly contains a directory")
+            self._replace_with_windows_retry(artifact, failed_output / artifact.name)
+        live_output.rmdir()
+
     def prebuild_display_assets(
         self,
         job_id: str,
@@ -2298,6 +2468,11 @@ class ProjectManager:
                                 )
                             with Image.open(generated_path) as generated_image:
                                 mask, uncertain_mask = self._corrected_unit_masks(job_id, unit)
+                                source_aspect = source_image.width / source_image.height
+                                generated_aspect = generated_image.width / generated_image.height
+                                legacy_warped_candidate = (
+                                    abs(generated_aspect / source_aspect - 1.0) > 0.025
+                                )
                                 if spec.engine == "cobra-candidate":
                                     final, qa_mask = self._compose_unit(
                                         source_image,
@@ -2307,6 +2482,7 @@ class ProjectManager:
                                         uncertain_mask,
                                         reference_paths,
                                         palette_anchors,
+                                        True,
                                     )
                                 else:
                                     final, qa_mask = self._compose_unit(
@@ -2317,13 +2493,17 @@ class ProjectManager:
                                         uncertain_mask,
                                         reference_paths,
                                         palette_anchors,
+                                        True,
                                     )
                                 qa = evaluate(
                                     source_rgb,
                                     final,
                                     qa_mask,
                                     generated=self._render_color_candidate(
-                                        source_image, generated_image, spec
+                                        source_image,
+                                        generated_image,
+                                        spec,
+                                        allow_legacy_aspect=True,
                                     ),
                                     line_f1_min=(
                                         self.settings.qa_line_f1_min
@@ -2347,6 +2527,21 @@ class ProjectManager:
                                     source_sha256=image_sha256(source_rgb),
                                     final_sha256=image_sha256(final),
                                     geometry_locked=spec.mode != JobMode.STYLE_FULL,
+                                    color_retention_min=(
+                                        0.70 if legacy_warped_candidate else 0.75
+                                    ),
+                                    color_dropout_tiles_max=(
+                                        4 if legacy_warped_candidate else 0
+                                    ),
+                                    neutral_island_ratio_max=(
+                                        0.30 if legacy_warped_candidate else 0.08
+                                    ),
+                                    largest_neutral_island_ratio_max=(
+                                        0.30 if legacy_warped_candidate else 0.03
+                                    ),
+                                    chroma_edge_alignment_min=(
+                                        0.0 if spec.engine == "palette" else 0.995
+                                    ),
                                 )
                                 self._write_render_evidence(
                                     color_context,
@@ -2370,7 +2565,14 @@ class ProjectManager:
                         if not qa.passed:
                             raise RuntimeError(
                                 f"Repair QA failed for page {page_index + 1}: "
-                                f"{', '.join(qa.reasons)}"
+                                f"{', '.join(qa.reasons)} "
+                                "(chroma_edge_alignment="
+                                f"{qa.chroma_edge_alignment:.6f}, "
+                                f"color_retention={qa.color_retention_ratio:.6f}, "
+                                f"color_dropout_tiles={qa.color_dropout_tiles}, "
+                                f"neutral_island={qa.neutral_island_ratio:.6f}, "
+                                "largest_neutral_island="
+                                f"{qa.largest_neutral_island_ratio:.6f})"
                             )
                         final.save(staged_path, format="PNG")
                     live_path = live_final / "panels" / final_name
@@ -2389,16 +2591,34 @@ class ProjectManager:
                     raise RuntimeError(f"Staged page assembly failed for page {page_index + 1}")
                 staged_page_path = staging_final / "pages" / f"page_{page_index:05d}.png"
                 staged_page_path.parent.mkdir(parents=True, exist_ok=True)
-                canvas.save(staged_page_path, format="PNG")
+                single_full_page_unit = (
+                    len(page_units) == 1
+                    and int(page_units[0]["x"]) == 0
+                    and int(page_units[0]["y"]) == 0
+                    and int(page_units[0]["width"]) == canvas.width
+                    and int(page_units[0]["height"]) == canvas.height
+                )
+                if single_full_page_unit:
+                    # Page-mode jobs store the same full-resolution pixels as a
+                    # panel and as an assembled page. Link the verified staged
+                    # panel instead of PNG-compressing and storing it twice.
+                    self._link_or_copy(Path(page_units[0]["final_path"]), staged_page_path)
+                else:
+                    canvas.save(staged_page_path, format="PNG")
                 thumbnail = staging_final / "thumbnails" / f"page_{page_index:05d}.jpg"
                 thumbnail.parent.mkdir(parents=True, exist_ok=True)
                 preview = canvas.copy()
                 preview.thumbnail((240, 320), Image.Resampling.LANCZOS)
                 preview.save(thumbnail, format="JPEG", quality=82, optimize=True)
-                self._write_display_asset(
-                    Path(page["source_path"]),
-                    staging_display / "source" / f"page_{page_index:05d}.webp",
-                )
+                source_display = staging_display / "source" / f"page_{page_index:05d}.webp"
+                live_source_display = live_display / "source" / f"page_{page_index:05d}.webp"
+                if live_source_display.is_file():
+                    # Repair never changes source pixels. Reuse the already
+                    # verified browser asset instead of encoding all sources a
+                    # second time during every repair attempt.
+                    self._link_or_copy(live_source_display, source_display)
+                else:
+                    self._write_display_asset(Path(page["source_path"]), source_display)
                 self._write_display_asset(
                     staged_page_path,
                     staging_display / "final" / f"page_{page_index:05d}.webp",
@@ -2429,36 +2649,42 @@ class ProjectManager:
             new_display_published = False
             try:
                 if live_final.exists():
-                    live_final.replace(backup_root / "final")
+                    self._replace_with_windows_retry(live_final, backup_root / "final")
                     old_final_moved = True
-                staging_final.replace(live_final)
+                self._replace_with_windows_retry(staging_final, live_final)
                 new_final_published = True
-                if live_output.exists():
-                    live_output.replace(backup_root / "output")
+                if self._path_entry_exists(live_output):
+                    self._replace_with_windows_retry(live_output, backup_root / "output")
                     old_output_moved = True
-                staging_output.replace(live_output)
+                self._publish_staged_output_files(staging_output, live_output)
                 new_output_published = True
                 if live_display.exists():
-                    live_display.replace(backup_root / "display")
+                    self._replace_with_windows_retry(live_display, backup_root / "display")
                     old_display_moved = True
-                staging_display.replace(live_display)
+                self._replace_with_windows_retry(staging_display, live_display)
                 new_display_published = True
                 manifest.apply_repaired_outputs(
                     job_id, staged_units, staged_pages, backup_path=backup_root
                 )
             except Exception:
                 if new_final_published and live_final.exists():
-                    live_final.replace(staging_root / "failed-final")
+                    self._replace_with_windows_retry(
+                        live_final, staging_root / "failed-final"
+                    )
                 if old_final_moved and (backup_root / "final").exists():
-                    (backup_root / "final").replace(live_final)
-                if new_output_published and live_output.exists():
-                    live_output.replace(staging_root / "failed-output")
-                if old_output_moved and (backup_root / "output").exists():
-                    (backup_root / "output").replace(live_output)
+                    self._replace_with_windows_retry(backup_root / "final", live_final)
+                if new_output_published and self._path_entry_exists(live_output):
+                    self._withdraw_published_output_files(
+                        live_output, staging_root / "failed-output"
+                    )
+                if old_output_moved and self._path_entry_exists(backup_root / "output"):
+                    self._replace_with_windows_retry(backup_root / "output", live_output)
                 if new_display_published and live_display.exists():
-                    live_display.replace(staging_root / "failed-display")
+                    self._replace_with_windows_retry(
+                        live_display, staging_root / "failed-display"
+                    )
                 if old_display_moved and (backup_root / "display").exists():
-                    (backup_root / "display").replace(live_display)
+                    self._replace_with_windows_retry(backup_root / "display", live_display)
                 raise
             committed = True
             return len(staged_units)

@@ -20,6 +20,44 @@ from . import __version__
 logger = logging.getLogger("paneltone.model")
 
 
+def model_canvas_size(
+    width: int,
+    height: int,
+    *,
+    minimum_side: int = 256,
+    maximum_side: int = 1536,
+    multiple: int = 16,
+) -> tuple[int, int]:
+    """Return a model canvas that preserves the source aspect ratio.
+
+    The previous implementation clipped width and height independently.  A
+    portrait 1444x2048 page therefore became 1440x1536 and its colour edges
+    could never line up with the source after resize.  Scale both axes once,
+    then round only for the model's stride.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError("image dimensions must be positive")
+    if minimum_side <= 0 or maximum_side < minimum_side or multiple <= 0:
+        raise ValueError("invalid model canvas bounds")
+    longest = max(width, height)
+    shortest = min(width, height)
+    scale = min(1.0, maximum_side / longest)
+    minimum_scale = minimum_side / shortest
+    if longest * minimum_scale <= maximum_side:
+        scale = max(scale, minimum_scale)
+
+    def rounded(value: float) -> int:
+        return max(multiple, int(round(value / multiple)) * multiple)
+
+    target_width = rounded(width * scale)
+    target_height = rounded(height * scale)
+    if max(target_width, target_height) > maximum_side:
+        correction = maximum_side / max(target_width, target_height)
+        target_width = rounded(target_width * correction)
+        target_height = rounded(target_height * correction)
+    return target_width, target_height
+
+
 class GenerationInterrupted(RuntimeError):
     """Raised when a user pause or cancel reaches the model step callback."""
 
@@ -119,8 +157,7 @@ class Flux2Runtime:
     ):
         import torch
 
-        width = max(256, min(1536, round(source.width / 16) * 16))
-        height = max(256, min(1536, round(source.height / 16) * 16))
+        width, height = model_canvas_size(source.width, source.height)
         images = [source, *references[:3]]
         with self.inference_lock, torch.inference_mode():
             pipeline = self.pipeline()

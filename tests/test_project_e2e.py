@@ -15,7 +15,7 @@ from PIL import Image
 from manga_repaint.config import Settings
 from manga_repaint.engines import EngineInterrupted, EngineRegistry
 from manga_repaint.models import DetailMode, JobSpec
-from manga_repaint.project import ProjectManager
+from manga_repaint.project import ProjectManager, _balloons_with_detected_text
 
 
 def _sha256(path: Path) -> str:
@@ -177,7 +177,7 @@ def test_geometry_locked_project_aligns_model_canvas_without_importing_edges(
     settings = Settings(data_root=tmp_path / "jobs")
     manager = ProjectManager(settings, EngineRegistry())
     source = Image.new("RGB", (722, 1024), (230, 230, 230))
-    generated = Image.new("RGB", (720, 1536), (220, 90, 60))
+    generated = Image.new("RGB", (720, 1024), (220, 90, 60))
     spec = JobSpec(
         source=tmp_path / "source.png",
         workspace=settings.data_root,
@@ -199,6 +199,85 @@ def test_geometry_locked_project_aligns_model_canvas_without_importing_edges(
         np.max(np.asarray(final), axis=2),
         np.max(np.asarray(source), axis=2),
     )
+
+
+def test_new_model_candidate_rejects_material_aspect_warp(tmp_path: Path) -> None:
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    source = Image.new("RGB", (722, 1024), (230, 230, 230))
+    warped = Image.new("RGB", (720, 1536), (220, 90, 60))
+    spec = JobSpec(
+        source=tmp_path / "source.png",
+        workspace=settings.data_root,
+        engine="palette",
+    )
+
+    with pytest.raises(ValueError, match="aspect ratio differs"):
+        manager._render_color_candidate(source, warped, spec)
+
+    repaired = manager._render_color_candidate(
+        source, warped, spec, allow_legacy_aspect=True
+    )
+    assert repaired.size == source.size
+
+
+def test_semantic_ink_protection_keeps_only_dark_source_core(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_path = tmp_path / "unit.png"
+    pixels = np.full((24, 24, 3), 245, dtype=np.uint8)
+    pixels[12, 12] = 0
+    Image.fromarray(pixels, mode="RGB").save(source_path)
+    manager = ProjectManager(Settings(data_root=tmp_path / "jobs"), EngineRegistry())
+    spec = JobSpec(
+        source=source_path,
+        workspace=tmp_path / "jobs",
+        engine="palette",
+        preserve_text=False,
+    )
+    manifest = SimpleNamespace(mask_corrections=lambda _page_id: [])
+    semantic = SimpleNamespace(
+        confidence=np.ones((24, 24), dtype=np.float32),
+        masks={
+            "text": np.ones((24, 24), dtype=bool),
+            "ink": np.ones((24, 24), dtype=bool),
+        },
+        uncertain=np.zeros((24, 24), dtype=bool),
+    )
+    monkeypatch.setattr(manager, "_load_spec", lambda _job_id: spec)
+    monkeypatch.setattr(manager, "_manifest", lambda _job_id: manifest)
+    monkeypatch.setattr(manager, "semantic_page", lambda _job_id, _page_index: semantic)
+
+    protected, _uncertain = manager._corrected_unit_masks(
+        "job",
+        {
+            "source_path": str(source_path),
+            "page_id": 1,
+            "page_index": 0,
+            "unit_index": 0,
+            "x": 0,
+            "y": 0,
+        },
+    )
+
+    assert protected[12, 12]
+    assert not protected[5, 5]
+    assert protected.mean() < 0.1
+
+
+def test_semantic_balloon_protection_rejects_component_without_text() -> None:
+    balloons = np.zeros((40, 60), dtype=bool)
+    balloons[4:18, 4:24] = True
+    balloons[22:36, 34:56] = True
+    text = np.zeros_like(balloons)
+    text[8:14, 10:18] = True
+    source_gray = np.full(balloons.shape, 245, dtype=np.uint8)
+    source_gray[8:14, 10:18] = 0
+
+    protected = _balloons_with_detected_text(balloons, text, source_gray)
+
+    assert protected[10, 12]
+    assert not protected[28, 44]
 
 
 def test_cobra_prefers_reviewed_curated_references_over_live_retrieval(
@@ -322,6 +401,64 @@ def test_completed_repair_is_staged_and_keeps_rollback_backup(
     assert (backup_roots[0] / "manifest.sqlite").is_file()
     assert (backup_roots[0] / "final" / "pages" / "page_00000.png").is_file()
     assert manager.status(job_id)["status"] == "completed"
+
+
+def test_atomic_repair_move_retries_a_temporary_windows_file_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "staging-output"
+    destination = tmp_path / "output"
+    source.mkdir()
+    attempts = 0
+    original_replace = Path.replace
+
+    def temporarily_locked(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("temporary scanner lock")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", temporarily_locked)
+    monkeypatch.setattr("manga_repaint.project.time.sleep", lambda _seconds: None)
+
+    ProjectManager._replace_with_windows_retry(source, destination)
+
+    assert attempts == 3
+    assert destination.is_dir()
+    assert not source.exists()
+
+
+def test_repair_output_publishes_files_without_renaming_staging_directory(
+    tmp_path: Path,
+) -> None:
+    manager = ProjectManager(Settings(data_root=tmp_path / "jobs"), EngineRegistry())
+    staging = tmp_path / "staging-output"
+    live = tmp_path / "output"
+    failed = tmp_path / "failed-output"
+    staging.mkdir()
+    (staging / "book-images.zip").write_bytes(b"verified archive")
+
+    manager._publish_staged_output_files(staging, live)
+
+    assert not staging.exists()
+    assert (live / "book-images.zip").read_bytes() == b"verified archive"
+
+    manager._withdraw_published_output_files(live, failed)
+
+    assert not live.exists()
+    assert (failed / "book-images.zip").read_bytes() == b"verified archive"
+
+
+def test_repair_detects_a_dangling_output_directory_entry(tmp_path: Path) -> None:
+    dangling = tmp_path / "output"
+    try:
+        dangling.symlink_to(tmp_path / "missing-output-target", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    assert not dangling.exists()
+    assert ProjectManager._path_entry_exists(dangling)
 
 
 def test_failed_staged_repair_does_not_change_live_results(

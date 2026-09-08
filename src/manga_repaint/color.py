@@ -235,7 +235,7 @@ def apply_render_profile(
 def is_already_colorized(
     image: Image.Image,
     *,
-    coverage_min: float = 0.90,
+    coverage_min: float = 0.80,
     pixel_min: int = 4096,
 ) -> bool:
     """Return whether a source page is already a substantially colour image.
@@ -243,7 +243,10 @@ def is_already_colorized(
     Covers, credits and publisher pages can be supplied as colour scans. They
     must not be sent through a monochrome-to-colour model, especially when a
     model invents structure that is absent from the source. White paper and
-    black line art are excluded from the coverage calculation.
+    black line art are excluded from the coverage calculation.  The threshold
+    deliberately allows printed highlights, white lettering and neutral scan
+    areas: a genuinely coloured cover can contain more than ten percent
+    achromatic pixels without becoming a monochrome page.
     """
     if not 0.0 <= coverage_min <= 1.0:
         raise ValueError("Colour coverage minimum must be between 0.0 and 1.0")
@@ -483,18 +486,104 @@ def composite_reference_locked_colorization(
     source_hsv = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2HSV)
     candidate_hsv = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2HSV)
     source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
-    # Cobra supplies colour only.  Hue uses a circular representation before
-    # smoothing so red does not average through the 0/179 seam.  The source V
-    # channel is copied exactly; this keeps every original contour, halftone,
-    # shadow and panel geometry in place.
-    hue = candidate_hsv[..., 0].astype(np.float32)
-    hue_sin = cv2.GaussianBlur(np.sin(hue * np.pi / 90.0), (0, 0), 0.55)
-    hue_cos = cv2.GaussianBlur(np.cos(hue * np.pi / 90.0), (0, 0), 0.55)
-    result_hue = (np.arctan2(hue_sin, hue_cos) * 90.0 / np.pi) % 180.0
-    result_sat = cv2.GaussianBlur(
-        candidate_hsv[..., 1].astype(np.float32), (0, 0), 0.55
+    # A generated candidate is a low-frequency colour hint, never a pixelwise
+    # overlay.  Model redraws can shift an eye, limb or balloon by several
+    # pixels; copying its H/S channels directly turned those shifted boundaries
+    # into coloured double contours even while source luminance stayed exact.
+    # Guided filtering aligns the candidate chroma field to source luminance
+    # edges and suppresses candidate-only high-frequency structure.
+    candidate_ycc = cv2.cvtColor(generated_rgb, cv2.COLOR_RGB2YCrCb).astype(np.float32)
+    valid_candidate_colour = np.logical_and(
+        candidate_hsv[..., 1] >= 18, candidate_hsv[..., 2] >= 32
     )
-    result_sat = np.clip(result_sat * float(chroma_strength), 0, 255)
+    nearby_colour = cv2.dilate(
+        valid_candidate_colour.astype(np.uint8), np.ones((13, 13), np.uint8)
+    ).astype(bool)
+    # Candidate black strokes and small neutral holes describe the model's
+    # redrawn geometry, not colour.  Remove them from the chroma signal before
+    # edge guidance; source ink and luminance are restored later from source.
+    inpaint_mask = np.logical_and(candidate_hsv[..., 2] <= 48, nearby_colour)
+    neutral = np.logical_and(candidate_hsv[..., 1] < 12, nearby_colour)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        neutral.astype(np.uint8), connectivity=8
+    )
+    maximum_hole = max(64, int(source_rgb.shape[0] * source_rgb.shape[1] * 0.015))
+    for component in range(1, count):
+        if int(stats[component, cv2.CC_STAT_AREA]) > maximum_hole:
+            continue
+        x = int(stats[component, cv2.CC_STAT_LEFT])
+        y = int(stats[component, cv2.CC_STAT_TOP])
+        width = int(stats[component, cv2.CC_STAT_WIDTH])
+        height = int(stats[component, cv2.CC_STAT_HEIGHT])
+        # A 13x13 dilation can reach only six pixels beyond a component.
+        # Work in that bounded ROI instead of allocating and scanning a full
+        # page-sized boolean array for every neutral speck on a screentone page.
+        x0 = max(0, x - 6)
+        y0 = max(0, y - 6)
+        x1 = min(labels.shape[1], x + width + 6)
+        y1 = min(labels.shape[0], y + height + 6)
+        region = labels[y0:y1, x0:x1] == component
+        colour_ring = np.logical_and(
+            cv2.dilate(region.astype(np.uint8), np.ones((13, 13), np.uint8)).astype(bool),
+            np.logical_and(
+                ~region, valid_candidate_colour[y0:y1, x0:x1]
+            ),
+        )
+        if int(colour_ring.sum()) < 32:
+            continue
+        ring_hue = candidate_hsv[y0:y1, x0:x1, 0][colour_ring].astype(np.float32)
+        ring_saturation = candidate_hsv[y0:y1, x0:x1, 1][colour_ring].astype(np.float32)
+        angles = ring_hue * np.pi / 90.0
+        weights = np.maximum(ring_saturation, 1.0)
+        concentration = float(
+            np.hypot(
+                np.sum(np.sin(angles) * weights),
+                np.sum(np.cos(angles) * weights),
+            )
+            / np.sum(weights)
+        )
+        # Only a coherent surrounding colour may fill a neutral candidate
+        # island.  This repairs missing skin/hair patches without painting a
+        # deliberately white shirt or a balloon from unrelated neighbours.
+        if concentration >= 0.78 and float(np.median(ring_saturation)) >= 24.0:
+            inpaint_mask[y0:y1, x0:x1] |= region
+    if inpaint_mask.any() and (~inpaint_mask).any():
+        encoded_mask = inpaint_mask.astype(np.uint8) * 255
+        for channel in (1, 2):
+            candidate_ycc[..., channel] = cv2.inpaint(
+                candidate_ycc[..., channel].astype(np.uint8),
+                encoded_mask,
+                5,
+                cv2.INPAINT_TELEA,
+            )
+    guide = source_gray.astype(np.float32) / 255.0
+    radius = max(2, min(12, round(min(source_rgb.shape[:2]) / 144)))
+    sigma = max(0.8, radius * 0.22)
+    filtered_ycc = np.empty_like(candidate_ycc)
+    filtered_ycc[..., 0] = source_gray
+    for channel in (1, 2):
+        chroma = (candidate_ycc[..., channel] - 128.0) / 127.0
+        chroma = cv2.GaussianBlur(chroma, (0, 0), sigma)
+        filtered = _guided_filter(guide, chroma, radius=radius, epsilon=0.0025)
+        filtered_ycc[..., channel] = np.clip(
+            128.0 + filtered * 127.0 * float(chroma_strength), 0, 255
+        )
+    guided_rgb = cv2.cvtColor(
+        np.clip(np.rint(filtered_ycc), 0, 255).astype(np.uint8),
+        cv2.COLOR_YCrCb2RGB,
+    )
+    guided_hsv = cv2.cvtColor(guided_rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    result_hue = guided_hsv[..., 0]
+    # Reapplying a bright source value after YCrCb conversion naturally lowers
+    # measured HSV saturation. Restore it only from the already source-guided
+    # chroma field. Candidate-derived saturation hints are deliberately
+    # forbidden here: even after smoothing they can restore a shifted contour
+    # as a cyan or magenta rim.
+    result_sat = np.clip(
+        guided_hsv[..., 1] * 1.5 * float(chroma_strength),
+        0,
+        255,
+    )
 
     # A reference library is a book-level colour vocabulary, not a semantic
     # segmentation model. Softly pull nearby candidate hues toward that
@@ -508,17 +597,11 @@ def composite_reference_locked_colorization(
             strength=palette_strength,
         )
 
-    # Cobra can leave neutral islands inside an otherwise coloured local area.
-    # Fill only holes close to a coherent candidate colour field. This is
-    # deliberately local: it cannot paint a whole white speech balloon or page
-    # background merely because a different region on the page is colourful.
-    result_hue, result_sat = _fill_neutral_holes(
-        result_hue,
-        result_sat,
-        candidate_hsv[..., 2].astype(np.float32),
-        protected_mask,
-        source_gray,
-    )
+    # Do not run the legacy pixelwise neutral-hole pass here.  Its local hue
+    # lookup can reintroduce the very candidate edges removed above.  Small
+    # dark/neutral holes have already been inpainted before guided transfer;
+    # larger neutral regions stay neutral unless a future source-region model
+    # assigns them a reviewed colour.
     composed = np.dstack(
         (
             result_hue.astype(np.uint8),
@@ -529,10 +612,40 @@ def composite_reference_locked_colorization(
     result_rgb = cv2.cvtColor(composed, cv2.COLOR_HSV2RGB)
     # Semantic protection is the hard boundary.  Pure black source pixels are
     # also restored exactly so missed semantic ink cannot be recoloured.
-    black_source = source_gray <= 5
+    black_source = source_gray <= 18
     exact = protected_mask | black_source
     result_rgb[exact] = source_rgb[exact]
     return Image.fromarray(result_rgb, mode="RGB")
+
+
+def _guided_filter(
+    guide: np.ndarray,
+    signal: np.ndarray,
+    *,
+    radius: int,
+    epsilon: float,
+) -> np.ndarray:
+    """Edge-align a scalar signal to a normalized single-channel guide."""
+    if guide.shape != signal.shape:
+        raise ValueError("guided filter arrays must have identical dimensions")
+    if radius < 1:
+        raise ValueError("guided filter radius must be positive")
+    window = (radius * 2 + 1, radius * 2 + 1)
+    mean_guide = cv2.boxFilter(guide, cv2.CV_32F, window, normalize=True)
+    mean_signal = cv2.boxFilter(signal, cv2.CV_32F, window, normalize=True)
+    correlation = cv2.boxFilter(guide * signal, cv2.CV_32F, window, normalize=True)
+    variance = (
+        cv2.boxFilter(guide * guide, cv2.CV_32F, window, normalize=True)
+        - mean_guide * mean_guide
+    )
+    covariance = correlation - mean_guide * mean_signal
+    coefficient = covariance / (variance + float(epsilon))
+    offset = mean_signal - coefficient * mean_guide
+    mean_coefficient = cv2.boxFilter(
+        coefficient, cv2.CV_32F, window, normalize=True
+    )
+    mean_offset = cv2.boxFilter(offset, cv2.CV_32F, window, normalize=True)
+    return mean_coefficient * guide + mean_offset
 
 
 def _stabilize_palette(

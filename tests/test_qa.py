@@ -4,8 +4,11 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from manga_repaint.color import composite_geometry_locked_colorization
-from manga_repaint.qa import evaluate
+from manga_repaint.color import (
+    composite_geometry_locked_colorization,
+    composite_reference_locked_colorization,
+)
+from manga_repaint.qa import _color_dropout_tiles, evaluate
 
 
 def test_color_qa_rejects_page_that_drops_generated_color() -> None:
@@ -57,6 +60,20 @@ def test_color_qa_accepts_full_color_with_exact_protection() -> None:
     assert qa.color_dropout_tiles == 0
 
 
+def test_regional_color_qa_ignores_tiny_border_fragments() -> None:
+    generated = np.full((120, 120, 3), (220, 80, 40), dtype=np.uint8)
+    result = generated.copy()
+    roi = np.zeros((120, 120), dtype=bool)
+    for row in range(6):
+        for column in range(6):
+            y = row * 20
+            x = column * 20
+            roi[y : y + 3, x : x + 3] = True
+            result[y : y + 3, x : x + 3] = 160
+
+    assert _color_dropout_tiles(generated, result, roi) == 0
+
+
 def test_geometry_qa_rejects_twelve_pixel_structure_shift() -> None:
     source_pixels = np.full((128, 128, 3), 238, dtype=np.uint8)
     source_pixels[52:56, 20:108] = 0
@@ -98,3 +115,39 @@ def test_geometry_locked_composition_does_not_import_shifted_edges() -> None:
     result_edges = cv2.Canny(np.asarray(result.convert("L")), 60, 150) > 0
     assert int(result_edges[50:54, 14:82].sum()) == 0
     assert int(np.logical_and(source_edges, result_edges).sum()) > 0
+
+
+def test_chroma_qa_rejects_shifted_colour_ghost_but_accepts_guided_transfer() -> None:
+    source_pixels = np.full((96, 96, 3), 232, dtype=np.uint8)
+    source_pixels[38:42, 14:82] = 0
+    generated_pixels = np.full_like(source_pixels, (226, 88, 56))
+    generated_pixels[50:54, 14:82] = 0
+    source = Image.fromarray(source_pixels, mode="RGB")
+    generated = Image.fromarray(generated_pixels, mode="RGB")
+    protected = np.zeros((96, 96), dtype=bool)
+
+    source_hsv = cv2.cvtColor(source_pixels, cv2.COLOR_RGB2HSV)
+    direct_hsv = cv2.cvtColor(generated_pixels, cv2.COLOR_RGB2HSV)
+    direct_hsv[..., 2] = source_hsv[..., 2]
+    direct = Image.fromarray(cv2.cvtColor(direct_hsv, cv2.COLOR_HSV2RGB), mode="RGB")
+    direct_qa = evaluate(
+        source,
+        direct,
+        protected,
+        generated=generated,
+        geometry_locked=True,
+    )
+
+    guided = composite_reference_locked_colorization(source, generated, protected)
+    guided_qa = evaluate(
+        source,
+        guided,
+        protected,
+        generated=generated,
+        geometry_locked=True,
+    )
+
+    assert not direct_qa.passed
+    assert "chroma_edge_alignment_below_threshold" in direct_qa.reasons
+    assert guided_qa.passed
+    assert guided_qa.chroma_edge_alignment == 1.0

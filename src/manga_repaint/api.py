@@ -2361,6 +2361,14 @@ def create_app(
             "Pragma": "no-cache",
         }
 
+    def _range_not_satisfiable_headers(path: Path) -> dict[str, str]:
+        """Return 416 metadata without advertising the full file as its body."""
+        size = path.stat().st_size
+        headers = _download_headers(path)
+        headers.pop("Content-Length", None)
+        headers["Content-Range"] = f"bytes */{size}"
+        return headers
+
     @app.get("/api/jobs/{job_id}/download-info")
     def download_info(job_id: str) -> dict[str, Any]:
         path = _download_output(job_id)
@@ -2399,7 +2407,7 @@ def create_app(
         if not range_header.startswith("bytes=") or "," in range_header:
             return Response(
                 status_code=416,
-                headers={**headers, "Content-Range": f"bytes */{size}"},
+                headers=_range_not_satisfiable_headers(path),
             )
         value = range_header[6:].strip()
         try:
@@ -2421,7 +2429,7 @@ def create_app(
         except (TypeError, ValueError):
             return Response(
                 status_code=416,
-                headers={**headers, "Content-Range": f"bytes */{size}"},
+                headers=_range_not_satisfiable_headers(path),
             )
         ranged_headers = {
             **headers,

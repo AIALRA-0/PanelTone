@@ -44,6 +44,13 @@ test('fixed viewports keep the workspace usable and geometry stable', async ({ p
       expect(Math.abs((button!.x + button!.width / 2) - (svg!.x + svg!.width / 2))).toBeLessThanOrEqual(1)
       expect(Math.abs((button!.y + button!.height / 2) - (svg!.y + svg!.height / 2))).toBeLessThanOrEqual(1)
     }
+    const compareStage = await page.locator('.compare-stage').boundingBox()
+    const previous = await buttons.nth(0).boundingBox()
+    const next = await buttons.nth(1).boundingBox()
+    if (compareStage && previous && next) {
+      expect(previous.x + previous.width).toBeLessThanOrEqual(compareStage.x + 1)
+      expect(next.x).toBeGreaterThanOrEqual(compareStage.x + compareStage.width - 1)
+    }
   }
 })
 
@@ -55,7 +62,22 @@ test('203-page status view stays windowed and keyboard addressable', async ({ pa
   await expect(page.locator('.status-list button')).toHaveCount(24)
   await page.locator('.status-list').focus()
   await page.keyboard.press('End')
-  await expect(page.locator('.canvas-page-count')).toHaveText('203 / 203')
+  await expect(page.getByRole('spinbutton', { name: '跳转页码' })).toHaveValue('203')
+  await expect(page.locator('.canvas-page-total')).toHaveText('/ 203')
+})
+
+test('page jump goes directly to a valid page and rejects an invalid page', async ({ page }) => {
+  await openWorkspace(page, 1440, 900)
+  await page.getByRole('button', { name: /203\/203/ }).click()
+  const input = page.getByRole('spinbutton', { name: '跳转页码' })
+  await expect(input).toHaveAttribute('max', '203')
+  await input.fill('109')
+  await page.getByRole('button', { name: '跳转', exact: true }).click()
+  await expect(input).toHaveValue('109')
+  await input.fill('204')
+  await page.getByRole('button', { name: '跳转', exact: true }).click()
+  await expect(input).toHaveValue('109')
+  await expect(page.getByText('请输入 1 到 203 之间的页码')).toBeVisible()
 })
 
 test('width sweep does not create horizontal overflow or hide mobile library actions', async ({ page }) => {

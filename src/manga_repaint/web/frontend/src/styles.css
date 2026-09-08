@@ -1143,6 +1143,22 @@ button, input, select, textarea { font-size: 14px; }
 
 /* Alpha.3 canonical layout contract.  This is the final stylesheet contract
    for the current UI; it deliberately owns the breakpoints below. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.canvas {
+  --canvas-pad: 16px;
+  --canvas-side-gutter: 64px;
+  padding: var(--canvas-pad) var(--canvas-side-gutter);
+}
 .icon-chevron {
   display: block;
   width: 20px;
@@ -1162,8 +1178,8 @@ button, input, select, textarea { font-size: 14px; }
 .page-placeholder {
   position: absolute;
   z-index: 0;
-  inset: var(--canvas-pad, 20px);
-  width: calc(100% - (var(--canvas-pad, 20px) * 2));
+  inset: var(--canvas-pad, 20px) var(--canvas-side-gutter, 20px);
+  width: calc(100% - (var(--canvas-side-gutter, 20px) * 2));
   height: calc(100% - (var(--canvas-pad, 20px) * 2));
   object-fit: contain;
   opacity: .42;
@@ -1174,6 +1190,43 @@ button, input, select, textarea { font-size: 14px; }
 .canvas > .single-page,
 .canvas > .waiting-page { position: relative; z-index: 1; }
 .canvas > .page-loading { z-index: 7; }
+.canvas-page-jump {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 4px 5px 4px 8px;
+  pointer-events: auto;
+}
+.canvas-page-jump label { display: block; }
+.canvas-page-jump input {
+  width: 42px;
+  height: 24px;
+  padding: 0 3px;
+  border: 1px solid rgba(255,255,255,.45);
+  border-radius: 5px;
+  outline: 0;
+  background: rgba(255,255,255,.12);
+  color: white;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  appearance: textfield;
+}
+.canvas-page-jump input::-webkit-inner-spin-button,
+.canvas-page-jump input::-webkit-outer-spin-button { margin: 0; appearance: none; }
+.canvas-page-jump input:focus { border-color: white; box-shadow: 0 0 0 1px white; }
+.canvas-page-jump button {
+  min-height: 24px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 5px;
+  background: white;
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+}
 .page-status-overview {
   display: grid;
   gap: 8px;
@@ -1362,11 +1415,14 @@ button, input, select, textarea { font-size: 14px; }
   .toolbar-actions { flex: 0 1 auto; gap: 3px; }
   .segmented button { min-height: 32px; padding-inline: 4px; }
   .more-button { display: grid; width: 32px; min-width: 32px; }
-  .canvas { --canvas-pad: 8px; padding: 8px; }
+  .canvas { --canvas-pad: 8px; --canvas-side-gutter: 50px; padding: var(--canvas-pad) var(--canvas-side-gutter); }
   .canvas-page-nav { width: 44px; height: 48px; }
   .canvas-page-nav.previous { left: 4px; }
   .canvas-page-nav.next { right: 4px; }
   .canvas-page-count { bottom: 8px; }
+  .canvas-page-jump { gap: 4px; padding-left: 6px; }
+  .canvas-page-jump input { width: 36px; }
+  .canvas-page-jump button { padding-inline: 5px; }
   .filmstrip.filmstrip-shell { height: 124px; }
   .filmstrip-viewport { padding-inline: 10px; }
   .progress-drawer { position: fixed; z-index: 25; inset: 56px 0 52px; margin: 0; overflow: auto; }

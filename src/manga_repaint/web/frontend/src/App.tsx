@@ -1,4 +1,4 @@
-import { ChangeEvent, DragEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactElement, type WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, DragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactElement, type WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from 'react'
 
 type Descriptor = {
   id: string
@@ -413,6 +413,7 @@ function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [pages, setPages] = useState<Page[]>([])
   const [pageIndex, setPageIndex] = useState(0)
+  const [pageJumpValue, setPageJumpValue] = useState('1')
   const [importOpen, setImportOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [progressOpen, setProgressOpen] = useState(true)
@@ -515,6 +516,7 @@ function App() {
   useEffect(() => { setReadyNotice(null) }, [selected?.id])
   useEffect(() => { pagesRef.current = pages }, [pages])
   useEffect(() => { pageIndexRef.current = pageIndex }, [pageIndex])
+  useEffect(() => { setPageJumpValue(String(pageIndex + 1)) }, [pageIndex])
   useEffect(() => { logKindRef.current = logKind }, [logKind])
   useEffect(() => { localStorage.setItem('paneltone.leftCollapsed', leftCollapsed ? '1' : '0') }, [leftCollapsed])
   useEffect(() => { localStorage.setItem('paneltone.rightCollapsed', rightCollapsed ? '1' : '0') }, [rightCollapsed])
@@ -761,6 +763,7 @@ function App() {
     pageSelectionRef.current.set(selected.id, index)
     setPageLoading(true)
     setCanvasPan({ x: 0, y: 0 })
+    pageIndexRef.current = index
     setPageIndex(index)
     setReadyNotice(current => current === index ? null : current)
     prefetchPageAssets(selected.id, index)
@@ -769,6 +772,18 @@ function App() {
   function movePage(offset: number) {
     const currentPosition = pagesRef.current.findIndex(page => page.page_index === pageIndexRef.current)
     const target = pagesRef.current[currentPosition + offset]
+    if (target) selectPage(target.page_index)
+  }
+
+  function submitPageJump(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const requested = Number(pageJumpValue)
+    if (!Number.isInteger(requested) || requested < 1 || requested > pagesRef.current.length) {
+      setPageJumpValue(String(pageIndexRef.current + 1))
+      setMessage(`请输入 1 到 ${pagesRef.current.length} 之间的页码`)
+      return
+    }
+    const target = pagesRef.current[requested - 1]
     if (target) selectPage(target.page_index)
   }
 
@@ -1375,7 +1390,11 @@ function App() {
                  </div> : previewMode === 'source' ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : previewMode === 'mask' ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page mask-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={`/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask`} alt={`第 ${currentPage.page_index + 1} 页保护遮罩`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : currentResultUrl ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : waitingForModel ? <div className="waiting-page model-waiting"><span className="waiting-symbol">!</span><strong>模型服务未连接</strong><span>当前没有页面在处理，服务恢复后会自动继续</span>{selected.error && <small className="waiting-detail">{selected.error}</small>}<button onClick={() => refreshHealth()}>重新检测模型</button></div> : <div className="waiting-page"><div className="spinner" /><strong>{modelLoading ? '正在加载模型权重' : waitingPageTitle}</strong><span>{modelLoading ? '首次启动需要准备模型，完成后才会生成第 1 页' : waitingPageHint}</span>{modelLoading && <div className="model-stage-progress">{typeof modelHealth?.progress === 'number' ? <><progress max="100" value={modelHealth.progress} /><strong>{modelHealth.progress.toFixed(0)}%</strong></> : <small>{modelHealth?.stage || modelHealth?.message || '当前服务只提供阶段状态，未提供可靠总量'}</small>}</div>}</div>}
               <button className="canvas-page-nav previous" onClick={() => movePage(-1)} disabled={pages.findIndex(page => page.page_index === pageIndex) <= 0} aria-label="上一页" title="上一页"><Icon name="chevron-left" /></button>
               <button className="canvas-page-nav next" onClick={() => movePage(1)} disabled={pages.findIndex(page => page.page_index === pageIndex) < 0 || pages.findIndex(page => page.page_index === pageIndex) >= pages.length - 1} aria-label="下一页" title="下一页"><Icon name="chevron-right" /></button>
-              <span className="canvas-page-count" aria-label="当前页码">{currentPage.page_index + 1} / {pages.length}</span>
+              <form className="canvas-page-count canvas-page-jump" aria-label="页面跳转" noValidate onSubmit={submitPageJump} onPointerDown={event => event.stopPropagation()}>
+                <label><span className="sr-only">跳转页码</span><input aria-label="跳转页码" type="number" inputMode="numeric" min="1" max={pages.length} value={pageJumpValue} onChange={event => setPageJumpValue(event.target.value)} onFocus={event => event.currentTarget.select()} /></label>
+                <span className="canvas-page-total">/ {pages.length}</span>
+                <button type="submit">跳转</button>
+              </form>
               {pageLoading && <div className="page-loading" role="status"><span className="spinner" />正在载入第 {currentPage.page_index + 1} 页</div>}
             </> : <div className="waiting-page"><strong>正在准备页面</strong><span>页面展开后会显示缩略图</span></div>}
           </div>

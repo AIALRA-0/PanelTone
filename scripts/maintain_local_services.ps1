@@ -8,6 +8,8 @@ param(
     [int]$CheckIntervalSeconds = 10,
     [ValidateRange(1, 300)]
     [int]$RestartDelaySeconds = 5,
+    [ValidateRange(10, 900)]
+    [int]$UnhealthyRestartSeconds = 45,
     [string]$LogDirectory = "",
     [switch]$ValidateOnly
 )
@@ -96,6 +98,48 @@ function Test-ServiceHealth([int]$Port, [string]$Path) {
     }
 }
 
+function Get-ListeningProcessId([int]$Port) {
+    $listener = Get-NetTCPConnection `
+        -State Listen `
+        -LocalPort $Port `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalAddress -in @("127.0.0.1", "::1") } |
+        Select-Object -First 1
+    if ($listener) {
+        return [int]$listener.OwningProcess
+    }
+    return $null
+}
+
+function Test-OwnedServiceProcess(
+    [int]$ProcessId,
+    [string]$Executable,
+    [string]$ProcessMarker
+) {
+    if ($ProcessId -le 0) {
+        return $false
+    }
+    $process = Get-CimInstance Win32_Process `
+        -Filter "ProcessId=$ProcessId" `
+        -ErrorAction SilentlyContinue
+    if (-not $process) {
+        return $false
+    }
+    # A Windows virtual-environment launcher reports the base interpreter in
+    # Win32_Process.ExecutablePath.  Match the executable name plus the unique
+    # service command marker instead of rejecting a healthy venv child solely
+    # because its resolved base path differs from the launcher path.
+    $expectedExecutableName = [IO.Path]::GetFileName($Executable)
+    $actualExecutableName = [IO.Path]::GetFileName([string]$process.ExecutablePath)
+    return (
+        $actualExecutableName.Equals(
+            $expectedExecutableName,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -and
+        [string]$process.CommandLine -like "*$ProcessMarker*"
+    )
+}
+
 function Start-ManagedProcess(
     [string]$Name,
     [string]$Executable,
@@ -145,6 +189,7 @@ $services = @(
             PYTHONPATH = (Join-Path $resolvedProjectRoot "src")
             PANELTONE_SEMANTIC_MODEL_DIR = $semanticModelRoot
         }
+        ProcessMarker = "manga_repaint.semantic_service:app"
     },
     [pscustomobject]@{
         Name = "flux"
@@ -163,6 +208,7 @@ $services = @(
             MANGA_REPAINT_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
             MANGA_REPAINT_MODEL_CPU_OFFLOAD = "1"
         }
+        ProcessMarker = "manga_repaint.model_server:app"
     },
     [pscustomobject]@{
         Name = "cobra"
@@ -182,6 +228,7 @@ $services = @(
             PANELTONE_COBRA_HEADLESS = "1"
             PANELTONE_COBRA_TMP = $cobraTemp
         }
+        ProcessMarker = "scripts.cobra_http_service:app"
     },
     [pscustomobject]@{
         Name = "app"
@@ -199,6 +246,7 @@ $services = @(
             PANELTONE_DATA_ROOT = $resolvedDataRoot
             PANELTONE_MODEL_ROOT = $resolvedModelRoot
         }
+        ProcessMarker = "manga_repaint.cli"
     }
 )
 
@@ -225,18 +273,65 @@ if ($ValidateOnly) {
 Write-SupervisorLog "supervisor_started"
 $tracked = @{}
 $lastStart = @{}
+$unhealthySince = @{}
 while ($true) {
     foreach ($service in $services) {
         if (Test-ServiceHealth $service.Port $service.HealthPath) {
+            $unhealthySince.Remove($service.Name)
             continue
         }
 
         $trackedProcess = $tracked[$service.Name]
         if ($trackedProcess -and -not $trackedProcess.HasExited) {
+            $now = Get-Date
+            if (-not $unhealthySince[$service.Name]) {
+                $unhealthySince[$service.Name] = $now
+                Write-SupervisorLog "unhealthy service=$($service.Name) pid=$($trackedProcess.Id)"
+                continue
+            }
+            if (($now - $unhealthySince[$service.Name]).TotalSeconds -lt $UnhealthyRestartSeconds) {
+                continue
+            }
+            if (Test-OwnedServiceProcess `
+                $trackedProcess.Id `
+                $service.Executable `
+                $service.ProcessMarker
+            ) {
+                Stop-Process -Id $trackedProcess.Id -Force -ErrorAction Stop
+                Write-SupervisorLog "unhealthy_process_stopped service=$($service.Name) pid=$($trackedProcess.Id)"
+            } else {
+                Write-SupervisorLog "unhealthy_process_not_owned service=$($service.Name) pid=$($trackedProcess.Id)"
+            }
+            $tracked.Remove($service.Name)
+            $unhealthySince.Remove($service.Name)
             continue
         }
 
         $now = Get-Date
+        $listenerProcessId = Get-ListeningProcessId $service.Port
+        if ($listenerProcessId) {
+            if (-not $unhealthySince[$service.Name]) {
+                $unhealthySince[$service.Name] = $now
+                Write-SupervisorLog "unhealthy_listener service=$($service.Name) pid=$listenerProcessId"
+                continue
+            }
+            if (($now - $unhealthySince[$service.Name]).TotalSeconds -lt $UnhealthyRestartSeconds) {
+                continue
+            }
+            if (Test-OwnedServiceProcess `
+                $listenerProcessId `
+                $service.Executable `
+                $service.ProcessMarker
+            ) {
+                Stop-Process -Id $listenerProcessId -Force -ErrorAction Stop
+                Write-SupervisorLog "unhealthy_listener_stopped service=$($service.Name) pid=$listenerProcessId"
+            } else {
+                Write-SupervisorLog "unhealthy_listener_not_owned service=$($service.Name) pid=$listenerProcessId"
+            }
+            $unhealthySince.Remove($service.Name)
+            continue
+        }
+        $unhealthySince.Remove($service.Name)
         $previousStart = $lastStart[$service.Name]
         if ($previousStart -and ($now - $previousStart).TotalSeconds -lt $RestartDelaySeconds) {
             continue

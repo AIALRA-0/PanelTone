@@ -100,6 +100,11 @@ def test_api_create_run_and_download(tmp_path: Path, manga_pages: Path) -> None:
             headers={"Range": "bytes=999999999-"},
         )
         assert invalid_range.status_code == 416
+        assert invalid_range.content == b""
+        assert invalid_range.headers["content-length"] == "0"
+        assert invalid_range.headers["content-range"] == (
+            f"bytes */{download_info['size_bytes']}"
+        )
 
 
 @pytest.mark.parametrize(
