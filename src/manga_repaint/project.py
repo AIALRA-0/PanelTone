@@ -18,6 +18,7 @@ from PIL import Image
 
 from .color import (
     apply_render_profile,
+    apply_vibrance_grade,
     classify_source_page,
     composite_geometry_locked_colorization,
     composite_protected,
@@ -1179,6 +1180,13 @@ class ProjectManager:
             spec,
             allow_legacy_aspect=allow_legacy_candidate,
         )
+        if spec.engine == "cobra-candidate":
+            # Cobra's reference-guided render is deliberately conservative.
+            # Enrich its existing material colours after the selected style
+            # profile, while keeping hue, value, geometry and neutral paper
+            # unchanged. Pastel/noir profiles remain restrained because their
+            # earlier profile grade supplies less chroma to this bounded lift.
+            generated_rgb = apply_vibrance_grade(generated_rgb)
         effective_chroma = spec.chroma_strength * float(
             render_profile(spec.color_preset, spec.style_preset)["chroma_multiplier"]
         )

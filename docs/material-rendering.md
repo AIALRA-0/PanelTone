@@ -41,6 +41,12 @@ paneltone material-render source.png review/plan.json experiment-output
 
 旧 `color-state` 中全为 `unresolved` 的几何片段不会自动转换成已接受的材质计划
 
+## Cobra 鲜明度收尾
+
+Cobra 的参考图上色倾向于输出柔和综合色盘。PanelTone 在样式 profile 之后执行一次有界鲜明度收尾，只增强模型已经给出可靠颜色的像素，不给白纸、灰色网点和气泡凭空染色
+
+该收尾保持色相和明暗值不变，并限制最高饱和度，因此不会移动结构、改变光影形状或制造新的区域颜色。柔和粉彩和黑色电影 profile 在前级保留较低色度，经过收尾后仍与鲜明动画色保持可验证差异
+
 ## 分割模型的使用边界
 
 `MaskPrompt` 和 `evaluate_mask_proposal` 检查有效坐标、正点遗漏、负点侵入、超出建议框的面积及孔洞

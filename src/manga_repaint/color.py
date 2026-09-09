@@ -232,6 +232,47 @@ def apply_render_profile(
     return Image.fromarray(graded, mode="RGB")
 
 
+def apply_vibrance_grade(
+    image: Image.Image,
+    *,
+    saturation_gain: float = 1.55,
+    vibrance: float = 0.28,
+    max_saturation: float = 0.90,
+    neutral_threshold: float = 0.025,
+) -> Image.Image:
+    """Enrich an existing colour render without repainting neutral pixels.
+
+    Cobra already decides which colour belongs to each material. This finishing
+    grade strengthens only pixels that contain a reliable chroma signal, with
+    the largest relative lift applied to muted colours. Hue and HSV value stay
+    unchanged, so the operation cannot introduce geometry, lighting texture,
+    coloured speech bubbles, or a new colour into truly neutral source areas.
+    """
+    if not 1.0 <= saturation_gain <= 2.5:
+        raise ValueError("Saturation gain must be between 1.0 and 2.5")
+    if not 0.0 <= vibrance <= 1.0:
+        raise ValueError("Vibrance must be between 0.0 and 1.0")
+    if not 0.0 < max_saturation <= 1.0:
+        raise ValueError("Maximum saturation must be between 0.0 and 1.0")
+    if not 0.0 <= neutral_threshold < 0.25:
+        raise ValueError("Neutral threshold must be between 0.0 and 0.25")
+
+    rgb = np.asarray(image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    saturation = hsv[..., 1] / 255.0
+    # A smooth gate leaves paper, gray screentones and white balloons exactly
+    # neutral. It reaches full strength only after the model has supplied a
+    # meaningful colour signal, rather than inventing one from gray pixels.
+    gate = np.clip((saturation - neutral_threshold) / 0.11, 0.0, 1.0)
+    gate = gate * gate * (3.0 - 2.0 * gate)
+    multiplier = 1.0 + gate * (
+        (saturation_gain - 1.0) + vibrance * (1.0 - saturation)
+    )
+    hsv[..., 1] = np.minimum(saturation * multiplier, max_saturation) * 255.0
+    graded = cv2.cvtColor(np.rint(hsv).astype(np.uint8), cv2.COLOR_HSV2RGB)
+    return Image.fromarray(graded, mode="RGB")
+
+
 def is_already_colorized(
     image: Image.Image,
     *,

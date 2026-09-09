@@ -6,6 +6,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from manga_repaint.color import (
+    apply_vibrance_grade,
     classify_source_page,
     composite_geometry_locked_colorization,
     composite_protected,
@@ -30,6 +31,23 @@ def test_protected_pixels_are_exact() -> None:
     result = np.asarray(composite_protected(source, generated, mask))
     assert np.all(result[mask] == 255)
     assert np.all(result[~mask] == np.array([30, 120, 220]))
+
+
+def test_vibrance_grade_enriches_muted_colour_without_tinting_neutrals() -> None:
+    pixels = np.full((16, 24, 3), 210, dtype=np.uint8)
+    pixels[:, 8:16] = (188, 154, 142)
+    pixels[:, 16:] = (96, 128, 156)
+    image = Image.fromarray(pixels, mode="RGB")
+
+    graded = np.asarray(apply_vibrance_grade(image))
+    original_hsv = cv2.cvtColor(pixels, cv2.COLOR_RGB2HSV)
+    graded_hsv = cv2.cvtColor(graded, cv2.COLOR_RGB2HSV)
+
+    assert np.array_equal(graded[:, :8], pixels[:, :8])
+    assert np.array_equal(graded_hsv[..., 0], original_hsv[..., 0])
+    assert np.array_equal(graded_hsv[..., 2], original_hsv[..., 2])
+    assert np.all(graded_hsv[:, 8:, 1] > original_hsv[:, 8:, 1])
+    assert int(graded_hsv[..., 1].max()) <= round(0.90 * 255)
 
 
 def test_replace_masked_preserves_base_outside_uncertain_region() -> None:
