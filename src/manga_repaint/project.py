@@ -18,7 +18,6 @@ from PIL import Image
 
 from .color import (
     apply_render_profile,
-    apply_vibrance_grade,
     classify_source_page,
     composite_geometry_locked_colorization,
     composite_protected,
@@ -975,22 +974,15 @@ class ProjectManager:
         explicit = [path.resolve() for path in spec.style_references if path.is_file()]
         if spec.engine != "cobra-candidate":
             return explicit
-        # A reviewed book-level anchor set is stronger than automatically
-        # retrieved final pages.  Automatic retrieval is useful for discovering
-        # candidates, but a previous page can itself contain dropped colour and
-        # would otherwise teach Cobra the same defect on every later page.
+        # Curated pages remain stronger evidence, but a warm-only curated set
+        # must not tint an entire book. Mix it with same-book retrieval and let
+        # the palette selector choose a small complementary pair.
         curated_root = self._job_dir(job_id) / "references" / "curated"
         curated = sorted(
             path
             for path in curated_root.glob("*")
             if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
         )
-        if curated:
-            paths: list[Path] = []
-            for path in (*explicit, *curated):
-                if path.is_file() and path not in paths:
-                    paths.append(path)
-            return paths[:12]
         # Reference colours must be scoped to the current book. The previous
         # global index could select a page from another manga, which made a
         # character's palette drift even when the candidate itself was stable.
@@ -1000,7 +992,7 @@ class ProjectManager:
             limit=12,
             exclude=(source_path, *explicit),
             scope_root=scope_root,
-            use_payload_cache=True,
+            use_payload_cache=False,
             min_colour_coverage=0.12,
         )
         if not matches:
@@ -1009,7 +1001,7 @@ class ProjectManager:
                 limit=6,
                 exclude=(source_path, *explicit),
                 scope_root=scope_root,
-                use_payload_cache=True,
+                use_payload_cache=False,
             )
         # A brand-new book may have no completed colour page yet. Keep the
         # candidate usable in that case, but make the fallback small and
@@ -1020,14 +1012,19 @@ class ProjectManager:
                 source_path,
                 limit=12,
                 exclude=(source_path,),
-                use_payload_cache=True,
+                use_payload_cache=False,
                 min_colour_coverage=0.20,
             )
         paths: list[Path] = []
-        for path in (*explicit, *(match.path for match in matches)):
+        for path in (*explicit, *curated, *(match.path for match in matches)):
             if path.is_file() and path not in paths:
                 paths.append(path)
-        return paths[:64]
+        selected = self.reference_library.select_balanced(
+            paths,
+            limit=2,
+            required=explicit,
+        )
+        return [self.reference_library.payload_path(path) for path in selected]
 
     def _reference_palette(
         self, paths: list[Path] | None
@@ -1180,13 +1177,6 @@ class ProjectManager:
             spec,
             allow_legacy_aspect=allow_legacy_candidate,
         )
-        if spec.engine == "cobra-candidate":
-            # Cobra's reference-guided render is deliberately conservative.
-            # Enrich its existing material colours after the selected style
-            # profile, while keeping hue, value, geometry and neutral paper
-            # unchanged. Pastel/noir profiles remain restrained because their
-            # earlier profile grade supplies less chroma to this bounded lift.
-            generated_rgb = apply_vibrance_grade(generated_rgb)
         effective_chroma = spec.chroma_strength * float(
             render_profile(spec.color_preset, spec.style_preset)["chroma_multiplier"]
         )
@@ -1682,7 +1672,7 @@ class ProjectManager:
                                     if spec.mode == JobMode.COLORIZE
                                     else render_settings["num_inference_steps"]
                                 ),
-                                "cobra_top_k": 6,
+                                "cobra_top_k": 2,
                                 "cobra_steps": 10,
                                 **(
                                     {

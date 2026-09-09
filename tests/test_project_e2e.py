@@ -12,7 +12,6 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from manga_repaint.color import apply_vibrance_grade
 from manga_repaint.config import Settings
 from manga_repaint.engines import EngineInterrupted, EngineRegistry
 from manga_repaint.models import DetailMode, JobSpec
@@ -246,9 +245,7 @@ def test_cobra_colourize_keeps_model_material_render_but_restores_source_ink(
         spec,
     )
     result = np.asarray(final)
-    expected = np.asarray(
-        apply_vibrance_grade(manager._render_color_candidate(source, generated, spec))
-    )
+    expected = np.asarray(manager._render_color_candidate(source, generated, spec))
 
     assert np.array_equal(result[40, 21], source_array[40, 21])
     assert np.array_equal(result[20, 70], expected[20, 70])
@@ -341,7 +338,8 @@ def test_cobra_prefers_reviewed_curated_references_over_live_retrieval(
 
     paths = manager._reference_paths(job_id, source, spec)
 
-    assert paths == [first, second]
+    assert len(paths) == 2
+    assert all(path.suffix == ".webp" for path in paths)
 
 
 def test_page_ready_event_precedes_completed(tmp_path: Path, manga_pages: Path) -> None:

@@ -18,6 +18,15 @@ class ReferenceMatch:
     source: str = "automatic"
 
 
+@dataclass(frozen=True, slots=True)
+class ReferencePaletteProfile:
+    path: Path
+    coverage: float
+    entropy: float
+    warm_share: float
+    hue_histogram: tuple[float, ...]
+
+
 class ColorReferenceLibrary:
     """Small local-only index for automatic manga colour reference retrieval.
 
@@ -206,6 +215,111 @@ class ColorReferenceLibrary:
             rgb.save(temporary, format="WEBP", quality=88, method=4)
             temporary.replace(target)
         return target
+
+    @staticmethod
+    def _palette_profile(path: Path) -> ReferencePaletteProfile | None:
+        """Describe useful colour without treating paper or ink as palette evidence."""
+        try:
+            with Image.open(path) as image:
+                rgb = np.asarray(
+                    image.convert("RGB").resize((128, 128), Image.Resampling.BILINEAR)
+                )
+        except (OSError, ValueError):
+            return None
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        coloured = (hsv[..., 1] >= 24) & (hsv[..., 2] >= 24) & (hsv[..., 2] <= 250)
+        coverage = float(coloured.mean())
+        if not coloured.any():
+            return ReferencePaletteProfile(path, coverage, 0.0, 1.0, (0.0,) * 12)
+        hue = hsv[..., 0][coloured]
+        weights = hsv[..., 1][coloured].astype(np.float64) / 255.0
+        histogram = np.histogram(hue, bins=12, range=(0, 180), weights=weights)[0]
+        histogram /= max(float(histogram.sum()), 1.0)
+        populated = histogram[histogram > 0]
+        entropy = float(
+            -(populated * np.log(populated)).sum() / math.log(len(histogram))
+        )
+        # OpenCV hue is measured in half-degrees. This span covers red-orange,
+        # skin and yellow; it is useful manga colour, but must not become the
+        # only evidence supplied to the model.
+        warm_share = float(((hue >= 3) & (hue <= 38)).mean())
+        return ReferencePaletteProfile(
+            path,
+            coverage,
+            entropy,
+            warm_share,
+            tuple(float(value) for value in histogram),
+        )
+
+    def select_balanced(
+        self,
+        paths: Iterable[Path],
+        *,
+        limit: int = 2,
+        required: Iterable[Path] = (),
+    ) -> list[Path]:
+        """Choose a small, useful reference set without a single warm cast.
+
+        Cobra becomes both slow and palette-biased when every available page
+        is uploaded. The selector keeps explicit user references, then greedily
+        adds high-coverage pages whose hue vocabulary improves the aggregate
+        palette. A warm-only page is allowed when it is the only evidence, but
+        cannot crowd out a neutral or cool companion.
+        """
+        if limit <= 0:
+            return []
+        unique: list[Path] = []
+        for path in paths:
+            resolved = Path(path).resolve()
+            if resolved.is_file() and resolved not in unique:
+                unique.append(resolved)
+        profiles = {
+            profile.path: profile
+            for profile in (self._palette_profile(path) for path in unique)
+            if profile is not None
+        }
+        selected: list[Path] = []
+        for path in required:
+            resolved = Path(path).resolve()
+            if resolved in profiles and resolved not in selected:
+                selected.append(resolved)
+            if len(selected) >= limit:
+                return selected
+
+        while len(selected) < limit:
+            choices = [profile for path, profile in profiles.items() if path not in selected]
+            if not choices:
+                break
+            if selected:
+                selected_hist = np.mean(
+                    [np.asarray(profiles[path].hue_histogram) for path in selected],
+                    axis=0,
+                )
+                selected_warm = float(np.mean([profiles[path].warm_share for path in selected]))
+            else:
+                selected_hist = np.zeros(12, dtype=np.float64)
+                selected_warm = 1.0
+
+            def score(
+                profile: ReferencePaletteProfile,
+                selected_hist: np.ndarray = selected_hist,
+                selected_warm: float = selected_warm,
+            ) -> float:
+                histogram = np.asarray(profile.hue_histogram)
+                diversity = float(np.abs(histogram - selected_hist).sum() / 2.0)
+                combined_warm = (
+                    selected_warm * len(selected) + profile.warm_share
+                ) / (len(selected) + 1)
+                warm_penalty = max(0.0, combined_warm - 0.72) * 1.4
+                return (
+                    profile.coverage * 0.20
+                    + profile.entropy * 0.55
+                    + diversity * (0.35 if selected else 0.0)
+                    - warm_penalty
+                )
+
+            selected.append(max(choices, key=score).path)
+        return selected
 
     @staticmethod
     def palette_anchors(

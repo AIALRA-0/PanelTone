@@ -1359,7 +1359,7 @@ function App() {
                 <div className="segmented">
                   {([['compare', '对比'], ['source', '原图'], ['final', '结果'], ['mask', '遮罩']] as const).map(([id, label]) =>
                     <button key={id} className={previewMode === id ? 'active' : ''} onClick={() => setPreviewMode(id)}>{label}</button>)}
-                  {pages.some(page => page.quality_candidate_url) && <button className={previewMode === 'candidate' ? 'active' : ''} onClick={() => { setReaderMode('paged'); setPreviewMode('candidate') }}>鲜明候选</button>}
+                  {pages.some(page => page.quality_candidate_url) && <button className={previewMode === 'candidate' ? 'active' : ''} onClick={() => { setReaderMode('paged'); setPreviewMode('candidate') }}>通用候选</button>}
                 </div>
                 <div className="segmented reader-modes" aria-label="阅读方式">
                   <button aria-pressed={readerMode === 'paged'} className={readerMode === 'paged' ? 'active' : ''} onClick={() => setReaderMode('paged')}>单页翻阅</button>
@@ -1407,8 +1407,8 @@ function App() {
                     url={currentCandidateUrl}
                     placeholder={placeholderUrl(currentPage, 'final')}
                     style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}
-                    alt={`第 ${currentPage.page_index + 1} 页鲜明上色候选`} onReady={markPageImageLoaded} />
-                  <span className="candidate-badge">Cobra 鲜明候选 · 不覆盖现有成品</span>
+                    alt={`第 ${currentPage.page_index + 1} 页通用上色候选`} onReady={markPageImageLoaded} />
+                  <span className="candidate-badge">Cobra 综合色盘候选 · 不覆盖现有成品</span>
                  </div> : <div className="waiting-page"><strong>此页尚无新版候选</strong><span>目前可查看第 9、41、71、111 页</span></div> : previewMode === 'source' || previewMode === 'mask' || currentResultUrl ? <div className="single-page-stage">
                   <ReaderImage key={`${selected.id}-${pageIndex}-${previewMode}-${readerDetail}-${currentPage.asset_revision}`}
                     url={previewMode === 'mask' ? `/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask` : (previewMode === 'source' ? currentSourceUrl! : currentResultUrl!)}

@@ -138,10 +138,10 @@ def generate(
         source_path.write_bytes(source.file.read())
         reference_paths: list[Path] = []
         # Cobra is designed to use a broad same-book reference set. The
-        # PanelTone adapter uploads bounded, downscaled proxies. Sixty-four
-        # same-book references are the measured quality/performance ceiling on
-        # this host; larger sets caused an unbounded local inference wait.
-        for index, item in enumerate(references[:64]):
+        # PanelTone supplies a tiny palette-balanced set. More references are
+        # not automatically better: they amplify book-wide casts and sharply
+        # increase VRAM and latency on this host.
+        for index, item in enumerate(references[:3]):
             target = (
                 temp_root / f"reference-{index:03d}-{Path(item.filename or 'reference.png').name}"
             )
@@ -187,7 +187,7 @@ def generate(
             resolution,
             int(seed or 0),
             int(metadata.get("cobra_steps", 10)),
-            min(int(metadata.get("cobra_top_k", 6)), len(reference_paths)),
+            min(int(metadata.get("cobra_top_k", 2)), len(reference_paths)),
             hint_mask,
             extracted_hint_color,
             query_origin,

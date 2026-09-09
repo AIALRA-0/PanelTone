@@ -63,6 +63,48 @@ def test_reference_library_extracts_palette_anchors(tmp_path: Path) -> None:
     )
 
 
+def test_reference_library_balances_warm_references_with_colour_variety(
+    tmp_path: Path,
+) -> None:
+    warm_a = tmp_path / "warm-a.png"
+    warm_b = tmp_path / "warm-b.png"
+    balanced = tmp_path / "balanced.png"
+    _page(warm_a, (222, 144, 82))
+    _page(warm_b, (196, 112, 64))
+    image = Image.new("RGB", (96, 128), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((8, 12, 46, 116), fill=(210, 115, 75))
+    draw.rectangle((48, 12, 88, 62), fill=(66, 132, 190))
+    draw.rectangle((48, 64, 88, 116), fill=(78, 158, 118))
+    image.save(balanced)
+
+    library = ColorReferenceLibrary(tmp_path / "jobs")
+    selected = library.select_balanced([warm_a, warm_b, balanced], limit=2)
+
+    assert balanced.resolve() in selected
+    assert not {warm_a.resolve(), warm_b.resolve()}.issubset(selected)
+
+
+def test_reference_library_keeps_explicit_reference_with_balanced_companion(
+    tmp_path: Path,
+) -> None:
+    explicit = tmp_path / "explicit.png"
+    warm = tmp_path / "warm.png"
+    cool = tmp_path / "cool.png"
+    _page(explicit, (220, 130, 72))
+    _page(warm, (190, 105, 55))
+    _page(cool, (60, 120, 205))
+
+    library = ColorReferenceLibrary(tmp_path / "jobs")
+    selected = library.select_balanced(
+        [explicit, warm, cool],
+        limit=2,
+        required=[explicit],
+    )
+
+    assert selected == [explicit.resolve(), cool.resolve()]
+
+
 def test_identity_hints_only_include_locked_records(tmp_path: Path) -> None:
     library = ColorReferenceLibrary(tmp_path / "jobs")
     hints = library.identity_hints(
