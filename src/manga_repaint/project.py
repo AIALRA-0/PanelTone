@@ -54,6 +54,7 @@ from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode
 from .panels import extract_panels
 from .presets import build_prompt, get_color_preset, get_style_preset, render_profile
 from .qa import evaluate
+from .reading_assets import ReadingAssetCache
 from .reference_library import ColorReferenceLibrary
 from .semantic import (
     ConservativeSemanticMaskEngine,
@@ -130,6 +131,9 @@ class ProjectManager:
         # browser refresh.  Serialize the tiny disk write so a refresh cannot
         # observe a partially-written preview or race the temporary file.
         self._preview_lock = threading.RLock()
+        self.reading_cache = ReadingAssetCache(
+            settings.reading_cache_root or settings.data_root / ".reading-cache"
+        )
         self._display_backfill_lock = threading.Lock()
         self._display_backfill_pending: set[tuple[str, int, str]] = set()
         self.semantic_engine = semantic_engine or configured_semantic_engine(settings.model_root)
@@ -258,7 +262,10 @@ class ProjectManager:
         return self.settings.data_root / job_id
 
     def _manifest(self, job_id: str) -> Manifest:
-        return Manifest(self._job_dir(job_id) / "manifest.sqlite")
+        try:
+            return Manifest(self._job_dir(job_id) / "manifest.sqlite", initialize=False)
+        except FileNotFoundError as exc:
+            raise KeyError("Unknown job") from exc
 
     def _allowed_source_roots(self) -> list[Path]:
         if not self.settings.allowed_roots:
@@ -304,7 +311,7 @@ class ProjectManager:
         ):
             (job_dir / name).mkdir(parents=True, exist_ok=True)
         spec.workspace = job_dir
-        manifest = self._manifest(job_id)
+        manifest = Manifest(job_dir / "manifest.sqlite")
         manifest.create_job(job_id, spec)
         manifest.set_job_status(job_id, JobStatus.INGESTING)
         manifest.set_ingest_progress(
@@ -2073,6 +2080,9 @@ class ProjectManager:
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
         output = self._job_dir(job_id) / "display" / variant / f"page_{page_index:05d}.webp"
+        # Existing files must not wait behind a whole-book backfill/export lock.
+        if output.is_file() and output.stat().st_mtime_ns >= source_path.stat().st_mtime_ns:
+            return output
         with self._preview_lock:
             if output.is_file() and output.stat().st_mtime_ns >= source_path.stat().st_mtime_ns:
                 return output
@@ -2084,6 +2094,18 @@ class ProjectManager:
                 )
                 raise DisplayAssetPending("display asset is being prepared")
             return self._write_display_asset(source_path, output)
+
+    def reading_asset(self, job_id: str, page_index: int, variant: str, size: str) -> Path:
+        if variant not in {"source", "final"}:
+            raise ValueError("Unknown reading variant")
+        page = self._manifest(job_id).page_by_index(job_id, page_index)
+        source = Path(page["source_path"] if variant == "source" else page["output_path"] or "")
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        output = self.reading_cache.request(source, size)
+        if output is None:
+            raise DisplayAssetPending("reading preview is being prepared")
+        return output
 
     def _write_display_asset(self, source_path: Path, output: Path) -> Path:
         """Encode one display asset atomically with bounded CPU work."""
@@ -2210,6 +2232,8 @@ class ProjectManager:
                 )
                 if not source_path.is_file():
                     continue
+                for size in ("preview", "reader"):
+                    self.reading_cache.request(source_path, size)
                 output = self._job_dir(job_id) / "display" / variant / f"page_{page_index:05d}.webp"
                 if output.is_file() and output.stat().st_mtime_ns >= source_path.stat().st_mtime_ns:
                     continue
@@ -2622,6 +2646,9 @@ class ProjectManager:
                 self._write_display_asset(
                     staged_page_path,
                     staging_display / "final" / f"page_{page_index:05d}.webp",
+                )
+                self.reading_cache.prepare_publication(
+                    staged_page_path, live_final / "pages" / f"page_{page_index:05d}.png"
                 )
                 staged_pages.append(
                     {

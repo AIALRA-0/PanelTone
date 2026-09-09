@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from manga_repaint.manifest import Manifest
 from manga_repaint.models import JobSpec, JobStatus, PanelBox
 
@@ -14,6 +16,33 @@ def test_manifest_creates_and_summarizes_job(tmp_path: Path) -> None:
     assert summary["status"] == "created"
     assert summary["page_count"] == 0
     assert summary["unit_counts"] == {}
+
+
+def test_existing_manifest_read_never_runs_schema_or_creates_missing_file(
+    tmp_path: Path, monkeypatch
+):
+    import manga_repaint.manifest as module
+
+    path = tmp_path / "manifest.sqlite"
+    manifest = Manifest(path)
+    manifest.create_job("abc", JobSpec(source=tmp_path, workspace=tmp_path))
+    monkeypatch.setattr(module, "SCHEMA", "THIS IS NOT VALID SQL")
+    existing = Manifest(path, initialize=False)
+    assert existing.summary("abc")["page_count"] == 0
+    with pytest.raises(FileNotFoundError):
+        Manifest(tmp_path / "absent" / "manifest.sqlite", initialize=False)
+    assert not (tmp_path / "absent").exists()
+
+
+def test_read_during_missing_manifest_does_not_recreate_database(tmp_path: Path):
+    path = tmp_path / "manifest.sqlite"
+    Manifest(path)
+    existing = Manifest(path, initialize=False)
+    path.rename(tmp_path / "backup.sqlite")
+    import sqlite3
+    with pytest.raises(sqlite3.OperationalError):
+        existing.pages("abc")
+    assert not path.exists()
 
 
 def test_manifest_recovers_interrupted_running_job(tmp_path: Path) -> None:

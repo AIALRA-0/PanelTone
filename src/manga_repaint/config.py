@@ -11,6 +11,7 @@ from typing import Any
 class Settings:
     data_root: Path = Path("jobs")
     model_root: Path = Path("models")
+    reading_cache_root: Path | None = None
     comfyui_url: str = "http://127.0.0.1:8188"
     max_upload_mib: int = 4096
     qa_line_f1_min: float = 0.98
@@ -44,6 +45,11 @@ class Settings:
                 )
             ).resolve(),
             model_root=Path(os.getenv("PANELTONE_MODEL_ROOT", str(default_models))).resolve(),
+            reading_cache_root=Path(os.getenv(
+                "PANELTONE_READING_CACHE_ROOT", str(Path(os.getenv(
+                    "PANELTONE_DATA_ROOT", os.getenv("MANGA_REPAINT_DATA_ROOT", str(default_root))
+                )) / ".reading-cache")
+            )).resolve(),
             comfyui_url=os.getenv(
                 "PANELTONE_COMFYUI_URL",
                 os.getenv("MANGA_REPAINT_COMFYUI_URL", "http://127.0.0.1:8188"),
@@ -105,6 +111,8 @@ class Settings:
             data["data_root"] = Path(data["data_root"]).resolve()
         if "model_root" in data:
             data["model_root"] = Path(data["model_root"]).resolve()
+        if data.get("reading_cache_root"):
+            data["reading_cache_root"] = Path(data["reading_cache_root"]).resolve()
         if "allowed_roots" in data:
             data["allowed_roots"] = [Path(item).resolve() for item in data["allowed_roots"]]
         return cls(**data)

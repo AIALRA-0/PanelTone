@@ -9,7 +9,7 @@ async function openWorkspace(page: Parameters<typeof test>[0]['page'], width: nu
   await page.setViewportSize({ width, height })
   await page.goto('/')
   await page.waitForSelector('.app-shell')
-  await page.waitForTimeout(700)
+  await expect(page.locator('.canvas-page-jump')).toBeAttached()
 }
 
 test('fixed viewports keep the workspace usable and geometry stable', async ({ page }) => {
@@ -29,11 +29,18 @@ test('fixed viewports keep the workspace usable and geometry stable', async ({ p
       await booksTab.click()
       await expect(page.locator('.new-folder')).toBeVisible()
       await page.getByRole('button', { name: /预览/ }).click()
+    } else if (width < 1100) {
+      await page.getByRole('button', { name: '展开书库', exact: true }).first().click()
+      await expect(page.locator('.new-folder')).toBeVisible()
+      await page.getByRole('button', { name: '关闭侧栏', exact: true }).click({ position: { x: 500, y: 100 } })
     } else {
+      const expandLibrary = page.getByRole('button', { name: '展开书库', exact: true }).first()
+      if (await expandLibrary.isVisible()) await expandLibrary.click()
       await expect(page.locator('.new-folder')).toBeVisible()
     }
 
     const buttons = page.locator('.canvas-page-nav')
+    await page.getByRole('button', { name: '对比', exact: true }).click()
     const svgs = page.locator('.canvas-page-nav .icon-chevron')
     expect(await buttons.count()).toBe(2)
     for (let index = 0; index < 2; index += 1) {
@@ -48,8 +55,11 @@ test('fixed viewports keep the workspace usable and geometry stable', async ({ p
     const previous = await buttons.nth(0).boundingBox()
     const next = await buttons.nth(1).boundingBox()
     if (compareStage && previous && next) {
-      expect(previous.x + previous.width).toBeLessThanOrEqual(compareStage.x + 1)
-      expect(next.x).toBeGreaterThanOrEqual(compareStage.x + compareStage.width - 1)
+      for (const nav of [previous, next]) {
+        const separated = nav.x + nav.width <= compareStage.x + 1 || nav.x >= compareStage.x + compareStage.width - 1
+          || nav.y >= compareStage.y + compareStage.height - 1 || nav.y + nav.height <= compareStage.y + 1
+        expect(separated, 'comparison drag area must not overlap navigation').toBe(true)
+      }
     }
   }
 })
@@ -57,6 +67,7 @@ test('fixed viewports keep the workspace usable and geometry stable', async ({ p
 test('203-page status view stays windowed and keyboard addressable', async ({ page }) => {
   await openWorkspace(page, 1440, 900)
   await page.getByRole('button', { name: /203\/203/ }).click()
+  await expect(page.getByRole('spinbutton', { name: '跳转页码' })).toHaveAttribute('max', '203')
   await page.getByRole('button', { name: '查看逐页状态' }).click()
   await expect(page.locator('.status-list')).toBeVisible()
   await expect(page.locator('.status-list button')).toHaveCount(24)
@@ -92,6 +103,8 @@ test('width sweep does not create horizontal overflow or hide mobile library act
       await page.getByRole('button', { name: /预览/ }).click()
       await page.getByRole('button', { name: /进度/ }).click()
     } else {
+      const expand = page.getByRole('button', { name: '展开书库', exact: true }).first()
+      if (await expand.isVisible()) await expand.click()
       await expect(page.locator('.new-folder')).toBeVisible()
     }
     await expect(page.locator('.page-status-overview')).toBeVisible()

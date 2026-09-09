@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(id);
+CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id, id);
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,

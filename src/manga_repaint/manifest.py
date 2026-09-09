@@ -127,10 +127,15 @@ def _now() -> str:
 
 
 class Manifest:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, initialize: bool = True):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._existing_only = not initialize
+        if not initialize:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             columns = {
@@ -166,7 +171,13 @@ class Manifest:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=30)
+        # Existing manifests must not be silently recreated during a directory
+        # swap or an invalid read request. Schema initialization belongs only
+        # to explicit creation and startup, never to preview/page GETs.
+        connection = (
+            sqlite3.connect(self.path.resolve().as_uri() + "?mode=rw", uri=True, timeout=30)
+            if self._existing_only else sqlite3.connect(self.path, timeout=30)
+        )
         connection.row_factory = sqlite3.Row
         try:
             yield connection

@@ -1,4 +1,6 @@
 import { ChangeEvent, DragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactElement, type WheelEvent as ReactWheelEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { readerCache, ReaderImage, ReaderThumbnail } from './readerAssets'
+import { ContinuousReader, readingUrl, placeholderUrl } from './ContinuousReader'
 
 type Descriptor = {
   id: string
@@ -86,6 +88,12 @@ type LibraryTree = {
 }
 
 type Page = {
+  width?: number
+  height?: number
+  source_reading_url?: string | null
+  final_reading_url?: string | null
+  source_preview_url?: string | null
+  final_preview_url?: string | null
   page_index: number
   status: string
   completed_units?: number
@@ -203,6 +211,9 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     const data = await response.json().catch(() => ({}))
     throw new Error(data.detail || `请求失败 ${response.status}`)
+  }
+  if (!response.headers.get('content-type')?.includes('application/json')) {
+    throw new Error('登录可能已过期，请重新登录；本地服务离线时请稍后重试')
   }
   return response.json()
 }
@@ -405,6 +416,9 @@ function App() {
   const [health, setHealth] = useState<Record<string, EngineHealth>>({})
   const [logs, setLogs] = useState<ActivityLog[]>([])
   const [rawLogs, setRawLogs] = useState<RawLog[]>([])
+  const rawLogScope = useRef('')
+  const rawLogCursor = useRef<number | undefined>(undefined)
+  const [pagesJobId, setPagesJobId] = useState<string | null>(null)
   const [gpuMetrics, setGpuMetrics] = useState<GpuMetrics | null>(null)
   const [logKind, setLogKind] = useState<'activity' | 'raw' | 'gpu'>('activity')
   const [logLevel, setLogLevel] = useState('all')
@@ -418,7 +432,10 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [progressOpen, setProgressOpen] = useState(true)
   const [previewDark, setPreviewDark] = useState(true)
-  const [previewMode, setPreviewMode] = useState<'compare' | 'source' | 'final' | 'mask'>('compare')
+  const [previewMode, setPreviewMode] = useState<'compare' | 'source' | 'final' | 'mask'>('final')
+  const [readerMode, setReaderMode] = useState<'paged' | 'vertical'>(() => localStorage.getItem('paneltone-reader-mode') === 'vertical' ? 'vertical' : 'paged')
+  const [readerDetail, setReaderDetail] = useState(false)
+  const [readerJump, setReaderJump] = useState(0)
   const [compare, setCompare] = useState(50)
   const [zoom, setZoom] = useState<'fit' | '50' | '100' | '200'>('fit')
   const [canvasScale, setCanvasScale] = useState(1)
@@ -426,8 +443,8 @@ function App() {
   const [pageLoading, setPageLoading] = useState(false)
   const [downloadBusy, setDownloadBusy] = useState(false)
   const [readyNotice, setReadyNotice] = useState<number | null>(null)
-  const [leftCollapsed, setLeftCollapsed] = useState(() => localStorage.getItem('paneltone.leftCollapsed') === '1')
-  const [rightCollapsed, setRightCollapsed] = useState(() => localStorage.getItem('paneltone.rightCollapsed') === '1')
+  const [leftCollapsed, setLeftCollapsed] = useState(() => innerWidth < 1100 || localStorage.getItem('paneltone.leftCollapsed') === '1')
+  const [rightCollapsed, setRightCollapsed] = useState(() => innerWidth < 1100 || localStorage.getItem('paneltone.rightCollapsed') === '1')
   const [taskMenuOpen, setTaskMenuOpen] = useState(false)
   const [mobileTab, setMobileTab] = useState<'books' | 'preview' | 'settings' | 'progress'>('preview')
   const [largeText, setLargeText] = useState(() => localStorage.getItem('paneltone.largeText') !== '0')
@@ -461,11 +478,6 @@ function App() {
   const pendingEventRefreshRef = useRef({ jobs: false, library: false, pages: false, logs: false, health: false })
   const pageLoadCountRef = useRef(0)
   const pageLoadTargetRef = useRef(1)
-  const prefetchQueueRef = useRef<string[]>([])
-  const prefetchActiveRef = useRef(0)
-  const prefetchedUrlsRef = useRef(new Set<string>())
-  const prefetchGenerationRef = useRef(0)
-  const decodedImagesRef = useRef(new Map<string, HTMLImageElement>())
   const downloadBusyRef = useRef(false)
   const gestureRef = useRef({
     pointers: new Map<number, { x: number; y: number }>(),
@@ -476,9 +488,9 @@ function App() {
   })
 
   const selected = jobs.find(job => job.id === selectedId) || jobs[0] || null
-  const currentPage = pages.find(page => page.page_index === pageIndex) || pages[0]
-  const currentSourceUrl = currentPage?.source_display_url || currentPage?.source_url || null
-  const currentResultUrl = currentPage?.final_display_url || currentPage?.final_url || currentPage?.preview_url || null
+  const currentPage = pagesJobId === selected?.id ? pages.find(page => page.page_index === pageIndex) || pages[0] : undefined
+  const currentSourceUrl = currentPage ? readingUrl(currentPage, 'source', readerDetail) : null
+  const currentResultUrl = currentPage ? readingUrl(currentPage, 'final', readerDetail) : null
   const selectedEngine = typeof selected?.spec.engine === 'string' ? selected.spec.engine : null
   const activeEngine = selectedEngine || 'palette'
   const modelHealth = health[activeEngine]
@@ -520,6 +532,12 @@ function App() {
   useEffect(() => { logKindRef.current = logKind }, [logKind])
   useEffect(() => { localStorage.setItem('paneltone.leftCollapsed', leftCollapsed ? '1' : '0') }, [leftCollapsed])
   useEffect(() => { localStorage.setItem('paneltone.rightCollapsed', rightCollapsed ? '1' : '0') }, [rightCollapsed])
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 760px) and (max-width: 1099px)')
+    const enteringDrawer = () => { if (media.matches) { setLeftCollapsed(true); setRightCollapsed(true) } }
+    media.addEventListener('change', enteringDrawer)
+    return () => media.removeEventListener('change', enteringDrawer)
+  }, [])
   useEffect(() => { localStorage.setItem('paneltone.largeText', largeText ? '1' : '0') }, [largeText])
   useEffect(() => {
     const handleKeyboard = (event: globalThis.KeyboardEvent) => {
@@ -615,10 +633,19 @@ function App() {
 
   async function refreshRawLogs(jobId = selectedRef.current) {
     const requestId = ++rawLogsRequestRef.current
-    const query = new URLSearchParams({ kind: logKind, limit: '80' })
-    if (jobId && logKind !== 'gpu') query.set('job_id', jobId)
+    const kind = logKindRef.current
+    const scope = `${kind}:${kind === 'gpu' ? 'global' : jobId}`
+    if (scope !== rawLogScope.current) {
+      rawLogScope.current = scope; rawLogCursor.current = undefined; setRawLogs([])
+    }
+    const query = new URLSearchParams({ kind, limit: '80' })
+    if (jobId && kind !== 'gpu') query.set('job_id', jobId)
+    if (rawLogCursor.current != null) query.set('after', String(rawLogCursor.current))
     const result = await api<RawLog[]>(`/api/logs?${query.toString()}`)
-    if (requestId === rawLogsRequestRef.current) setRawLogs(result)
+    if (requestId === rawLogsRequestRef.current && scope === rawLogScope.current) {
+      for (const row of result) if (row.id != null) rawLogCursor.current = Math.max(rawLogCursor.current || 0, row.id)
+      setRawLogs(previous => [...new Map([...previous, ...result].map(row => [row.id ?? `${row.timestamp}:${row.message}`, row])).values()].slice(-80))
+    }
   }
 
   async function refreshGpu() {
@@ -646,6 +673,7 @@ function App() {
       const result = await api<Page[]>(`/api/jobs/${jobId}/pages`, { signal: controller.signal })
       if (requestId !== pagesRequestRef.current || jobId !== selectedRef.current) return
       pagesRef.current = result
+      setPagesJobId(jobId)
       setPages(result)
       const manuallySelected = manualPageSelectionRef.current.has(jobId)
       const selectedPage = pageSelectionRef.current.get(jobId)
@@ -654,7 +682,8 @@ function App() {
         return
       }
       if (!manuallySelected) {
-        const readyPage = latestReadyPageIndex(jobs.find(job => job.id === jobId) || null, result)
+        const job = jobs.find(item => item.id === jobId)
+        const readyPage = job?.status === 'completed' ? (result[0]?.page_index || 0) : latestReadyPageIndex(job || null, result)
         setPageIndex(readyPage)
         pageSelectionRef.current.set(jobId, readyPage)
         return
@@ -695,66 +724,21 @@ function App() {
     }, 160)
   }
 
-  function pumpPrefetchQueue() {
-    while (prefetchActiveRef.current < 2 && prefetchQueueRef.current.length) {
-      const url = prefetchQueueRef.current.shift()
-      if (!url) continue
-      const generation = prefetchGenerationRef.current
-      prefetchActiveRef.current += 1
-      const image = new Image()
-      image.decoding = 'async'
-      const finish = () => {
-        prefetchActiveRef.current = Math.max(0, prefetchActiveRef.current - 1)
-        pumpPrefetchQueue()
-      }
-      image.onload = () => {
-        void image.decode().catch(() => undefined).finally(() => {
-          if (generation === prefetchGenerationRef.current) {
-            decodedImagesRef.current.delete(url)
-            decodedImagesRef.current.set(url, image)
-            while (decodedImagesRef.current.size > 8) {
-              const oldest = decodedImagesRef.current.keys().next().value
-              if (!oldest) break
-              decodedImagesRef.current.delete(oldest)
-            }
-          }
-          finish()
-        })
-      }
-      image.onerror = finish
-      image.src = url
-    }
-  }
-
-  function clearPrefetchQueue() {
-    prefetchGenerationRef.current += 1
-    prefetchQueueRef.current = []
-    prefetchedUrlsRef.current.clear()
-    decodedImagesRef.current.clear()
-  }
-
-  function queueImagePrefetch(url: string | null | undefined) {
-    if (!url || prefetchedUrlsRef.current.has(url)) return
-    prefetchedUrlsRef.current.add(url)
-    prefetchQueueRef.current.push(url)
-    pumpPrefetchQueue()
-  }
+  function clearPrefetchQueue() { readerCache.prefetch([]) }
 
   function prefetchPageAssets(jobId: string | null, index: number, sourcePages = pagesRef.current) {
     if (!jobId) return
-    const offsets = [0, 1, -1, 2, -2]
-    for (const offset of offsets) {
+    const urls: string[] = []
+    for (const offset of [0, 1, -1, 2]) {
       const page = sourcePages.find(item => item.page_index === index + offset)
       if (!page) continue
-      if (previewMode === 'source' || previewMode === 'mask') {
-        queueImagePrefetch(page.source_display_url || page.source_url)
-      } else if (previewMode === 'final') {
-        queueImagePrefetch(page.final_display_url || page.final_url || page.preview_url)
-      } else {
-        queueImagePrefetch(page.source_display_url || page.source_url)
-        queueImagePrefetch(page.final_display_url || page.final_url || page.preview_url)
+      if (previewMode !== 'final') urls.push(readingUrl(page, 'source', readerDetail)!)
+      if (previewMode === 'final' || previewMode === 'compare') {
+        const final = readingUrl(page, 'final', readerDetail)
+        if (final) urls.push(final)
       }
     }
+    readerCache.prefetch(urls.filter(Boolean))
   }
 
   function selectPage(index: number) {
@@ -765,6 +749,7 @@ function App() {
     setCanvasPan({ x: 0, y: 0 })
     pageIndexRef.current = index
     setPageIndex(index)
+    setReaderJump(value => value + 1)
     setReadyNotice(current => current === index ? null : current)
     prefetchPageAssets(selected.id, index)
   }
@@ -808,12 +793,13 @@ function App() {
   }
 
   function handleCanvasWheel(event: ReactWheelEvent<HTMLDivElement>) {
-    if (!currentPage) return
+    if (!currentPage || readerMode === 'vertical') return
     event.preventDefault()
     updateScale(canvasScale * Math.exp(-event.deltaY * 0.001))
   }
 
   function handleCanvasPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (readerMode === 'vertical') return
     const target = event.target as HTMLElement
     if (target.closest('button, a')) return
     // The compare range covers the whole stage so it can be dragged on desktop.
@@ -853,7 +839,7 @@ function App() {
     const point = gesture.pointers.get(event.pointerId)
     const wasSingle = gesture.pointers.size === 1
     gesture.pointers.delete(event.pointerId)
-    if (wasSingle && point && canvasScale <= 1.05) {
+    if (event.type !== 'pointercancel' && wasSingle && point && canvasScale <= 1.05) {
       const dx = point.x - gesture.swipeStart.x
       const dy = point.y - gesture.swipeStart.y
       if (Math.abs(dx) >= 70 && Math.abs(dx) > Math.abs(dy) * 1.25) movePage(dx < 0 ? 1 : -1)
@@ -864,7 +850,9 @@ function App() {
 
   useEffect(() => {
     clearPrefetchQueue()
-  }, [selected?.id, previewMode])
+  }, [selected?.id, previewMode, readerDetail, readerMode])
+
+  useEffect(() => { localStorage.setItem('paneltone-reader-mode', readerMode) }, [readerMode])
 
   useEffect(() => {
     if (!currentPage) return
@@ -873,7 +861,7 @@ function App() {
     pageLoadTargetRef.current = previewMode === 'compare' && Boolean(currentResultUrl) ? 2 : 1
     setPageLoading(imageWillLoad)
     prefetchPageAssets(selected?.id || null, pageIndex)
-  }, [selected?.id, pageIndex, currentPage?.asset_revision, previewMode, currentResultUrl])
+  }, [selected?.id, pageIndex, currentPage?.asset_revision, previewMode, currentResultUrl, readerDetail, readerMode])
 
   useEffect(() => {
     activeFilmstripPageRef.current?.scrollIntoView({
@@ -894,6 +882,10 @@ function App() {
     const assetRevision = String(data.asset_revision || Date.now())
     const readyPage: Page = {
       page_index: index,
+      source_reading_url: `/api/assets/jobs/${jobId}/pages/${index}/source.webp?v=${assetRevision}&size=reader`,
+      source_preview_url: `/api/assets/jobs/${jobId}/pages/${index}/source.webp?v=${assetRevision}&size=preview`,
+      final_reading_url: hasPreview ? null : `/api/assets/jobs/${jobId}/pages/${index}/final.webp?v=${assetRevision}&size=reader`,
+      final_preview_url: hasPreview ? null : `/api/assets/jobs/${jobId}/pages/${index}/final.webp?v=${assetRevision}&size=preview`,
       status: typeof data.status === 'string' ? data.status : hasPreview ? 'processing' : 'qa_passed',
       completed_units: Number(data.completed_units || 0),
       total_units: Number(data.total_units || data.completed_units || 0),
@@ -918,6 +910,7 @@ function App() {
         : [...pagesRef.current, readyPage].sort((left, right) => left.page_index - right.page_index)
     })()
     setPages(pagesRef.current)
+    setPagesJobId(jobId)
     const manuallySelected = manualPageSelectionRef.current.has(jobId)
     if (!manuallySelected) {
       const latest = latestReadyPageIndex(null, pagesRef.current)
@@ -976,14 +969,20 @@ function App() {
   }, [])
 
   useEffect(() => {
+    setPages([])
+    pagesRef.current = []
     refreshPages(selected?.id).catch(() => setPages([]))
     refreshLogs(selected?.id).catch(() => setLogs([]))
   }, [selected?.id])
 
   useEffect(() => {
     if (logKind === 'activity') return
+    rawLogCursor.current = undefined
     refreshRawLogs(selected?.id).catch(() => setRawLogs([]))
-  }, [selected?.id, logKind])
+    if (!progressOpen) return
+    const timer = window.setInterval(() => refreshRawLogs(selectedRef.current).catch(() => undefined), 10000)
+    return () => clearInterval(timer)
+  }, [selected?.id, logKind, progressOpen])
 
   const visibleJobs = useMemo(() => jobs.filter(job => {
     if (filter === 'active') return ['queued', 'running', 'waiting_model'].includes(job.status)
@@ -1355,8 +1354,13 @@ function App() {
                   {([['compare', '对比'], ['source', '原图'], ['final', '结果'], ['mask', '遮罩']] as const).map(([id, label]) =>
                     <button key={id} className={previewMode === id ? 'active' : ''} onClick={() => setPreviewMode(id)}>{label}</button>)}
                 </div>
+                <div className="segmented reader-modes" aria-label="阅读方式">
+                  <button aria-pressed={readerMode === 'paged'} className={readerMode === 'paged' ? 'active' : ''} onClick={() => setReaderMode('paged')}>单页翻阅</button>
+                  <button aria-pressed={readerMode === 'vertical'} className={readerMode === 'vertical' ? 'active' : ''} onClick={() => setReaderMode('vertical')}>垂直连读</button>
+                </div>
+                <button className="plain-button" aria-pressed={readerDetail} title="日常阅读使用轻量图；高清用于查看细节，下载始终保留原图" onClick={() => setReaderDetail(value => !value)}>{readerDetail ? '高清细节' : '流畅读图'}</button>
                 <button className="plain-button" onClick={() => setPreviewDark(value => !value)}>{previewDark ? '白底' : '深色底'}</button>
-                <div className="segmented zoom-controls" aria-label="缩放">
+                <div className={`segmented zoom-controls ${readerMode === 'vertical' ? 'reader-hidden' : ''}`} aria-label="缩放">
                   {(['fit', '50', '100', '200'] as const).map(value => <button key={value} className={zoom === value && ((value === 'fit' && canvasScale === 1) || value !== 'fit') ? 'active' : ''} onClick={() => setZoomPreset(value)}>{value === 'fit' ? '适配' : `${value}%`}</button>)}
                   <span className="zoom-readout" aria-live="polite">{Math.round(canvasScale * 100)}%</span>
                 </div>
@@ -1379,15 +1383,26 @@ function App() {
                 </div>}
               </div>
             </div>
-            <div className={`canvas canvas-gesture-zone ${previewDark ? 'dark' : ''} zoom-${zoom}`} onWheel={handleCanvasWheel} onPointerDown={handleCanvasPointerDown} onPointerMove={handleCanvasPointerMove} onPointerUp={handleCanvasPointerUp} onPointerCancel={handleCanvasPointerUp}>
+            <div className={`canvas canvas-gesture-zone reader-${readerMode} ${previewDark ? 'dark' : ''} zoom-${zoom}`} onWheel={handleCanvasWheel} onPointerDown={handleCanvasPointerDown} onPointerMove={handleCanvasPointerMove} onPointerUp={handleCanvasPointerUp} onPointerCancel={handleCanvasPointerUp}>
+              {readerMode === 'vertical' && <ContinuousReader key={selected.id} pages={pages} pageIndex={pageIndex} jumpToken={readerJump} jobId={selected.id} mode={previewMode} detail={readerDetail} onPageChange={index => {
+                manualPageSelectionRef.current.add(selected.id); pageSelectionRef.current.set(selected.id, index)
+                pageIndexRef.current = index; setPageIndex(index)
+              }} />}
               {currentPage ? <>
-                {pageLoading && currentPage.thumbnail_url && <img className="page-placeholder" src={freshAssetUrl(currentPage.thumbnail_url, currentPage.asset_revision || 'placeholder')} alt="" aria-hidden="true" />}
+                {readerMode === 'paged' && <div className="paged-reader-content">
                 {previewMode === 'compare' && currentResultUrl ? <div className="compare-stage">
-                  <img loading="eager" decoding="async" fetchPriority="high" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} />
-                  <div className="compare-result" style={{ clipPath: `inset(0 0 0 ${compare}%)`, transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}><img loading="eager" decoding="async" fetchPriority="high" src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /></div>
+                  <ReaderImage key={currentSourceUrl!} url={currentSourceUrl!} placeholder={placeholderUrl(currentPage, 'source')} style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} alt={`第 ${currentPage.page_index + 1} 页原图`} onReady={markPageImageLoaded} />
+                  <div className="compare-result" style={{ clipPath: `inset(0 0 0 ${compare}%)`, transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}><ReaderImage key={currentResultUrl} url={currentResultUrl} placeholder={placeholderUrl(currentPage, 'final')} alt={`第 ${currentPage.page_index + 1} 页结果`} onReady={markPageImageLoaded} /></div>
                   <div className="compare-line" style={{ left: `${compare}%` }}><span /></div>
                   <input className="compare-range" aria-label="拖动比较原图和结果" type="range" min="0" max="100" value={compare} onChange={event => setCompare(Number(event.target.value))} />
-                 </div> : previewMode === 'source' ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentSourceUrl || currentPage.source_url} alt={`第 ${currentPage.page_index + 1} 页原图`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : previewMode === 'mask' ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page mask-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={`/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask`} alt={`第 ${currentPage.page_index + 1} 页保护遮罩`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : currentResultUrl ? <img loading="eager" decoding="async" fetchPriority="high" className="single-page" style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }} src={currentResultUrl} alt={`第 ${currentPage.page_index + 1} 页结果`} onLoad={markPageImageLoaded} onError={() => setPageLoading(false)} /> : waitingForModel ? <div className="waiting-page model-waiting"><span className="waiting-symbol">!</span><strong>模型服务未连接</strong><span>当前没有页面在处理，服务恢复后会自动继续</span>{selected.error && <small className="waiting-detail">{selected.error}</small>}<button onClick={() => refreshHealth()}>重新检测模型</button></div> : <div className="waiting-page"><div className="spinner" /><strong>{modelLoading ? '正在加载模型权重' : waitingPageTitle}</strong><span>{modelLoading ? '首次启动需要准备模型，完成后才会生成第 1 页' : waitingPageHint}</span>{modelLoading && <div className="model-stage-progress">{typeof modelHealth?.progress === 'number' ? <><progress max="100" value={modelHealth.progress} /><strong>{modelHealth.progress.toFixed(0)}%</strong></> : <small>{modelHealth?.stage || modelHealth?.message || '当前服务只提供阶段状态，未提供可靠总量'}</small>}</div>}</div>}
+                 </div> : previewMode === 'source' || previewMode === 'mask' || currentResultUrl ? <div className="single-page-stage">
+                  <ReaderImage key={`${selected.id}-${pageIndex}-${previewMode}-${readerDetail}-${currentPage.asset_revision}`}
+                    url={previewMode === 'mask' ? `/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask` : (previewMode === 'source' ? currentSourceUrl! : currentResultUrl!)}
+                    placeholder={placeholderUrl(currentPage, previewMode === 'source' || previewMode === 'mask' ? 'source' : 'final')}
+                    style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}
+                    alt={`第 ${currentPage.page_index + 1} 页${previewMode === 'source' ? '原图' : previewMode === 'mask' ? '保护遮罩' : '结果'}`} onReady={markPageImageLoaded} />
+                 </div> : waitingForModel ? <div className="waiting-page model-waiting"><span className="waiting-symbol">!</span><strong>模型服务未连接</strong><span>当前没有页面在处理，服务恢复后会自动继续</span>{selected.error && <small className="waiting-detail">{selected.error}</small>}<button onClick={() => refreshHealth()}>重新检测模型</button></div> : <div className="waiting-page"><div className="spinner" /><strong>{modelLoading ? '正在加载模型权重' : waitingPageTitle}</strong><span>{modelLoading ? '首次启动需要准备模型，完成后才会生成第 1 页' : waitingPageHint}</span>{modelLoading && <div className="model-stage-progress">{typeof modelHealth?.progress === 'number' ? <><progress max="100" value={modelHealth.progress} /><strong>{modelHealth.progress.toFixed(0)}%</strong></> : <small>{modelHealth?.stage || modelHealth?.message || '当前服务只提供阶段状态，未提供可靠总量'}</small>}</div>}</div>}
+                </div>}
               <button className="canvas-page-nav previous" onClick={() => movePage(-1)} disabled={pages.findIndex(page => page.page_index === pageIndex) <= 0} aria-label="上一页" title="上一页"><Icon name="chevron-left" /></button>
               <button className="canvas-page-nav next" onClick={() => movePage(1)} disabled={pages.findIndex(page => page.page_index === pageIndex) < 0 || pages.findIndex(page => page.page_index === pageIndex) >= pages.length - 1} aria-label="下一页" title="下一页"><Icon name="chevron-right" /></button>
               <form className="canvas-page-count canvas-page-jump" aria-label="页面跳转" noValidate onSubmit={submitPageJump} onPointerDown={event => event.stopPropagation()}>
@@ -1395,7 +1410,7 @@ function App() {
                 <span className="canvas-page-total">/ {pages.length}</span>
                 <button type="submit">跳转</button>
               </form>
-              {pageLoading && <div className="page-loading" role="status"><span className="spinner" />正在载入第 {currentPage.page_index + 1} 页</div>}
+              {pageLoading && readerMode === 'paged' && <div className="page-loading" role="status"><span className="spinner" />正在载入第 {currentPage.page_index + 1} 页</div>}
             </> : <div className="waiting-page"><strong>正在准备页面</strong><span>页面展开后会显示缩略图</span></div>}
           </div>
             {readyNotice != null && <div className="page-ready-notice" role="status" aria-live="polite"><span>第 {readyNotice + 1} 页已完成，可以预览</span><button onClick={() => { manualPageSelectionRef.current.add(selected.id); pageSelectionRef.current.set(selected.id, readyNotice); setPageIndex(readyNotice); setReadyNotice(null) }}>查看这一页</button><button className="notice-dismiss" aria-label="关闭新页面提示" onClick={() => setReadyNotice(null)}>×</button></div>}
@@ -1403,7 +1418,7 @@ function App() {
               <div className="filmstrip-viewport">
                 <div className="filmstrip-pages">
                   {pages.map(page => <button key={page.page_index} ref={page.page_index === pageIndex ? activeFilmstripPageRef : undefined} className={page.page_index === pageIndex ? 'active' : ''} onClick={() => selectPage(page.page_index)}>
-                    <img loading="lazy" decoding="async" src={page.thumbnail_url || page.source_url} alt={`第 ${page.page_index + 1} 页`} /><span>{page.page_index + 1}</span>{!page.final_url && page.preview_url ? <i className="page-state-mark processing" title="已有预览，尚未通过整页检查" aria-label="处理中">◌</i> : ['failed', 'qa_failed', 'needs_attention'].includes(page.status) ? <i className="page-state-mark failed" aria-label="失败" /> : null}
+                    <ReaderThumbnail url={page.final_preview_url || page.source_preview_url || page.thumbnail_url || undefined} alt={`第 ${page.page_index + 1} 页`} /><span>{page.page_index + 1}</span>{!page.final_url && page.preview_url ? <i className="page-state-mark processing" title="已有预览，尚未通过整页检查" aria-label="处理中">◌</i> : ['failed', 'qa_failed', 'needs_attention'].includes(page.status) ? <i className="page-state-mark failed" aria-label="失败" /> : null}
                   </button>)}
                 </div>
               </div>

@@ -2057,11 +2057,29 @@ def create_app(
                     {
                         "page_index": int(page["page_index"]),
                         "status": page["status"],
+                        "width": int(page["width"]),
+                        "height": int(page["height"]),
                         "completed_units": sum(unit["status"] == "qa_passed" for unit in units),
                         "total_units": len(units),
                         "error": next((unit["error"] for unit in units if unit["error"]), None),
                         "asset_revision": revision,
                         "source_url": derived_asset_url(source_path, source_base, revision),
+                        "source_reading_url": (
+                            f"/api/assets/jobs/{job_id}/pages/{page['page_index']}/source.webp"
+                            f"?v={revision or 0}&size=reader"
+                        ),
+                        "source_preview_url": (
+                            f"/api/assets/jobs/{job_id}/pages/{page['page_index']}/source.webp"
+                            f"?v={revision or 0}&size=preview"
+                        ),
+                        "final_reading_url": (
+                            f"/api/assets/jobs/{job_id}/pages/{page['page_index']}/final.webp"
+                            f"?v={revision or 0}&size=reader"
+                        ) if has_final else None,
+                        "final_preview_url": (
+                            f"/api/assets/jobs/{job_id}/pages/{page['page_index']}/final.webp"
+                            f"?v={revision or 0}&size=preview"
+                        ) if has_final else None,
                         "source_display_url": (
                             f"/api/assets/jobs/{job_id}/pages/"
                             f"{page['page_index']}/source.webp?v={revision or 0}"
@@ -2310,9 +2328,13 @@ def create_app(
         page_index: int,
         variant: Literal["source", "final"],
         v: str | None = None,
+        size: Literal["detail", "reader", "preview"] = "detail",
     ) -> FileResponse | Response:
         try:
-            path = manager.display_asset(job_id, page_index, variant)
+            path = (
+                manager.display_asset(job_id, page_index, variant) if size == "detail"
+                else manager.reading_asset(job_id, page_index, variant, size)
+            )
             cache_control = (
                 "private, max-age=31536000, immutable"
                 if v
@@ -2324,7 +2346,8 @@ def create_app(
                 headers={"Cache-Control": cache_control},
             )
         except DisplayAssetPending:
-            manager.schedule_display_asset(job_id, page_index, variant)
+            if size == "detail":
+                manager.schedule_display_asset(job_id, page_index, variant)
             return JSONResponse(
                 {
                     "status": "preparing",
@@ -2333,7 +2356,7 @@ def create_app(
                     "message": "页面显示资源正在准备，请稍后重试",
                 },
                 status_code=202,
-                headers={"Cache-Control": "no-store, max-age=0"},
+                headers={"Cache-Control": "no-store, max-age=0", "Retry-After": "1"},
             )
         except (KeyError, StopIteration, FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="页面显示图尚不可用") from exc

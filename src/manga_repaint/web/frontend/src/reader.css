@@ -1,0 +1,38 @@
+/* Reader-only layout. The workspace's sidebar breakpoints remain in styles.css. */
+.reader-hidden { display: none !important; }
+.app-shell .preview-panel { grid-template-rows: max-content minmax(0, 1fr) 102px; }
+.app-shell .preview-toolbar { min-height: 64px; flex-wrap: wrap; padding-block: 8px; }
+.app-shell .preview-toolbar .toolbar-actions { flex-wrap: wrap; min-width: 0; gap: 6px; }
+.app-shell .preview-toolbar .title-block { flex: 1 1 140px; min-width: 0; }
+.app-shell .preview-toolbar .reader-modes { display: flex; }
+.paged-reader-content, .single-page-stage { position: relative; width: 100%; height: 100%; min-height: 0; min-width: 0; }
+.single-page-stage { display: flex; align-items: center; justify-content: center; }
+.single-page-stage > .reader-image { display: block; width: 100%; height: 100%; object-fit: contain; transform-origin: center; }
+.reader-image.placeholder { opacity: .8; }
+.reader-image-status { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); z-index: 4; max-width: 90%; padding: 5px 10px; background: #fff; color: #222; border-radius: 6px; font-size: 12px; text-align: center; }
+.reader-image-status.error { border: 1px solid #a53b32; }
+.reader-image-status button { margin-left: 6px; padding: 4px 8px; }
+.canvas.reader-paged > .page-loading { display: none; } /* Per-image loading/error belongs to the actual page. */
+.canvas.reader-vertical { display: block; padding: 0 0 56px; overflow: hidden; touch-action: pan-y pinch-zoom; }
+.continuous-reader { height: 100%; width: 100%; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; touch-action: pan-y pinch-zoom; }
+.continuous-track { position: relative; width: 100%; }
+.continuous-page { position: absolute; left: 50%; transform: translateX(-50%); margin: 0; background: white; }
+.continuous-page > .reader-image, .continuous-compare .reader-image { width: 100%; height: 100%; object-fit: contain; display: block; }
+.continuous-page footer { position: absolute; top: 100%; width: 100%; height: 36px; display: grid; place-items: center; color: #555; background: #eee; font-size: 12px; }
+.continuous-compare, .continuous-result { position: absolute; inset: 0; }
+.continuous-compare > input { position: absolute; bottom: 8px; left: 20%; width: 60%; z-index: 5; touch-action: pan-x; }
+.canvas.reader-vertical > .canvas-page-nav { top: auto; bottom: 4px; transform: none; height: 48px; }
+.canvas.reader-vertical > .canvas-page-count { bottom: 12px; }
+@media (max-width: 759px) {
+  .app-shell .preview-panel { grid-template-rows: max-content minmax(0, 1fr) 82px; }
+  .app-shell .preview-toolbar .title-block { display: none; }
+  .app-shell .preview-toolbar > .toolbar-actions > .plain-button { display: block; }
+  .app-shell .preview-toolbar { min-height: 0; gap: 4px; padding: 6px; }
+  .app-shell .preview-toolbar .toolbar-actions { gap: 4px; }
+  .canvas.reader-paged { --canvas-side-gutter: 8px; padding: 8px 8px 58px; }
+  .canvas.reader-paged > .canvas-page-nav { top: auto; bottom: 4px; transform: none; height: 48px; }
+  .canvas.reader-paged > .canvas-page-count { bottom: 12px; }
+  .filmstrip.filmstrip-shell { padding-block: 6px; }
+  .filmstrip-pages > button { height: 62px; }
+  .filmstrip-pages > button > img { height: 40px; }
+}

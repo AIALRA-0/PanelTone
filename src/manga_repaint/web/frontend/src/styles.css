@@ -391,13 +391,13 @@ button, input, select, textarea { font-size: 14px; }
 .rail-toggle { position: absolute; z-index: 3; top: 12px; display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 1px solid var(--line-dark); border-radius: 6px; background: var(--panel); cursor: pointer; font-size: 22px; line-height: 1; }
 .left-toggle { right: 10px; }
 .right-toggle { left: 10px; }
-.workspace.left-collapsed .library-panel > :not(.rail-toggle), .workspace.right-collapsed .inspector-panel > :not(.rail-toggle) { visibility: hidden; pointer-events: none; }
-.workspace.left-collapsed .library-panel .rail-toggle, .workspace.right-collapsed .inspector-panel .rail-toggle { visibility: visible; pointer-events: auto; }
-.workspace.left-collapsed .library-panel .job-list, .workspace.left-collapsed .library-panel .job-item, .workspace.left-collapsed .library-panel .job-row, .workspace.left-collapsed .library-panel .job-cover { visibility: visible; pointer-events: auto; }
-.workspace.left-collapsed .library-panel .job-list { pointer-events: auto; padding: 52px 6px 8px; }
-.workspace.left-collapsed .library-panel .job-row { display: grid; }
-.workspace.left-collapsed .library-panel .job-copy, .workspace.left-collapsed .library-panel .status-shape { display: none; }
-.workspace.left-collapsed .library-panel, .workspace.right-collapsed .inspector-panel { overflow: hidden; }
+
+
+
+
+
+
+
 .workspace.left-collapsed .left-toggle { right: 14px; }
 .workspace.right-collapsed .right-toggle { left: 14px; }
 .panel-heading { padding: 20px 16px 14px; }
@@ -630,12 +630,7 @@ button, input, select, textarea { font-size: 14px; }
 .activity-log > div { min-width: 0; overflow: auto; }
 .activity-log footer { min-width: 0; overflow: hidden; }
 .activity-log footer span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.workspace.left-collapsed .library-panel > :not(.rail-toggle):not(.rail-action),
-.workspace.right-collapsed .inspector-panel > :not(.rail-toggle) {
-  display: none !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
-}
+
 .rail-action {
   display: none;
   position: absolute;
@@ -655,13 +650,8 @@ button, input, select, textarea { font-size: 14px; }
 }
 .rail-action span { font-size: 15px; line-height: 1; }
 .rail-action small { color: var(--muted); font-size: 10px; line-height: 1; }
-.workspace.left-collapsed .library-panel .rail-action { display: grid; visibility: visible; pointer-events: auto; }
-.workspace.left-collapsed .library-panel .rail-toggle,
-.workspace.right-collapsed .inspector-panel .rail-toggle {
-  display: grid;
-  visibility: visible;
-  pointer-events: auto;
-}
+
+
 .topbar-left-tools { justify-self: start; }
 .topbar .top-actions { justify-self: end; }
 
@@ -756,17 +746,8 @@ button, input, select, textarea { font-size: 14px; }
 .topbar .top-status { justify-self: center; min-width: 0; }
 .topbar .top-actions { justify-self: end; align-items: center; }
 .text-size-button { min-height: 36px; padding-inline: 10px; white-space: nowrap; }
-.workspace.left-collapsed .library-panel > :not(.rail-toggle),
-.workspace.right-collapsed .inspector-panel > :not(.rail-toggle) {
-  display: none !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
-}
-.workspace.left-collapsed .library-panel,
-.workspace.right-collapsed .inspector-panel {
-  overflow: hidden;
-  background: var(--paper);
-}
+
+
 
 /* The page number is a real row inside every thumbnail, never a trailing label. */
 .filmstrip button { justify-content: flex-start; align-items: stretch; gap: 4px; }
@@ -833,19 +814,8 @@ button, input, select, textarea { font-size: 14px; }
   padding-inline: 6px;
   white-space: nowrap;
 }
-.workspace.left-collapsed .library-panel > :not(.rail-toggle):not(.rail-action),
-.workspace.right-collapsed .inspector-panel > :not(.rail-toggle) {
-  display: none !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
-}
-.workspace.left-collapsed .library-panel .rail-toggle,
-.workspace.left-collapsed .library-panel .rail-action,
-.workspace.right-collapsed .inspector-panel .rail-toggle {
-  display: grid !important;
-  visibility: visible !important;
-  pointer-events: auto !important;
-}
+
+
 .rail-action { position: absolute; }
 
 @media (max-width: 759px) {
@@ -1403,8 +1373,6 @@ button, input, select, textarea { font-size: 14px; }
   .mobile-books .preview-panel, .mobile-books .inspector-panel,
   .mobile-preview .library-panel, .mobile-preview .inspector-panel,
   .mobile-settings .library-panel, .mobile-settings .preview-panel { display: none !important; }
-  .workspace.left-collapsed .library-panel > :not(.rail-toggle),
-  .workspace.right-collapsed .inspector-panel > :not(.rail-toggle) { display: revert !important; visibility: visible !important; pointer-events: auto !important; }
   .workspace .rail-toggle, .workspace .rail-action { display: none !important; }
   .job-list { display: flex; flex: 1 1 auto; flex-direction: column; align-content: flex-start; justify-content: flex-start; min-height: 0; }
   .job-item { flex: 0 0 auto; }
@@ -1437,4 +1405,9 @@ button, input, select, textarea { font-size: 14px; }
   .status-list { grid-template-columns: 1fr; max-height: 300px; }
   .activity-log { margin: 10px 0 0; max-height: 280px; }
   .mobile-nav { position: relative; z-index: 30; display: grid; }
+}
+
+@media (min-width: 1100px) {
+  .workspace.left-collapsed .library-panel,
+  .workspace.right-collapsed .inspector-panel { visibility: hidden; pointer-events: none; }
 }

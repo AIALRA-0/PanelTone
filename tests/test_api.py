@@ -64,6 +64,22 @@ def test_api_create_run_and_download(tmp_path: Path, manga_pages: Path) -> None:
         pages = client.get(f"/api/jobs/{job_id}/pages").json()
         assert pages[0]["source_display_url"].startswith("/api/assets/")
         assert pages[0]["final_display_url"].startswith("/api/assets/")
+        assert (pages[0]["width"], pages[0]["height"]) == (320, 420)
+        for variant in ("source", "final"):
+            for profile, budget in (("reading", 300), ("preview", 48)):
+                url = pages[0][f"{variant}_{profile}_url"]
+                for _ in range(100):
+                    small = client.get(url)
+                    if small.status_code != 202:
+                        break
+                    assert small.headers["retry-after"] == "1"
+                    assert "no-store" in small.headers["cache-control"]
+                    time.sleep(.02)
+                assert small.status_code == 200
+                assert small.headers["content-type"] == "image/webp"
+                assert "private" in small.headers["cache-control"]
+                assert "immutable" in small.headers["cache-control"]
+                assert len(small.content) <= budget * 1024
         display = client.get(pages[0]["final_display_url"])
         assert display.status_code == 200
         assert display.headers["content-type"] == "image/webp"
