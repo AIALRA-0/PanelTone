@@ -50,6 +50,14 @@ from .masks import (
     deterministic_protection_mask,
     save_mask,
 )
+from .material_render import (
+    MaterialPlan,
+    evaluate_material_render,
+    render_material_flats,
+)
+from .material_render import (
+    protection_mask as material_protection_mask,
+)
 from .models import DetailMode, JobMode, JobSpec, JobStatus, ProtectionMode
 from .panels import extract_panels
 from .presets import build_prompt, get_color_preset, get_style_preset, render_profile
@@ -1136,6 +1144,7 @@ class ProjectManager:
         reference_paths: list[Path] | None = None,
         palette_anchors: list[tuple[float, float, float]] | None = None,
         allow_legacy_candidate: bool = False,
+        material_plan: MaterialPlan | None = None,
     ) -> tuple[Image.Image, np.ndarray]:
         """Compose one generated unit and return its QA protection mask.
 
@@ -1143,6 +1152,25 @@ class ProjectManager:
         a CPU-only repair must produce the same pixels and QA boundary as a
         normal GPU run, including balanced and generative detail modes.
         """
+        if material_plan is not None:
+            # An explicit reviewed plan is the only new-renderer entry point
+            # Legacy/unresolved book sidecars are NOT silently promoted here
+            if spec.mode != JobMode.COLORIZE:
+                raise ValueError("material rendering is only supported for COLORIZE")
+            material_plan.validate(source)
+            if mask.shape != material_plan.protected.shape:
+                raise ValueError("runtime protection does not match reviewed material plan")
+            reviewed_protection = material_protection_mask(source, material_plan.protected)
+            if np.any(mask.astype(bool) & ~reviewed_protection):
+                # A newly broad semantic mask must not erase reviewed colour
+                # and then hide the resulting gray islands as "protected"
+                raise ValueError("runtime protection changed; material plan requires review")
+            final = render_material_flats(source, material_plan)
+            report = evaluate_material_render(source, final, material_plan)
+            if not report["passed"]:
+                raise ValueError("material plan requires review: " + ", ".join(report["reasons"]))
+            return final, reviewed_protection
+
         source_rgb = source.convert("RGB")
         generated_rgb = self._render_color_candidate(
             source,

@@ -91,6 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("list", help="List local jobs")
     subparsers.add_parser("health", help="Check configured engines")
 
+    material = subparsers.add_parser(
+        "material-render", help="Render a reviewed material bundle into a NEW isolated directory"
+    )
+    material.add_argument("source")
+    material.add_argument(
+        "plan", help="Reviewed plan.json with source-sized label/protection masks"
+    )
+    material.add_argument("output", help="New directory; existing paths are never overwritten")
+
     serve = subparsers.add_parser("serve", help="Start the local review application")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
@@ -100,6 +109,28 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "material-render":
+        # Standalone review must not construct a live manager or touch recovery
+        from PIL import Image
+
+        from .material_render import (
+            evaluate_material_render,
+            load_material_plan,
+            render_material_flats,
+        )
+
+        with Image.open(args.source) as image:
+            source = image.copy()
+        plan = load_material_plan(Path(args.plan), source)
+        final = render_material_flats(source, plan)
+        report = evaluate_material_render(source, final, plan)
+        output = Path(args.output)
+        output.mkdir(parents=True, exist_ok=False)
+        final.save(output / "preview.png")
+        (output / "qa.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        _print(report)
+        return 0 if report["passed"] else 2
 
     # The web server creates its own application manager.  Do not construct a
     # throw-away manager first: its startup recovery pass could observe a live
