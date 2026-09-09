@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-RENDERER_VERSION = "book-color-plan-v1"
+RENDERER_VERSION = "book-color-plan-v2-clean-flats"
 STATE_VERSION = 1
 _VALID_STATES = {
     "observed",
@@ -332,16 +332,26 @@ def build_segment_graph(
             )
         )
     neighbours: dict[str, set[str]] = {node.segment_id: set() for node in nodes}
-    for label in label_to_id:
-        label_mask = (labels == label).astype(np.uint8)
-        nearby = cv2.dilate(label_mask, np.ones((3, 3), np.uint8), iterations=1)
-        adjacent = set(int(value) for value in np.unique(labels[nearby > 0]))
-        for other in adjacent:
-            if other in label_to_id and other != label:
-                left = label_to_id[label]
-                right = label_to_id[other]
-                neighbours[left].add(right)
-                neighbours[right].add(left)
+    # The previous implementation scanned/dilated the entire image for EACH
+    # region. Screentone pages can have thousands of regions. Compare four
+    # undirected one-pixel offsets once instead: exactly the same 3x3 proximity
+    # rule, O(pixels) work, no geometry/palette or graph-hash change.
+    for left_labels, right_labels in (
+        (labels[:, :-1], labels[:, 1:]),
+        (labels[:-1, :], labels[1:, :]),
+        (labels[:-1, :-1], labels[1:, 1:]),
+        (labels[:-1, 1:], labels[1:, :-1]),
+    ):
+        touches = (left_labels != right_labels) & (left_labels > 0) & (right_labels > 0)
+        if not touches.any():
+            continue
+        pairs = np.unique(np.stack((left_labels[touches], right_labels[touches]), axis=1), axis=0)
+        for left_label, right_label in pairs:
+            if int(left_label) not in label_to_id or int(right_label) not in label_to_id:
+                continue
+            left, right = label_to_id[int(left_label)], label_to_id[int(right_label)]
+            neighbours[left].add(right)
+            neighbours[right].add(left)
     final_nodes = tuple(
         SegmentNode(
             segment_id=node.segment_id,

@@ -283,6 +283,58 @@ def test_geometry_locked_colorization_rejects_dimension_mismatch() -> None:
         composite_geometry_locked_colorization(source, generated, np.zeros((32, 32), dtype=bool))
 
 
+def test_clean_flats_reduce_stains_without_crossing_ink_or_changing_shading() -> None:
+    from manga_repaint.color import clean_region_flats, composite_reference_locked_colorization
+
+    gray = np.full((128, 128), 230, dtype=np.uint8)
+    gray[:, 63:66] = 0
+    rng = np.random.default_rng(9)
+    hue = np.full(gray.shape, 12, dtype=np.float32)
+    hue[:, 66:] = 100
+    hue += rng.normal(0, 2, gray.shape).astype(np.float32)
+    sat = rng.uniform(60, 180, gray.shape).astype(np.float32)
+    clean_hue, clean_sat = clean_region_flats(gray, hue, sat, gray == 0)
+    assert np.std(clean_sat[8:-8, 8:56]) < np.std(sat[8:-8, 8:56]) * .2
+    assert abs(float(np.median(clean_hue[:, :56])) - 12) < 1
+    assert abs(float(np.median(clean_hue[:, 74:])) - 100) < 1
+    source = Image.fromarray(gray).convert("RGB")
+    candidate = Image.fromarray(cv2.cvtColor(
+        np.dstack((hue, sat, np.full_like(hue, 240))).astype(np.uint8), cv2.COLOR_HSV2RGB
+    ))
+    result = np.asarray(composite_reference_locked_colorization(source, candidate, gray == 0))
+    assert np.array_equal(result.max(axis=2), gray)
+    assert np.array_equal(result[gray == 0], np.asarray(source)[gray == 0])
+
+
+def test_clean_flats_leave_multicolour_and_white_regions_alone() -> None:
+    from manga_repaint.color import clean_region_flats
+
+    gray = np.full((80, 80), 240, dtype=np.uint8)
+    hue = np.full(gray.shape, 10, dtype=np.float32)
+    hue[:, 40:] = 100
+    sat = np.full(gray.shape, 100, dtype=np.float32)
+    protected = np.zeros(gray.shape, dtype=bool)
+    h, s = clean_region_flats(gray, hue, sat, protected)
+    assert np.array_equal(h, hue) and np.array_equal(s, sat)
+    sat[:] = 0
+    _, s = clean_region_flats(gray, hue, sat, protected)
+    assert not s.any()
+
+
+def test_source_shading_does_not_create_saturation_watermarks() -> None:
+    from manga_repaint.color import composite_reference_locked_colorization
+
+    gray = np.tile(np.linspace(80, 250, 180).astype(np.uint8), (100, 1))
+    source = Image.fromarray(gray).convert("RGB")
+    result = composite_reference_locked_colorization(
+        source, Image.new("RGB", source.size, (235, 174, 145)),
+        np.zeros_like(gray, dtype=bool),
+    )
+    hsv = cv2.cvtColor(np.asarray(result), cv2.COLOR_RGB2HSV)
+    assert np.array_equal(hsv[..., 2], gray)
+    assert np.ptp(hsv[..., 1].astype(int)) <= 3
+
+
 def test_geometry_barrier_matches_locked_composer_protection() -> None:
     source = Image.new("RGB", (40, 40), "white")
     draw = ImageDraw.Draw(source)

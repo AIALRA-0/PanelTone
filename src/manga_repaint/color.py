@@ -455,6 +455,67 @@ def composite_geometry_locked_colorization(
     return Image.fromarray(result_rgb, mode="RGB")
 
 
+def clean_region_flats(
+    source_gray: np.ndarray,
+    hue: np.ndarray,
+    saturation: np.ndarray,
+    protected: np.ndarray,
+    *,
+    strength: float = 0.85,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Separate coherent base colours from source shading, like a flats layer.
+
+    Only source-enclosed, overwhelmingly single-colour regions are regularized.
+    Multicolour patterns and uncoloured areas are not assigned invented colours.
+    Hue statistics are circular. Neither shadows nor source ink are blurred.
+    """
+    if not 0 <= strength <= 1:
+        raise ValueError("Flat colour strength must be between zero and one")
+    edges = cv2.Canny(cv2.GaussianBlur(source_gray, (3, 3), 0.6), 48, 120) > 0
+    barrier = cv2.dilate(
+        (edges | protected | (source_gray < 40)).astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+    )
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(1 - barrier, connectivity=4)
+    inside_distance = cv2.distanceTransform(1 - barrier, cv2.DIST_L2, 3)
+    result_hue, result_sat = hue.copy(), saturation.copy()
+    for component in range(1, count):
+        area = int(stats[component, cv2.CC_STAT_AREA])
+        if area < 64:
+            continue
+        x, y, width, height = (int(value) for value in stats[component, :4])
+        region = labels[y:y + height, x:x + width] == component
+        local_hue = hue[y:y + height, x:x + width]
+        local_sat = saturation[y:y + height, x:x + width]
+        coloured = region & (local_sat >= 18)
+        if int(coloured.sum()) < area * 0.65:
+            continue
+        angles = local_hue[coloured] * np.pi / 90.0
+        # Saturation weighting would let a few neon stains dictate the flat.
+        centre = np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles)))
+        distance = np.abs(np.angle(np.exp(1j * (angles - centre))))
+        coherent = distance <= np.pi / 6
+        if float(np.mean(coherent)) < 0.9:
+            continue
+        centre = np.arctan2(np.mean(np.sin(angles[coherent])),
+                            np.mean(np.cos(angles[coherent])))
+        target_sat = float(np.median(local_sat[coloured][coherent]))
+        region_angles = local_hue[coloured] * np.pi / 90.0
+        # Fade corrections into the original colour field at ink and neutral
+        # boundaries. A hard flat-mask edge would itself become a coloured rim.
+        amount = strength * np.minimum(inside_distance[y:y + height, x:x + width][coloured] / 8, 1)
+        amount *= np.clip((local_sat[coloured] - 18) / 32, 0, 1)
+        mixed = np.arctan2(
+            (1 - amount) * np.sin(region_angles) + amount * np.sin(centre),
+            (1 - amount) * np.cos(region_angles) + amount * np.cos(centre),
+        )
+        result_hue[y:y + height, x:x + width][coloured] = (mixed * 90 / np.pi) % 180
+        result_sat[y:y + height, x:x + width][coloured] = (
+            (1 - amount) * local_sat[coloured] + amount * target_sat
+        )
+    return result_hue, result_sat
+
+
 def composite_reference_locked_colorization(
     source: Image.Image,
     generated: Image.Image,
@@ -464,6 +525,7 @@ def composite_reference_locked_colorization(
     ink_core_threshold: int = 64,
     palette_anchors: list[tuple[float, float, float]] | None = None,
     palette_strength: float = 0.28,
+    clean_flats: bool = True,
 ) -> Image.Image:
     """Transfer reference colour while keeping source luminance and geometry.
 
@@ -560,7 +622,10 @@ def composite_reference_locked_colorization(
     radius = max(2, min(12, round(min(source_rgb.shape[:2]) / 144)))
     sigma = max(0.8, radius * 0.22)
     filtered_ycc = np.empty_like(candidate_ycc)
-    filtered_ycc[..., 0] = source_gray
+    # A constant working luminance prevents screentone/shadow values from
+    # modulating H/S through YCrCb clipping. Actual source shading is applied
+    # once, below, as the exact source value channel.
+    filtered_ycc[..., 0] = 192 if clean_flats else source_gray
     for channel in (1, 2):
         chroma = (candidate_ycc[..., channel] - 128.0) / 127.0
         chroma = cv2.GaussianBlur(chroma, (0, 0), sigma)
@@ -580,10 +645,20 @@ def composite_reference_locked_colorization(
     # forbidden here: even after smoothing they can restore a shifted contour
     # as a cyan or magenta rim.
     result_sat = np.clip(
-        guided_hsv[..., 1] * 1.5 * float(chroma_strength),
+        guided_hsv[..., 1] * (1.15 if clean_flats else 1.5) * float(chroma_strength),
         0,
         255,
     )
+    if clean_flats:
+        # Cleaning a faintly tinted area must not erase its existing colour.
+        # Retain only a bounded pastel floor from the SAME guided chroma field,
+        # never from candidate pixels or texture. Strong saturation still comes
+        # exclusively from the constant-luminance base above.
+        shaded_hint = filtered_ycc.copy()
+        shaded_hint[..., 0] = source_gray
+        shaded_rgb = cv2.cvtColor(shaded_hint.astype(np.uint8), cv2.COLOR_YCrCb2RGB)
+        shaded_sat = cv2.cvtColor(shaded_rgb, cv2.COLOR_RGB2HSV)[..., 1].astype(np.float32)
+        result_sat = np.maximum(result_sat, np.minimum(48, shaded_sat * 1.5 * chroma_strength))
 
     # A reference library is a book-level colour vocabulary, not a semantic
     # segmentation model. Softly pull nearby candidate hues toward that
@@ -595,6 +670,11 @@ def composite_reference_locked_colorization(
             result_sat,
             palette_anchors,
             strength=palette_strength,
+        )
+
+    if clean_flats:
+        result_hue, result_sat = clean_region_flats(
+            source_gray, result_hue, result_sat, protected_mask
         )
 
     # Do not run the legacy pixelwise neutral-hole pass here.  Its local hue

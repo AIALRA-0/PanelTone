@@ -29,6 +29,38 @@ def test_segment_graph_is_deterministic_and_preserves_neighbour_evidence() -> No
     assert all(node.semantic_candidates == ("unresolved",) for node in first.nodes)
 
 
+def test_segment_neighbours_match_original_dilation_without_per_region_scans(monkeypatch):
+    import cv2
+    import numpy as np
+
+    image = Image.new("RGB", (180, 180), "white")
+    draw = ImageDraw.Draw(image)
+    for x in range(10, 170, 14):
+        for y in range(10, 170, 14):
+            draw.rectangle((x, y, x + 10, y + 10), outline="black", width=2)
+    gray = np.asarray(image.convert("L"))
+    barrier = cv2.dilate((gray <= 96).astype(np.uint8), np.ones((3, 3), np.uint8))
+    _, labels, stats, _ = cv2.connectedComponentsWithStats((barrier == 0).astype(np.uint8), 8)
+    eligible = [label for label in range(1, len(stats)) if stats[label, cv2.CC_STAT_AREA] >= 24]
+    mapping = {label: f"p0000-s{index:05d}" for index, label in enumerate(eligible)}
+    expected = {}
+    for label in eligible:
+        nearby = cv2.dilate((labels == label).astype(np.uint8), np.ones((3, 3), np.uint8))
+        expected[mapping[label]] = tuple(sorted(
+            mapping[int(other)] for other in np.unique(labels[nearby > 0])
+            if other in mapping and other != label
+        ))
+    original = cv2.dilate
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(cv2, "dilate", counted)
+    graph = build_segment_graph(image, job_id="book", page_index=0)
+    assert {node.segment_id: node.neighbours for node in graph.nodes} == expected
+    assert len(calls) == 1
+
+
 def test_identity_graph_keeps_same_panel_nodes_cannot_linked() -> None:
     observations = [
         IdentityNode("p0-a", 0, 0, (0, 0, 10, 10), "same", 0.8),
