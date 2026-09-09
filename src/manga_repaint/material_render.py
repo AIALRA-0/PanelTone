@@ -20,7 +20,8 @@ from PIL import Image
 
 from .color import image_sha256
 
-VERSION = "material-flats-v1"
+VERSION = "material-plan-v1"
+RENDERER_VERSION = "material-cel-v3"
 MATERIALS = {
     "skin",
     "hair",
@@ -68,6 +69,8 @@ class MaterialSlot:
     evidence: str = ""
     identity_id: str | None = None
     appearance_id: str | None = None
+    shadow_rgb: tuple[int, int, int] | None = None
+    highlight_rgb: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,15 @@ class MaterialPlan:
                 raise ValueError("accepted palette colour requires review evidence")
             if slot.material == "white" and max(slot.rgb) - min(slot.rgb) > 12:
                 raise ValueError("white material cannot use a saturated palette colour")
+            for layer_name, layer_colour in (
+                ("shadow", slot.shadow_rgb),
+                ("highlight", slot.highlight_rgb),
+            ):
+                if layer_colour is not None and (
+                    len(layer_colour) != 3
+                    or any(type(c) is not int or not 0 <= c <= 255 for c in layer_colour)
+                ):
+                    raise ValueError(f"{layer_name} colour must be three integer sRGB channels")
         regions = {region.label: region for region in self.regions}
         if len(regions) != len(self.regions) or any(key <= 0 for key in regions):
             raise ValueError("region identifiers must be unique and positive")
@@ -126,12 +138,37 @@ class MaterialPlan:
                 raise ValueError("accepted material region requires mask review evidence")
 
 
+def _structural_ink_mask(source: Image.Image) -> np.ndarray:
+    """Keep drawn contours while rejecting isolated halftone dots.
+
+    A raw darkness threshold cannot distinguish a black contour from a black
+    screentone dot. Connected print strokes are retained, while tiny isolated
+    components are treated as tone samples and consumed by the cel-shadow
+    estimator instead of being stamped back over the paint.
+    """
+    gray = cv2.cvtColor(_source_rgb(source), cv2.COLOR_RGB2GRAY)
+    dark = (gray <= 96).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    area = stats[:, cv2.CC_STAT_AREA]
+    width = stats[:, cv2.CC_STAT_WIDTH]
+    height = stats[:, cv2.CC_STAT_HEIGHT]
+    span = np.maximum(width, height)
+    thin = np.minimum(width, height)
+    keep = (area >= 12) & ((span >= 8) | (area >= 32) | (thin <= 2))
+    keep[0] = False
+    core = keep[labels]
+    # Restore antialiased fringes only around a retained structural stroke
+    # instead of protecting every mid-gray screentone pixel
+    fringe = cv2.dilate(core.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    return core | (fringe & (gray <= 192))
+
+
 def protection_mask(source: Image.Image, supplied: np.ndarray) -> np.ndarray:
-    """Preserve caller's text/panel masks plus exact dark source ink."""
+    """Preserve reviewed text/panel masks plus structural source ink."""
     rgb = _source_rgb(source)
     if supplied.shape != rgb.shape[:2]:
         raise ValueError("protection dimensions do not match source")
-    return supplied.astype(bool) | (np.max(rgb, axis=2) <= 40)
+    return supplied.astype(bool) | _structural_ink_mask(source)
 
 
 def _accepted_masks(plan: MaterialPlan, protected: np.ndarray):
@@ -175,27 +212,183 @@ def region_chroma_statistics(rgb: np.ndarray, mask: np.ndarray) -> dict:
     }
 
 
-def render_material_flats(source: Image.Image, plan: MaterialPlan) -> Image.Image:
-    """Render one albedo per reviewed region, with source-only scalar shading.
+def _chroma_residual_statistics(rgb: np.ndarray, expected: np.ndarray, mask: np.ndarray) -> dict:
+    """Measure unexplained colour structure after subtracting authored layers."""
+    bright = mask & (np.max(rgb, axis=-1) >= 32) & (np.max(expected, axis=-1) >= 32)
+    y, x = np.where(bright)
+    if not len(x):
+        return {"dispersion_p95": 0.0, "low_frequency_residual_p95": 0.0}
+    bounds = np.s_[y.min() : y.max() + 1, x.min() : x.max() + 1]
+    local = bright[bounds]
+    residual = _chromaticity(rgb[bounds]) - _chromaticity(expected[bounds])
+    magnitude = np.linalg.norm(residual[local], axis=-1)
+    weights = local.astype(np.float32)
+    low_frequency = []
+    for sigma in (3.0, 9.0, 21.0):
+        numerator = cv2.GaussianBlur(residual * weights[..., None], (0, 0), sigma)
+        denominator = cv2.GaussianBlur(weights, (0, 0), sigma)
+        blurred = numerator / np.maximum(denominator[..., None], 1e-6)
+        low_frequency.append(float(np.quantile(np.linalg.norm(blurred[local], axis=-1), 0.95)))
+    return {
+        "dispersion_p95": float(np.quantile(magnitude, 0.95)),
+        "low_frequency_residual_p95": max(low_frequency),
+    }
 
-    Unknown/proposed pixels remain the source, and prevent publishable QA.
-    Source screentone and hatching modulate scalar light only, never hue. There
-    is no invented relighting and no cross-region filtering. Keeping the full
-    source tone is intentional: automatic removal of patterns is not reliable.
+
+def _derived_layers(slot: MaterialSlot) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return book-stable base, shadow and highlight colours in linear light."""
+    base_rgb = np.asarray(slot.rgb, dtype=np.uint8)
+    base = _linear(base_rgb)
+    if slot.shadow_rgb is not None:
+        shadow = _linear(np.asarray(slot.shadow_rgb, dtype=np.uint8))
+    else:
+        # A material-aware shadow is a separate paint layer, not black opacity
+        shadow_tints = {
+            "skin": np.array([0.32, 0.08, 0.06], dtype=np.float32),
+            "hair": np.array([0.08, 0.06, 0.09], dtype=np.float32),
+            "hosiery": np.array([0.07, 0.08, 0.12], dtype=np.float32),
+            "wood": np.array([0.22, 0.09, 0.04], dtype=np.float32),
+        }
+        tint = shadow_tints.get(slot.material, base * 0.35)
+        shadow = np.clip(base * 0.62 + tint * 0.16, 0, 1)
+    if slot.highlight_rgb is not None:
+        highlight = _linear(np.asarray(slot.highlight_rgb, dtype=np.uint8))
+    else:
+        # Highlights retain the material colour instead of becoming white holes
+        highlight = np.clip(base * 0.82 + 0.18, 0, 1)
+    return base, shadow, highlight
+
+
+def _region_tone_layers(
+    gray: np.ndarray,
+    mask: np.ndarray,
+    *,
+    preserve_pattern: bool,
+) -> tuple[tuple[slice, slice], np.ndarray, np.ndarray, np.ndarray]:
+    """Convert print tone into discrete paint layers for one material.
+
+    Ordinary materials do not retain per-dot opacity. The density of dots and
+    hatching selects a coherent cel-shadow layer. Only a region explicitly
+    declared as patterned may retain a weak achromatic source pattern.
+    """
+    y, x = np.where(mask)
+    if not len(x):
+        empty = np.empty((0, 0), dtype=np.float32)
+        return (slice(0, 0), slice(0, 0)), empty, empty, empty
+    padding = 12
+    y0, y1 = max(0, y.min() - padding), min(gray.shape[0], y.max() + padding + 1)
+    x0, x1 = max(0, x.min() - padding), min(gray.shape[1], x.max() + padding + 1)
+    local_gray = gray[y0:y1, x0:x1]
+
+    # Descreen before deciding paint layers. This makes a 50% dot field one
+    # shadow decision instead of thousands of transparent black pinholes
+    descreened = cv2.medianBlur(local_gray, 7)
+    broad = cv2.GaussianBlur(descreened, (0, 0), 2.2).astype(np.float32) / 255.0
+    raw = local_gray.astype(np.float32) / 255.0
+
+    # Four stable steps represent paper/base, light shade, shadow and deep
+    # shadow. These are authored colour layers, not source gray used as alpha
+    shade = np.select(
+        (broad >= 0.91, broad >= 0.80, broad >= 0.58),
+        (0.0, 0.38, 0.72),
+        default=1.0,
+    ).astype(np.float32)
+
+    # Highlights require an explicit region in a future review plan. Guessing
+    # them from white gaps in a screentone would recreate the spotted mask look
+    highlight = np.zeros_like(shade)
+    if preserve_pattern:
+        residual = np.clip((raw + 0.04) / np.maximum(broad + 0.04, 0.08), 0.78, 1.06)
+        residual = 1.0 + (residual - 1.0) * 0.22
+    else:
+        residual = np.ones_like(raw)
+
+    return (slice(y0, y1), slice(x0, x1)), shade, highlight, residual
+
+
+def render_material_flats(source: Image.Image, plan: MaterialPlan) -> Image.Image:
+    """Render an inspectable colour-guidance preview.
+
+    This output proves that accepted regions and palette slots are coherent,
+    but it is not the final illustrated page. The production colourizer must
+    consume sparse hints derived from this plan and create the actual material,
+    shadow and highlight rendering. Unknown or proposed pixels remain source
+    gray and make publishable QA fail.
     """
     plan.validate(source)
     rgb = _source_rgb(source)
     protected = protection_mask(source, plan.protected)
-    source_linear = _linear(rgb)
-    luminance = source_linear @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     result = rgb.copy()
     for _, slot, mask in _accepted_masks(plan, protected):
-        # White source paper corresponds to the region's canonical base colour
-        # Lower source values scale the same linear RGB vector, not its hue
-        albedo = _linear(np.array(slot.rgb, dtype=np.uint8))
-        result[mask] = _encode(luminance[mask, None] * albedo)
+        if not mask.any():
+            continue
+        base, shadow, highlight_colour = _derived_layers(slot)
+        bounds, shade, highlight, detail = _region_tone_layers(
+            gray,
+            mask,
+            preserve_pattern=slot.material == "patterned",
+        )
+        painted = base[None, None, :] * (1.0 - shade[..., None])
+        painted += shadow[None, None, :] * shade[..., None]
+        painted = painted * (1.0 - highlight[..., None])
+        painted += highlight_colour[None, None, :] * highlight[..., None]
+        painted *= detail[..., None]
+        local_mask = mask[bounds]
+        result[bounds][local_mask] = _encode(painted[local_mask])
     result[protected] = rgb[protected]
     return Image.fromarray(result)
+
+
+def build_sparse_color_hint(
+    source: Image.Image,
+    plan: MaterialPlan,
+    *,
+    radius: int = 6,
+    max_points_per_region: int = 8,
+) -> Image.Image:
+    """Create an RGBA point-hint layer for a reference-guided colourizer.
+
+    Full masks encourage a model to behave like a paint overlay. This artifact
+    instead places a few unambiguous palette samples deep inside each reviewed
+    material region. Transparent pixels mean no hint. It is safe to send to a
+    model that supports colour scribbles because neither source geometry nor a
+    full-page opacity field is encoded in it.
+    """
+    if radius < 1 or max_points_per_region < 1:
+        raise ValueError("hint radius and point limit must be positive")
+    plan.validate(source)
+    protected = protection_mask(source, plan.protected)
+    hint = np.zeros((source.height, source.width, 4), dtype=np.uint8)
+    yy, xx = np.ogrid[: source.height, : source.width]
+    for _, slot, mask in _accepted_masks(plan, protected):
+        available = mask.astype(np.uint8)
+        component_count, components, stats, _ = cv2.connectedComponentsWithStats(
+            available, connectivity=8
+        )
+        point_budget = max_points_per_region
+        for component in range(1, component_count):
+            if point_budget <= 0:
+                break
+            if int(stats[component, cv2.CC_STAT_AREA]) < 4:
+                continue
+            component_mask = components == component
+            distance = cv2.distanceTransform(component_mask.astype(np.uint8), cv2.DIST_L2, 5)
+            while point_budget > 0:
+                flat_index = int(np.argmax(distance))
+                clearance = float(distance.flat[flat_index])
+                if clearance < 1.0:
+                    break
+                y, x = np.unravel_index(flat_index, distance.shape)
+                dot_radius = max(1, min(radius, int(clearance)))
+                dot = (xx - x) ** 2 + (yy - y) ** 2 <= dot_radius**2
+                dot &= component_mask & ~protected
+                hint[dot, :3] = np.asarray(slot.rgb, dtype=np.uint8)
+                hint[dot, 3] = 255
+                suppress_radius = max(radius * 6, dot_radius * 4)
+                distance[(xx - x) ** 2 + (yy - y) ** 2 <= suppress_radius**2] = 0
+                point_budget -= 1
+    return Image.fromarray(hint, mode="RGBA")
 
 
 def evaluate_material_render(
@@ -216,6 +409,7 @@ def evaluate_material_render(
     output = np.asarray(result.convert("RGB"))
     protected = protection_mask(source, reference.protected)
     diff = np.abs(output.astype(np.int16) - original.astype(np.int16))
+    expected_output = np.asarray(render_material_flats(source, reference))
     maximum = int(diff[protected].max()) if protected.any() else 0
     covered = protected.copy()
     reasons = ["protected_pixels_changed"] if maximum else []
@@ -225,22 +419,20 @@ def evaluate_material_render(
         # Avoid chromaticity division near quantized black; tone is still
         # checked on *every* pixel by the source/albedo lightness residual
         bright = mask & (np.max(output, axis=2) >= 32)
-        expected = _chromaticity(np.array(slot.rgb, dtype=np.uint8))
-        error = np.linalg.norm(_chromaticity(output[bright]) - expected, axis=-1)
+        error = np.linalg.norm(
+            _chromaticity(output[bright]) - _chromaticity(expected_output[bright]), axis=-1
+        )
         p95 = float(np.quantile(error, 0.95)) if error.size else 0.0
         worst = float(error.max()) if error.size else 0.0
-        stain_metrics = region_chroma_statistics(output, mask)
-        original_l = _linear(original[mask]) @ np.array([0.2126, 0.7152, 0.0722])
-        actual_l = _linear(output[mask]) @ np.array([0.2126, 0.7152, 0.0722])
-        albedo_l = float(
-            _linear(np.array(slot.rgb, dtype=np.uint8)) @ np.array([0.2126, 0.7152, 0.0722])
+        stain_metrics = _chroma_residual_statistics(output, expected_output, mask)
+        render_error = np.max(
+            np.abs(output[mask].astype(np.int16) - expected_output[mask].astype(np.int16)), axis=1
         )
-        light_error = np.abs(actual_l - original_l * albedo_l)
-        light_p95 = float(np.quantile(light_error, 0.95)) if light_error.size else 0.0
+        render_error_p95 = float(np.quantile(render_error, 0.95)) if render_error.size else 0.0
         failed = (
             p95 > 0.04
             or worst > 0.12
-            or light_p95 > 0.015
+            or render_error_p95 > 1.0
             or stain_metrics["low_frequency_residual_p95"] > 0.04
         )
         rows.append(
@@ -251,7 +443,7 @@ def evaluate_material_render(
                 "pixels": int(mask.sum()),
                 "chromaticity_error_p95": p95,
                 "chromaticity_error_max": worst,
-                "source_shade_error_p95": light_p95,
+                "layer_render_error_p95": render_error_p95,
                 "chroma_statistics": stain_metrics,
                 "passed": not failed,
             }
@@ -265,7 +457,7 @@ def evaluate_material_render(
         reasons.append("unknown_pixels_changed")
     return {
         "passed": not reasons,
-        "renderer": VERSION,
+        "renderer": RENDERER_VERSION,
         "reasons": reasons,
         "protected_pixel_diff": maximum,
         "unknown_pixels": int(unknown.sum()),
@@ -360,7 +552,23 @@ def load_material_plan(manifest: Path, source: Image.Image) -> MaterialPlan:
         data["source_hash"],
         labels,
         protected,
-        tuple(MaterialSlot(**{**slot, "rgb": tuple(slot["rgb"])}) for slot in data["slots"]),
+        tuple(
+            MaterialSlot(
+                **{
+                    **slot,
+                    "rgb": tuple(slot["rgb"]),
+                    "shadow_rgb": (
+                        tuple(slot["shadow_rgb"]) if slot.get("shadow_rgb") is not None else None
+                    ),
+                    "highlight_rgb": (
+                        tuple(slot["highlight_rgb"])
+                        if slot.get("highlight_rgb") is not None
+                        else None
+                    ),
+                }
+            )
+            for slot in data["slots"]
+        ),
         tuple(MaterialRegion(**region) for region in data["regions"]),
         data["palette_revision"],
     )

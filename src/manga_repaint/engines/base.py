@@ -16,6 +16,7 @@ class EngineRequest:
     prompt: str
     negative_prompt: str
     references: list[Path] = field(default_factory=list)
+    hint_path: Path | None = None
     attempt: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
 

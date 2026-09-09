@@ -221,6 +221,41 @@ def test_new_model_candidate_rejects_material_aspect_warp(tmp_path: Path) -> Non
     assert repaired.size == source.size
 
 
+def test_cobra_colourize_keeps_model_material_render_but_restores_source_ink(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_root=tmp_path / "jobs")
+    manager = ProjectManager(settings, EngineRegistry())
+    source_array = np.full((96, 96, 3), 245, dtype=np.uint8)
+    source_array[10:86, 20:23] = 0
+    source = Image.fromarray(source_array)
+    generated_array = np.full((96, 96, 3), (235, 170, 145), dtype=np.uint8)
+    generated_array[50:, :] = (135, 70, 85)  # authored model shadow layer
+    generated = Image.fromarray(generated_array)
+    spec = JobSpec(
+        source=tmp_path / "source.png",
+        workspace=settings.data_root,
+        engine="cobra-candidate",
+    )
+
+    final, _ = manager._compose_unit(
+        source,
+        generated,
+        np.zeros((96, 96), dtype=bool),
+        spec,
+    )
+    result = np.asarray(final)
+    expected = np.asarray(manager._render_color_candidate(source, generated, spec))
+
+    assert np.array_equal(result[40, 21], source_array[40, 21])
+    assert np.array_equal(result[20, 70], expected[20, 70])
+    assert np.array_equal(result[70, 70], expected[70, 70])
+    assert not np.array_equal(
+        np.max(result, axis=2),
+        np.max(source_array, axis=2),
+    )
+
+
 def test_semantic_ink_protection_keeps_only_dark_source_core(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

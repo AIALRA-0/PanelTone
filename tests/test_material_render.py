@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-import cv2
 import numpy as np
 import pytest
 from PIL import Image
@@ -12,10 +11,12 @@ from manga_repaint.material_render import (
     MaterialPlan,
     MaterialRegion,
     MaterialSlot,
+    build_sparse_color_hint,
     evaluate_material_render,
     labels_from_masks,
     load_material_plan,
     propose_region_colour,
+    protection_mask,
     render_material_flats,
     save_material_plan,
 )
@@ -42,16 +43,18 @@ def fixture():
     return source, MaterialPlan(image_sha256(source), labels, protected, slots, regions, "book-1")
 
 
-def test_flat_render_preserves_ink_and_screentone_without_hue_noise():
+def test_cel_render_preserves_structural_ink_but_descreens_ordinary_materials():
     source, plan = fixture()
     result = render_material_flats(source, plan)
     report = evaluate_material_render(source, result, plan)
     assert report["passed"], report
     assert report["protected_pixel_diff"] == 0
     rgb = np.asarray(result)
-    # Original tonal detail remains, while white fabric stays neutral
+    # White fabric stays neutral, structural ink remains exact, and isolated
+    # screentone dots select a coherent layer instead of becoming paint holes
     assert np.max(rgb[:, 66:]) == np.min(rgb[:, 66:], axis=2).max()
-    assert rgb[10, 10, 0] < rgb[11, 11, 0]
+    assert np.array_equal(rgb[20, 63], np.asarray(source)[20, 63])
+    assert np.max(np.abs(rgb[10, 10].astype(int) - rgb[11, 11].astype(int))) <= 1
     assert max(row["chromaticity_error_p95"] for row in report["regions"]) < 0.015
 
 
@@ -77,7 +80,8 @@ def test_independent_region_qa_rejects_stains_holes_bleed_and_screentone_hue(def
         alpha = ((np.sin(xx / 9) * np.sin(yy / 11) + 1) * 0.3)[..., None]
         rgb = np.rint(rgb * (1 - alpha) + np.array([80, 140, 210]) * alpha).astype(np.uint8)
     # Passing geometry/protected pixels alone must not hide the colour defect
-    rgb[reference.protected] = np.asarray(source)[reference.protected]
+    protected = protection_mask(source, reference.protected)
+    rgb[protected] = np.asarray(source)[protected]
     report = evaluate_material_render(source, Image.fromarray(rgb), reference)
     assert not report["passed"]
     assert report["protected_pixel_diff"] == 0
@@ -181,8 +185,47 @@ def test_declared_pattern_retains_source_detail_without_model_texture():
     report = evaluate_material_render(source, final, plan)
     assert report["passed"]
     # Pattern colour changes need separate labels/slots, not a hidden spatial layer
-    hues = cv2.cvtColor(np.asarray(final), cv2.COLOR_RGB2HSV)[..., 0]
-    assert np.ptp(hues[(plan.labels == 1) & ~plan.protected]) <= 2
+    assert report["regions"][0]["chroma_statistics"]["dispersion_p95"] < 0.01
+    assert not np.array_equal(np.asarray(final)[10, 10], np.asarray(final)[11, 11])
+
+
+def test_connected_ink_is_preserved_but_isolated_black_screentone_is_not():
+    gray = np.full((80, 100), 255, dtype=np.uint8)
+    gray[15:65, 20] = 0
+    gray[15:65, 21] = 80  # antialiased fringe of a connected contour
+    gray[30, 60] = 0  # isolated screentone sample
+    source = Image.fromarray(np.repeat(gray[..., None], 3, axis=2))
+    plan = MaterialPlan(
+        image_sha256(source),
+        np.ones(gray.shape, dtype=np.uint16),
+        np.zeros(gray.shape, dtype=bool),
+        (MaterialSlot("skin", "skin", (232, 176, 145), "accepted", "fixture"),),
+        (MaterialRegion(1, "skin", "accepted", "fixture"),),
+        "ink-vs-tone",
+    )
+    result = np.asarray(render_material_flats(source, plan))
+    assert np.array_equal(result[40, 20], np.asarray(source)[40, 20])
+    assert np.array_equal(result[40, 21], np.asarray(source)[40, 21])
+    assert not np.array_equal(result[30, 60], np.asarray(source)[30, 60])
+    assert np.max(np.abs(result[30, 60].astype(int) - result[30, 61].astype(int))) <= 1
+
+
+def test_sparse_model_hints_do_not_encode_a_full_page_colour_mask():
+    source, plan = fixture()
+    hint = np.asarray(build_sparse_color_hint(source, plan, radius=3, max_points_per_region=3))
+    alpha = hint[..., 3] > 0
+    protected = protection_mask(source, plan.protected)
+    assert alpha.any()
+    assert float(alpha.mean()) < 0.03
+    assert not np.any(alpha & protected)
+    assert not np.any(hint[~alpha])
+    skin = alpha & (plan.labels == 1)
+    assert skin.any()
+    assert np.all(hint[skin, :3] == np.asarray(plan.slots[0].rgb))
+    assert np.array_equal(
+        hint,
+        np.asarray(build_sparse_color_hint(source, plan, radius=3, max_points_per_region=3)),
+    )
 
 
 def test_cli_isolated_render_does_not_construct_live_manager(tmp_path, monkeypatch):
@@ -201,6 +244,7 @@ def test_cli_isolated_render_does_not_construct_live_manager(tmp_path, monkeypat
         cli.main(["material-render", str(source_path), str(manifest), str(tmp_path / "out")]) == 0
     )
     assert (tmp_path / "out" / "qa.json").is_file()
+    assert (tmp_path / "out" / "cobra-hint.png").is_file()
 
 
 def test_transparent_source_uses_same_white_composite_as_source_hash():
@@ -210,7 +254,9 @@ def test_transparent_source_uses_same_white_composite_as_source_hash():
     source = Image.fromarray(rgba)
     plan = replace(plan, source_hash=image_sha256(source))
     result = render_material_flats(source, plan)
-    assert tuple(np.asarray(result)[10, 10]) == plan.slots[0].rgb
+    assert (
+        np.max(np.abs(np.asarray(result)[10, 10].astype(int) - np.asarray(plan.slots[0].rgb))) <= 1
+    )
     assert evaluate_material_render(source, result, plan)["passed"]
 
 
@@ -274,3 +320,39 @@ def test_stain_measurement_is_independent_of_chosen_palette():
     stats = region_chroma_statistics(rgb, region)
     assert stats["dispersion_p95"] > 0.10
     assert stats["low_frequency_residual_p95"] > 0.04
+
+
+def test_renderer_paints_distinct_base_shadow_and_highlight_layers():
+    gray = np.full((96, 96), 255, dtype=np.uint8)
+    gray[:, :32] = 115
+    gray[32:64, :32] = 240  # authored highlight inside a broad shadow area
+    source = Image.fromarray(np.repeat(gray[..., None], 3, axis=2))
+    labels = np.ones(gray.shape, dtype=np.uint16)
+    plan = MaterialPlan(
+        image_sha256(source),
+        labels,
+        np.zeros(gray.shape, dtype=bool),
+        (
+            MaterialSlot(
+                "skin",
+                "skin",
+                (232, 176, 145),
+                "accepted",
+                "fixture",
+                shadow_rgb=(154, 80, 75),
+                highlight_rgb=(250, 218, 193),
+            ),
+        ),
+        (MaterialRegion(1, "skin", "accepted", "fixture"),),
+        "layered-1",
+    )
+    result = np.asarray(render_material_flats(source, plan))
+    base = result[70, 70].astype(int)
+    shadow = result[10, 10].astype(int)
+    highlight = result[45, 10].astype(int)
+    # Base remains canonical paint while shade/highlight move toward their own
+    # authored colours; a gray-times-RGB wash cannot satisfy both relationships
+    assert np.linalg.norm(base - np.asarray((232, 176, 145))) <= 2
+    assert np.linalg.norm(shadow - np.asarray((154, 80, 75))) < np.linalg.norm(shadow - base)
+    assert highlight.mean() > shadow.mean()
+    assert not np.allclose(shadow / 115, base / 255, atol=0.08)

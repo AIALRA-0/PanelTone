@@ -22,6 +22,7 @@ from .color import (
     composite_geometry_locked_colorization,
     composite_protected,
     composite_reference_locked_colorization,
+    composite_strict_colorization,
     geometry_barrier_mask,
     image_sha256,
     is_already_colorized,
@@ -1188,17 +1189,18 @@ class ProjectManager:
                 # scene when the generation service invents structure.
                 final = source_rgb
             else:
-                # Every COLORIZE engine is geometry-locked and colour-only.
-                # Generative candidates need source-guided low-frequency
-                # transfer because their drawn edges may move.  The built-in
-                # deterministic palette engine already shares source geometry
-                # exactly, so its component-aware path remains the more faithful
-                # test/fallback compositor.
-                compositor = (
-                    composite_reference_locked_colorization
-                    if spec.mode == JobMode.COLORIZE and spec.engine != "palette"
-                    else composite_geometry_locked_colorization
-                )
+                # Cobra is a reference-guided line-art colourizer: its material,
+                # shadow and highlight rendering is the actual product, not a
+                # palette mask. Restore reviewed source ink over that render and
+                # let geometry QA reject shifted or invented structure. Generic
+                # generators remain colour-hint providers because their spatial
+                # output is not reliably aligned to manga line art.
+                if spec.engine == "cobra-candidate":
+                    compositor = composite_strict_colorization
+                elif spec.mode == JobMode.COLORIZE and spec.engine != "palette":
+                    compositor = composite_reference_locked_colorization
+                else:
+                    compositor = composite_geometry_locked_colorization
                 if compositor is composite_geometry_locked_colorization:
                     mask = validated_colorization_protection(source_rgb, generated_rgb, mask)
                 final = compositor(
@@ -1207,6 +1209,11 @@ class ProjectManager:
                     mask,
                     chroma_strength=effective_chroma,
                     ink_core_threshold=64,
+                    **(
+                        {"ink_edge_threshold": 128}
+                        if compositor is composite_strict_colorization
+                        else {}
+                    ),
                     **(
                         {
                             "palette_anchors": palette_anchors
@@ -1232,7 +1239,10 @@ class ProjectManager:
             # The legacy barrier compositor restores its one-pixel geometry
             # guard, while the reference compositor keeps that guard only as a
             # diagnostic boundary to avoid gray islands on small panels.
-            if compositor is composite_reference_locked_colorization:
+            if compositor in {
+                composite_reference_locked_colorization,
+                composite_strict_colorization,
+            }:
                 # The reference compositor intentionally keeps the barrier as
                 # a diagnostic boundary, not a broad source-pixel restore. A
                 # broad restore recreates the gray islands this route removes.
@@ -2122,6 +2132,20 @@ class ProjectManager:
                 )
                 raise DisplayAssetPending("display asset is being prepared")
             return self._write_display_asset(source_path, output)
+
+    def quality_candidate_asset(self, job_id: str, page_index: int) -> Path:
+        """Return a prebuilt, isolated review candidate without touching live output."""
+        self._manifest(job_id).page_by_index(job_id, page_index)
+        path = (
+            self._job_dir(job_id)
+            / "quality-candidates"
+            / "cobra"
+            / "display"
+            / f"page_{page_index:05d}.webp"
+        )
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
 
     def reading_asset(self, job_id: str, page_index: int, variant: str, size: str) -> Path:
         if variant not in {"source", "final"}:

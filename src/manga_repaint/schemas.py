@@ -130,6 +130,7 @@ class PageAsset(BaseModel):
     preview_url: str | None = None
     final_url: str | None = None
     final_display_url: str | None = None
+    quality_candidate_url: str | None = None
     thumbnail_url: str | None = None
     asset_revision: str | None = None
     preview_only: bool = False

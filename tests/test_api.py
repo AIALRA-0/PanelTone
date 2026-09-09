@@ -91,6 +91,29 @@ def test_api_create_run_and_download(tmp_path: Path, manga_pages: Path) -> None:
         unversioned = client.get(pages[0]["final_display_url"].split("?", 1)[0])
         assert unversioned.headers["cache-control"] == "no-store, max-age=0"
         assert unversioned.headers["pragma"] == "no-cache"
+        candidate_dir = (
+            app.state.manager._job_dir(job_id)
+            / "quality-candidates"
+            / "cobra"
+            / "display"
+        )
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        candidate_path = candidate_dir / "page_00000.webp"
+        Image.new("RGB", (48, 64), "cornflowerblue").save(candidate_path, "WEBP")
+        pages_with_candidate = client.get(f"/api/jobs/{job_id}/pages").json()
+        candidate_url = pages_with_candidate[0]["quality_candidate_url"]
+        assert candidate_url.startswith(
+            f"/api/assets/jobs/{job_id}/pages/0/candidate.webp?v="
+        )
+        candidate = client.get(candidate_url)
+        assert candidate.status_code == 200
+        assert candidate.headers["content-type"] == "image/webp"
+        assert candidate.headers["cache-control"] == (
+            "private, max-age=31536000, immutable"
+        )
+        assert client.get(
+            f"/api/assets/jobs/{job_id}/pages/1/candidate.webp?v=missing"
+        ).status_code == 404
         response = client.get(f"/api/jobs/{job_id}/download")
         assert response.status_code == 200
         assert response.headers["content-type"] in {

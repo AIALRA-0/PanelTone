@@ -115,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         from PIL import Image
 
         from .material_render import (
+            build_sparse_color_hint,
             evaluate_material_render,
             load_material_plan,
             render_material_flats,
@@ -125,9 +126,11 @@ def main(argv: list[str] | None = None) -> int:
         plan = load_material_plan(Path(args.plan), source)
         final = render_material_flats(source, plan)
         report = evaluate_material_render(source, final, plan)
+        hint = build_sparse_color_hint(source, plan)
         output = Path(args.output)
         output.mkdir(parents=True, exist_ok=False)
         final.save(output / "preview.png")
+        hint.save(output / "cobra-hint.png")
         (output / "qa.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         _print(report)
         return 0 if report["passed"] else 2

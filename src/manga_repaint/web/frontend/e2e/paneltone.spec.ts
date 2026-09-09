@@ -91,6 +91,19 @@ test('page jump goes directly to a valid page and rejects an invalid page', asyn
   await expect(page.getByText('请输入 1 到 203 之间的页码')).toBeVisible()
 })
 
+test('isolated Cobra candidates are reviewable without replacing live results', async ({ page }) => {
+  await openWorkspace(page, 1440, 900)
+  await page.getByRole('button', { name: /203\/203/ }).click()
+  const input = page.getByRole('spinbutton', { name: '跳转页码' })
+  await input.fill('9')
+  await page.getByRole('button', { name: '跳转', exact: true }).click()
+  await page.getByRole('button', { name: '新版候选', exact: true }).click()
+  await expect(page.getByText('Cobra 新版候选 · 不覆盖现有成品')).toBeVisible()
+  const candidate = page.getByAltText('第 9 页新版上色候选')
+  await expect(candidate).toBeVisible()
+  await expect.poll(() => candidate.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true)
+})
+
 test('width sweep does not create horizontal overflow or hide mobile library actions', async ({ page }) => {
   test.setTimeout(120_000)
   for (let width = 320; width <= 1920; width += 40) {

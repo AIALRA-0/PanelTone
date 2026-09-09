@@ -16,6 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from manga_repaint.color import normalize_color_candidate_size
+from manga_repaint.engines.cobra import prepare_cobra_hint
 
 logger = logging.getLogger("paneltone.cobra")
 # FastAPI's dependency declarations intentionally call File/Form at definition
@@ -107,6 +108,7 @@ def release() -> dict[str, Any]:
 def generate(
     source: UploadFile = File(...),
     references: list[UploadFile] = File(default=[]),
+    hint: UploadFile | None = File(default=None),
     prompt: str = Form(""),
     negative_prompt: str = Form(""),
     seed: str = Form("0"),
@@ -158,6 +160,22 @@ def generate(
             source_image, str(metadata.get("cobra_style", "line + shadow"))
         )
         extracted_line, _, hint_mask, query_origin, extracted_original, resolution = extracted
+        if hint is not None:
+            hint_image = cobra.Image.open(hint.file).convert("RGBA")
+            try:
+                hint_mask, extracted_hint_color = prepare_cobra_hint(
+                    extracted_line,
+                    hint_image,
+                    source_size=source_image.size,
+                    resolution=resolution,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=str(exc),
+                ) from exc
+        else:
+            extracted_hint_color = extracted_line
 
         class _Ref:
             def __init__(self, name: str) -> None:
@@ -171,7 +189,7 @@ def generate(
             int(metadata.get("cobra_steps", 10)),
             min(int(metadata.get("cobra_top_k", 6)), len(reference_paths)),
             hint_mask,
-            extracted_line,
+            extracted_hint_color,
             query_origin,
             extracted_original,
         )

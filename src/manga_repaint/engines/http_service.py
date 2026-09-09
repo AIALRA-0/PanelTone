@@ -36,6 +36,10 @@ class HTTPImageEngine:
                 handle = reference.open("rb")
                 handles.append(handle)
                 files.append(("references", (reference.name, handle, "image/png")))
+            if request.hint_path is not None:
+                hint_handle = request.hint_path.open("rb")
+                handles.append(hint_handle)
+                files.append(("hint", (request.hint_path.name, hint_handle, "image/png")))
             payload = {
                 "prompt": request.prompt,
                 "negative_prompt": request.negative_prompt,

@@ -103,6 +103,7 @@ type Page = {
   source_display_url?: string | null
   final_url: string | null
   final_display_url?: string | null
+  quality_candidate_url?: string | null
   preview_url?: string | null
   preview_only?: boolean
   thumbnail_url: string | null
@@ -432,7 +433,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [progressOpen, setProgressOpen] = useState(true)
   const [previewDark, setPreviewDark] = useState(true)
-  const [previewMode, setPreviewMode] = useState<'compare' | 'source' | 'final' | 'mask'>('final')
+  const [previewMode, setPreviewMode] = useState<'compare' | 'source' | 'final' | 'mask' | 'candidate'>('final')
   const [readerMode, setReaderMode] = useState<'paged' | 'vertical'>(() => localStorage.getItem('paneltone-reader-mode') === 'vertical' ? 'vertical' : 'paged')
   const [readerDetail, setReaderDetail] = useState(false)
   const [readerJump, setReaderJump] = useState(0)
@@ -491,6 +492,7 @@ function App() {
   const currentPage = pagesJobId === selected?.id ? pages.find(page => page.page_index === pageIndex) || pages[0] : undefined
   const currentSourceUrl = currentPage ? readingUrl(currentPage, 'source', readerDetail) : null
   const currentResultUrl = currentPage ? readingUrl(currentPage, 'final', readerDetail) : null
+  const currentCandidateUrl = currentPage?.quality_candidate_url || null
   const selectedEngine = typeof selected?.spec.engine === 'string' ? selected.spec.engine : null
   const activeEngine = selectedEngine || 'palette'
   const modelHealth = health[activeEngine]
@@ -732,6 +734,10 @@ function App() {
     for (const offset of [0, 1, -1, 2]) {
       const page = sourcePages.find(item => item.page_index === index + offset)
       if (!page) continue
+      if (previewMode === 'candidate') {
+        if (page.quality_candidate_url) urls.push(page.quality_candidate_url)
+        continue
+      }
       if (previewMode !== 'final') urls.push(readingUrl(page, 'source', readerDetail)!)
       if (previewMode === 'final' || previewMode === 'compare') {
         const final = readingUrl(page, 'final', readerDetail)
@@ -857,11 +863,11 @@ function App() {
   useEffect(() => {
     if (!currentPage) return
     pageLoadCountRef.current = 0
-    const imageWillLoad = previewMode === 'source' || previewMode === 'mask' || Boolean(currentResultUrl)
+    const imageWillLoad = previewMode === 'source' || previewMode === 'mask' || (previewMode === 'candidate' ? Boolean(currentCandidateUrl) : Boolean(currentResultUrl))
     pageLoadTargetRef.current = previewMode === 'compare' && Boolean(currentResultUrl) ? 2 : 1
     setPageLoading(imageWillLoad)
     prefetchPageAssets(selected?.id || null, pageIndex)
-  }, [selected?.id, pageIndex, currentPage?.asset_revision, previewMode, currentResultUrl, readerDetail, readerMode])
+  }, [selected?.id, pageIndex, currentPage?.asset_revision, previewMode, currentResultUrl, currentCandidateUrl, readerDetail, readerMode])
 
   useEffect(() => {
     activeFilmstripPageRef.current?.scrollIntoView({
@@ -1353,6 +1359,7 @@ function App() {
                 <div className="segmented">
                   {([['compare', '对比'], ['source', '原图'], ['final', '结果'], ['mask', '遮罩']] as const).map(([id, label]) =>
                     <button key={id} className={previewMode === id ? 'active' : ''} onClick={() => setPreviewMode(id)}>{label}</button>)}
+                  {pages.some(page => page.quality_candidate_url) && <button className={previewMode === 'candidate' ? 'active' : ''} onClick={() => { setReaderMode('paged'); setPreviewMode('candidate') }}>新版候选</button>}
                 </div>
                 <div className="segmented reader-modes" aria-label="阅读方式">
                   <button aria-pressed={readerMode === 'paged'} className={readerMode === 'paged' ? 'active' : ''} onClick={() => setReaderMode('paged')}>单页翻阅</button>
@@ -1384,7 +1391,7 @@ function App() {
               </div>
             </div>
             <div className={`canvas canvas-gesture-zone reader-${readerMode} ${previewDark ? 'dark' : ''} zoom-${zoom}`} onWheel={handleCanvasWheel} onPointerDown={handleCanvasPointerDown} onPointerMove={handleCanvasPointerMove} onPointerUp={handleCanvasPointerUp} onPointerCancel={handleCanvasPointerUp}>
-              {readerMode === 'vertical' && <ContinuousReader key={selected.id} pages={pages} pageIndex={pageIndex} jumpToken={readerJump} jobId={selected.id} mode={previewMode} detail={readerDetail} onPageChange={index => {
+              {readerMode === 'vertical' && previewMode !== 'candidate' && <ContinuousReader key={selected.id} pages={pages} pageIndex={pageIndex} jumpToken={readerJump} jobId={selected.id} mode={previewMode} detail={readerDetail} onPageChange={index => {
                 manualPageSelectionRef.current.add(selected.id); pageSelectionRef.current.set(selected.id, index)
                 pageIndexRef.current = index; setPageIndex(index)
               }} />}
@@ -1395,7 +1402,14 @@ function App() {
                   <div className="compare-result" style={{ clipPath: `inset(0 0 0 ${compare}%)`, transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}><ReaderImage key={currentResultUrl} url={currentResultUrl} placeholder={placeholderUrl(currentPage, 'final')} alt={`第 ${currentPage.page_index + 1} 页结果`} onReady={markPageImageLoaded} /></div>
                   <div className="compare-line" style={{ left: `${compare}%` }}><span /></div>
                   <input className="compare-range" aria-label="拖动比较原图和结果" type="range" min="0" max="100" value={compare} onChange={event => setCompare(Number(event.target.value))} />
-                 </div> : previewMode === 'source' || previewMode === 'mask' || currentResultUrl ? <div className="single-page-stage">
+                 </div> : previewMode === 'candidate' ? currentCandidateUrl ? <div className="single-page-stage quality-candidate-stage">
+                  <ReaderImage key={`${selected.id}-${pageIndex}-candidate-${currentCandidateUrl}`}
+                    url={currentCandidateUrl}
+                    placeholder={placeholderUrl(currentPage, 'final')}
+                    style={{ transform: `translate3d(${canvasPan.x}px, ${canvasPan.y}px, 0) scale(${canvasScale})` }}
+                    alt={`第 ${currentPage.page_index + 1} 页新版上色候选`} onReady={markPageImageLoaded} />
+                  <span className="candidate-badge">Cobra 新版候选 · 不覆盖现有成品</span>
+                 </div> : <div className="waiting-page"><strong>此页尚无新版候选</strong><span>目前可查看第 9、41、71、111 页</span></div> : previewMode === 'source' || previewMode === 'mask' || currentResultUrl ? <div className="single-page-stage">
                   <ReaderImage key={`${selected.id}-${pageIndex}-${previewMode}-${readerDetail}-${currentPage.asset_revision}`}
                     url={previewMode === 'mask' ? `/api/jobs/${selected.id}/pages/${currentPage.page_index}/mask` : (previewMode === 'source' ? currentSourceUrl! : currentResultUrl!)}
                     placeholder={placeholderUrl(currentPage, previewMode === 'source' || previewMode === 'mask' ? 'source' : 'final')}

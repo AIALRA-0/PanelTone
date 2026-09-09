@@ -2020,6 +2020,13 @@ def create_app(
                     / "final"
                     / f"page_{page['page_index']:05d}.webp"
                 )
+                quality_candidate_path = (
+                    manager._job_dir(job_id)
+                    / "quality-candidates"
+                    / "cobra"
+                    / "display"
+                    / f"page_{page['page_index']:05d}.webp"
+                )
                 output_path = Path(page["output_path"] or "")
                 has_final = bool(page["output_path"] and output_path.is_file())
                 revision = page.get("asset_revision")
@@ -2102,6 +2109,14 @@ def create_app(
                             f"/api/assets/jobs/{job_id}/pages/"
                             f"{page['page_index']}/final.webp?v={revision or 0}"
                             if has_final and final_display_path.is_file()
+                            else None
+                        ),
+                        "quality_candidate_url": (
+                            f"/api/assets/jobs/{job_id}/pages/"
+                            f"{page['page_index']}/candidate.webp"
+                            f"?v={quality_candidate_path.stat().st_mtime_ns}-"
+                            f"{quality_candidate_path.stat().st_size}"
+                            if quality_candidate_path.is_file()
                             else None
                         ),
                         "preview_url": derived_asset_url(preview_path, preview_base, revision)
@@ -2326,15 +2341,18 @@ def create_app(
     def page_display_image(
         job_id: str,
         page_index: int,
-        variant: Literal["source", "final"],
+        variant: Literal["source", "final", "candidate"],
         v: str | None = None,
         size: Literal["detail", "reader", "preview"] = "detail",
     ) -> FileResponse | Response:
         try:
-            path = (
-                manager.display_asset(job_id, page_index, variant) if size == "detail"
-                else manager.reading_asset(job_id, page_index, variant, size)
-            )
+            if variant == "candidate":
+                path = manager.quality_candidate_asset(job_id, page_index)
+            else:
+                path = (
+                    manager.display_asset(job_id, page_index, variant) if size == "detail"
+                    else manager.reading_asset(job_id, page_index, variant, size)
+                )
             cache_control = (
                 "private, max-age=31536000, immutable"
                 if v
@@ -2346,7 +2364,7 @@ def create_app(
                 headers={"Cache-Control": cache_control},
             )
         except DisplayAssetPending:
-            if size == "detail":
+            if size == "detail" and variant != "candidate":
                 manager.schedule_display_asset(job_id, page_index, variant)
             return JSONResponse(
                 {
