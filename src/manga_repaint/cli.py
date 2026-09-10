@@ -100,6 +100,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     material.add_argument("output", help="New directory; existing paths are never overwritten")
 
+    proposal = subparsers.add_parser(
+        "flat-proposal",
+        help="Create a source-topology flat-colour proposal in a NEW isolated directory",
+    )
+    proposal.add_argument("source")
+    proposal.add_argument(
+        "candidate", help="Colour candidate used only for per-region colour votes"
+    )
+    proposal.add_argument("output", help="New review directory; live results are never changed")
+    proposal.add_argument("--palette-revision", default="isolated-proposal-v1")
+
+    sam_proposal = subparsers.add_parser(
+        "sam2-flat-proposal",
+        help="Create an object-consistent SAM2 flat proposal in a NEW review directory",
+    )
+    sam_proposal.add_argument("source")
+    sam_proposal.add_argument("candidate")
+    sam_proposal.add_argument("output")
+    sam_proposal.add_argument("--model-root", required=True)
+    sam_proposal.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    sam_proposal.add_argument("--grid-x", type=int, default=10)
+    sam_proposal.add_argument("--grid-y", type=int, default=14)
+    sam_proposal.add_argument(
+        "--material-labels", help="Reviewed labels-only JSON; VLM coordinates are rejected"
+    )
+    sam_proposal.add_argument("--palette-revision", default="sam2-isolated-proposal-v1")
+
+    cel_candidate = subparsers.add_parser(
+        "cel-candidate",
+        help="Build a source-geometry cel candidate in a NEW isolated review directory",
+    )
+    cel_candidate.add_argument("source")
+    cel_candidate.add_argument("candidate", help="Model image used only as an albedo proposal")
+    cel_candidate.add_argument(
+        "output", help="New review directory; live results are never changed"
+    )
+    cel_candidate.add_argument(
+        "--refinement",
+        action="append",
+        default=[],
+        metavar="LEFT,TOP,RIGHT,BOTTOM=IMAGE",
+        help="Optional high-resolution panel colour proposal; may be repeated",
+    )
+    cel_candidate.add_argument("--chroma-strength", type=float, default=1.0)
+
     serve = subparsers.add_parser("serve", help="Start the local review application")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
@@ -134,6 +179,209 @@ def main(argv: list[str] | None = None) -> int:
         (output / "qa.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         _print(report)
         return 0 if report["passed"] else 2
+
+    if args.command == "flat-proposal":
+        # This is an isolated review artifact. Candidate geometry, texture and
+        # light never enter the rendered pixels, and the saved plan remains in
+        # proposed state until an explicit review operation accepts it
+        from dataclasses import asdict
+
+        import numpy as np
+        from PIL import Image
+
+        from .flat_planner import preview_plan, propose_material_plan
+        from .material_render import render_material_layers, save_material_plan
+        from .semantic import ConservativeSemanticMaskEngine
+
+        with Image.open(args.source) as image:
+            source = image.convert("RGB")
+        with Image.open(args.candidate) as image:
+            candidate = image.convert("RGB")
+        semantic = ConservativeSemanticMaskEngine().segment(source)
+        protected = np.logical_or.reduce(
+            [semantic.masks[name] for name in ("text", "bubbles", "borders", "ink")]
+        )
+        result = propose_material_plan(
+            source,
+            candidate,
+            protected,
+            palette_revision=args.palette_revision,
+            evidence=f"candidate:{Path(args.candidate).name}",
+        )
+        output = Path(args.output)
+        output.mkdir(parents=True, exist_ok=False)
+        save_material_plan(output / "plan", source, result.plan)
+        layers = render_material_layers(source, preview_plan(result))
+        layers.flats.save(output / "flats.png")
+        layers.shadows.save(output / "shadows.png")
+        layers.final.save(output / "cel.png")
+        Image.fromarray(layers.shade_index * 85).save(output / "shade-index.png")
+        Image.fromarray(layers.screentone.astype(np.uint8) * 255).save(
+            output / "screentone.png"
+        )
+        report = {
+            "status": "review_required",
+            "publishable": False,
+            "candidate_pixels_used_in_final": False,
+            "proposal_count": len(result.proposals),
+            "unknown_ratio": result.unknown_ratio,
+            "conflict_ratio": result.conflict_ratio,
+            "proposals": [asdict(item) for item in result.proposals],
+        }
+        (output / "proposal.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _print(report)
+        return 0
+
+    if args.command == "sam2-flat-proposal":
+        # This command is intentionally run by the separate model environment
+        # and emits review artifacts only.  Nothing is written into live data
+        from dataclasses import asdict
+
+        import numpy as np
+        from PIL import Image
+
+        from .flat_planner import preview_plan, propose_material_plan_with_object_masks
+        from .material_render import render_material_layers, save_material_plan
+        from .sam2_regions import Sam2AutomaticMasker, render_region_overlay
+        from .semantic import ConservativeSemanticMaskEngine
+        from .vlm_proposals import parse_material_labels, reviewed_materials
+
+        with Image.open(args.source) as image:
+            source = image.convert("RGB")
+        with Image.open(args.candidate) as image:
+            candidate = image.convert("RGB")
+        semantic = ConservativeSemanticMaskEngine().segment(source)
+        protected = np.logical_or.reduce(
+            [semantic.masks[name] for name in ("text", "bubbles", "borders", "ink")]
+        )
+        masker = Sam2AutomaticMasker(Path(args.model_root), device=args.device)
+        masks = masker.propose(
+            source, exclude=protected, grid_x=args.grid_x, grid_y=args.grid_y
+        )
+        material_labels = None
+        if args.material_labels:
+            payload = Path(args.material_labels).read_text(encoding="utf-8")
+            proposals = parse_material_labels(payload, expected_ids=set(range(len(masks))))
+            material_labels = reviewed_materials(proposals)
+        result = propose_material_plan_with_object_masks(
+            source,
+            candidate,
+            protected,
+            masks,
+            palette_revision=args.palette_revision,
+            evidence=f"sam2+candidate:{Path(args.candidate).name}",
+            material_labels=material_labels,
+        )
+        output = Path(args.output)
+        output.mkdir(parents=True, exist_ok=False)
+        render_region_overlay(source, masks).save(output / "sam2-regions.png")
+        save_material_plan(output / "plan", source, result.plan)
+        layers = render_material_layers(source, preview_plan(result))
+        layers.flats.save(output / "flats.png")
+        layers.shadows.save(output / "shadows.png")
+        layers.final.save(output / "cel.png")
+        Image.fromarray(layers.shade_index * 85).save(output / "shade-index.png")
+        Image.fromarray(layers.screentone.astype(np.uint8) * 255).save(
+            output / "screentone.png"
+        )
+        report = {
+            "status": "review_required",
+            "publishable": False,
+            "candidate_pixels_used_in_final": False,
+            "sam2_mask_count": len(masks),
+            "proposal_count": len(result.proposals),
+            "unknown_ratio": result.unknown_ratio,
+            "conflict_ratio": result.conflict_ratio,
+            "proposals": [asdict(item) for item in result.proposals],
+        }
+        (output / "proposal.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _print(report)
+        return 0
+
+    if args.command == "cel-candidate":
+        # This produces review evidence only. The candidate supplies albedo;
+        # source geometry, tone, text and ink remain authoritative
+        import hashlib
+
+        import numpy as np
+        from PIL import Image
+
+        from .color import composite_cel_locked_colorization, merge_candidate_albedo
+        from .qa import evaluate
+        from .semantic import ConservativeSemanticMaskEngine
+
+        with Image.open(args.source) as image:
+            source = image.convert("RGB")
+        with Image.open(args.candidate) as image:
+            candidate = image.convert("RGB")
+        refinements = []
+        for value in args.refinement:
+            try:
+                coordinates, image_path = value.split("=", 1)
+                box = tuple(int(item) for item in coordinates.split(","))
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    "refinement must use LEFT,TOP,RIGHT,BOTTOM=IMAGE"
+                ) from exc
+            if len(box) != 4:
+                raise ValueError("refinement must contain four coordinates")
+            with Image.open(image_path) as image:
+                refinements.append((box, image.convert("RGB")))
+        if refinements:
+            candidate = merge_candidate_albedo(candidate, refinements)
+        if candidate.size != source.size:
+            raise ValueError("candidate dimensions must match source exactly")
+        semantic = ConservativeSemanticMaskEngine().segment(source)
+        protected = np.logical_or.reduce(
+            [semantic.masks[name] for name in ("text", "bubbles", "borders", "ink")]
+        )
+        final = composite_cel_locked_colorization(
+            source,
+            candidate,
+            protected,
+            chroma_strength=args.chroma_strength,
+        )
+        qa = evaluate(
+            source,
+            final,
+            protected,
+            generated=candidate,
+            luminance_mae_max=255.0,
+            geometry_locked=True,
+            color_retention_min=0.75,
+            chroma_edge_alignment_min=0.995,
+        )
+        output = Path(args.output)
+        output.mkdir(parents=True, exist_ok=False)
+        candidate.save(output / "albedo-proposal.png")
+        final.save(output / "cel-locked.png")
+        final.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+        final.save(output / "display.webp", format="WEBP", quality=88, method=4)
+        report = {
+            "status": "review_required",
+            "publishable": False,
+            "candidate_pixels_used_in_final": False,
+            "source_geometry_owner": True,
+            "refinement_count": len(refinements),
+            "qa_passed": qa.passed,
+            "qa": qa.to_json_dict(),
+            "source_sha256": hashlib.sha256(Path(args.source).read_bytes()).hexdigest(),
+            "candidate_sha256": hashlib.sha256(
+                (output / "albedo-proposal.png").read_bytes()
+            ).hexdigest(),
+            "render_sha256": hashlib.sha256(
+                (output / "cel-locked.png").read_bytes()
+            ).hexdigest(),
+        }
+        (output / "review.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _print(report)
+        return 0
 
     # The web server creates its own application manager.  Do not construct a
     # throw-away manager first: its startup recovery pass could observe a live

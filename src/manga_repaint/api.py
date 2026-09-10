@@ -1986,48 +1986,79 @@ def create_app(
             units_by_page = manifest.page_units_for_job(job_id)
             semantic_by_page = manifest.semantic_masks_for_job(job_id)
             result: list[dict[str, Any]] = []
+            job_dir = manager._job_dir(job_id)
+
+            def candidate_metadata(directory: Path) -> dict[str, tuple[int, int]]:
+                metadata: dict[str, tuple[int, int]] = {}
+                try:
+                    for candidate in directory.glob("page_*.webp"):
+                        stat = candidate.stat()
+                        metadata[candidate.name] = (stat.st_mtime_ns, stat.st_size)
+                except OSError:
+                    return {}
+                return metadata
+
+            quality_candidate_metadata = candidate_metadata(
+                job_dir / "quality-candidates" / "cobra" / "display"
+            )
+            material_candidate_metadata = candidate_metadata(
+                job_dir / "quality-candidates" / "material-cel-v4" / "display"
+            )
 
             for page in pages:
                 units = units_by_page.get(int(page["page_index"]), [])
                 source_path = Path(page["source_path"])
                 thumbnail_path = (
-                    manager._job_dir(job_id)
+                    job_dir
                     / "final"
                     / "thumbnails"
                     / f"page_{page['page_index']:05d}.jpg"
                 )
                 preview_path = (
-                    manager._job_dir(job_id)
+                    job_dir
                     / "preview"
                     / "pages"
                     / f"page_{page['page_index']:05d}.png"
                 )
                 preview_thumbnail_path = (
-                    manager._job_dir(job_id)
+                    job_dir
                     / "preview"
                     / "thumbnails"
                     / f"page_{page['page_index']:05d}.jpg"
                 )
                 source_display_path = (
-                    manager._job_dir(job_id)
+                    job_dir
                     / "display"
                     / "source"
                     / f"page_{page['page_index']:05d}.webp"
                 )
                 final_display_path = (
-                    manager._job_dir(job_id)
+                    job_dir
                     / "display"
                     / "final"
                     / f"page_{page['page_index']:05d}.webp"
                 )
                 quality_candidate_path = (
-                    manager._job_dir(job_id)
+                    job_dir
                     / "quality-candidates"
                     / "cobra"
                     / "display"
                     / f"page_{page['page_index']:05d}.webp"
                 )
+                material_candidate_path = (
+                    job_dir
+                    / "quality-candidates"
+                    / "material-cel-v4"
+                    / "display"
+                    / f"page_{page['page_index']:05d}.webp"
+                )
                 output_path = Path(page["output_path"] or "")
+                quality_candidate_meta = quality_candidate_metadata.get(
+                    quality_candidate_path.name
+                )
+                material_candidate_meta = material_candidate_metadata.get(
+                    material_candidate_path.name
+                )
                 has_final = bool(page["output_path"] and output_path.is_file())
                 revision = page.get("asset_revision")
                 if not revision:
@@ -2114,9 +2145,15 @@ def create_app(
                         "quality_candidate_url": (
                             f"/api/assets/jobs/{job_id}/pages/"
                             f"{page['page_index']}/candidate.webp"
-                            f"?v={quality_candidate_path.stat().st_mtime_ns}-"
-                            f"{quality_candidate_path.stat().st_size}"
-                            if quality_candidate_path.is_file()
+                            f"?v={quality_candidate_meta[0]}-{quality_candidate_meta[1]}"
+                            if quality_candidate_meta
+                            else None
+                        ),
+                        "material_candidate_url": (
+                            f"/api/assets/jobs/{job_id}/pages/"
+                            f"{page['page_index']}/material.webp"
+                            f"?v={material_candidate_meta[0]}-{material_candidate_meta[1]}"
+                            if material_candidate_meta
                             else None
                         ),
                         "preview_url": derived_asset_url(preview_path, preview_base, revision)
@@ -2341,13 +2378,15 @@ def create_app(
     def page_display_image(
         job_id: str,
         page_index: int,
-        variant: Literal["source", "final", "candidate"],
+        variant: Literal["source", "final", "candidate", "material"],
         v: str | None = None,
         size: Literal["detail", "reader", "preview"] = "detail",
     ) -> FileResponse | Response:
         try:
             if variant == "candidate":
                 path = manager.quality_candidate_asset(job_id, page_index)
+            elif variant == "material":
+                path = manager.material_candidate_asset(job_id, page_index)
             else:
                 path = (
                     manager.display_asset(job_id, page_index, variant) if size == "detail"
@@ -2364,7 +2403,7 @@ def create_app(
                 headers={"Cache-Control": cache_control},
             )
         except DisplayAssetPending:
-            if size == "detail" and variant != "candidate":
+            if size == "detail" and variant not in {"candidate", "material"}:
                 manager.schedule_display_asset(job_id, page_index, variant)
             return JSONResponse(
                 {

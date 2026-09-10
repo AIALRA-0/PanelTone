@@ -98,10 +98,26 @@ test('isolated Cobra candidates are reviewable without replacing live results', 
   await input.fill('9')
   await page.getByRole('button', { name: '跳转', exact: true }).click()
   await page.getByRole('button', { name: '通用候选', exact: true }).click()
-  await expect(page.getByText('Cobra 综合色盘候选 · 不覆盖现有成品')).toBeVisible()
+  await expect(page.getByText('Cobra 综合色盘候选 · 需审核，不覆盖现有成品')).toBeVisible()
   const candidate = page.getByAltText('第 9 页通用上色候选')
   await expect(candidate).toBeVisible()
   await expect.poll(() => candidate.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true)
+})
+
+test('cel-locked golden candidates remain isolated and directly reviewable', async ({ page }) => {
+  await openWorkspace(page, 1440, 900)
+  await page.getByRole('button', { name: /203\/203/ }).click()
+  const input = page.getByRole('spinbutton', { name: '跳转页码' })
+  await input.fill('111')
+  await page.getByRole('button', { name: '跳转', exact: true }).click()
+  await page.getByRole('button', { name: '专业平涂', exact: true }).click()
+  await expect(page.getByText(/Cobra 色彩提议 \+ 原图几何锁定赛璐璐渲染/)).toBeVisible()
+  await expect(page.getByText(/需审核，不覆盖现有成品/)).toBeVisible()
+  const candidate = page.getByAltText('第 111 页专业平涂候选')
+  await expect(candidate).toBeVisible()
+  await expect.poll(() => candidate.evaluate(
+    (image: HTMLImageElement) => image.complete && image.naturalWidth > 0,
+  )).toBe(true)
 })
 
 test('width sweep does not create horizontal overflow or hide mobile library actions', async ({ page }) => {

@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
+import cv2
 import numpy as np
 import pytest
 from PIL import Image
@@ -221,7 +222,7 @@ def test_new_model_candidate_rejects_material_aspect_warp(tmp_path: Path) -> Non
     assert repaired.size == source.size
 
 
-def test_cobra_colourize_keeps_model_material_render_but_restores_source_ink(
+def test_cobra_colourize_uses_candidate_albedo_but_source_owned_tone_and_ink(
     tmp_path: Path,
 ) -> None:
     settings = Settings(data_root=tmp_path / "jobs")
@@ -230,7 +231,7 @@ def test_cobra_colourize_keeps_model_material_render_but_restores_source_ink(
     source_array[10:86, 20:23] = 0
     source = Image.fromarray(source_array)
     generated_array = np.full((96, 96, 3), (235, 170, 145), dtype=np.uint8)
-    generated_array[50:, :] = (135, 70, 85)  # authored model shadow layer
+    generated_array[50:, :] = (135, 98, 83)  # same albedo, candidate-only value shadow
     generated = Image.fromarray(generated_array)
     spec = JobSpec(
         source=tmp_path / "source.png",
@@ -245,11 +246,11 @@ def test_cobra_colourize_keeps_model_material_render_but_restores_source_ink(
         spec,
     )
     result = np.asarray(final)
-    expected = np.asarray(manager._render_color_candidate(source, generated, spec))
-
     assert np.array_equal(result[40, 21], source_array[40, 21])
-    assert np.array_equal(result[20, 70], expected[20, 70])
-    assert np.array_equal(result[70, 70], expected[70, 70])
+    result_hsv = cv2.cvtColor(result, cv2.COLOR_RGB2HSV)
+    assert abs(int(result_hsv[20, 70, 0]) - int(result_hsv[70, 70, 0])) <= 1
+    assert abs(int(result_hsv[20, 70, 1]) - int(result_hsv[70, 70, 1])) <= 2
+    assert int(result[20, 70].max()) - int(result[20, 70].min()) > 20
     assert not np.array_equal(
         np.max(result, axis=2),
         np.max(source_array, axis=2),

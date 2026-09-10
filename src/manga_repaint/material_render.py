@@ -21,7 +21,7 @@ from PIL import Image
 from .color import image_sha256
 
 VERSION = "material-plan-v1"
-RENDERER_VERSION = "material-cel-v3"
+RENDERER_VERSION = "material-cel-v4"
 MATERIALS = {
     "skin",
     "hair",
@@ -138,7 +138,47 @@ class MaterialPlan:
                 raise ValueError("accepted material region requires mask review evidence")
 
 
-def _structural_ink_mask(source: Image.Image) -> np.ndarray:
+@dataclass(frozen=True)
+class SceneLight:
+    """A restrained page-wide light transform, separate from object albedo."""
+
+    direction: str = "upper-left"
+    ambient_strength: float = 0.0
+    temperature: float = 0.0
+
+    def validate(self) -> None:
+        if self.direction not in {"upper-left", "upper-right", "top", "flat"}:
+            raise ValueError("unsupported scene light direction")
+        if not 0.0 <= self.ambient_strength <= 0.2:
+            raise ValueError("scene ambient strength must be between 0 and 0.2")
+        if not -0.12 <= self.temperature <= 0.12:
+            raise ValueError("scene light temperature must be between -0.12 and 0.12")
+
+
+@dataclass(frozen=True)
+class SourceDecomposition:
+    """Source-owned layers used by the deterministic colour renderer."""
+
+    gray: np.ndarray
+    broad_tone: np.ndarray
+    structural_ink: np.ndarray
+    screentone: np.ndarray
+    protected: np.ndarray
+
+
+@dataclass(frozen=True)
+class MaterialRenderLayers:
+    """Inspectable stages of one deterministic material render."""
+
+    flats: Image.Image
+    shadows: Image.Image
+    final: Image.Image
+    shade_index: np.ndarray
+    screentone: np.ndarray
+    unknown: np.ndarray
+
+
+def structural_ink_mask(source: Image.Image) -> np.ndarray:
     """Keep drawn contours while rejecting isolated halftone dots.
 
     A raw darkness threshold cannot distinguish a black contour from a black
@@ -163,12 +203,45 @@ def _structural_ink_mask(source: Image.Image) -> np.ndarray:
     return core | (fringe & (gray <= 192))
 
 
+# Compatibility for callers and old evidence that used the private name
+_structural_ink_mask = structural_ink_mask
+
+
 def protection_mask(source: Image.Image, supplied: np.ndarray) -> np.ndarray:
     """Preserve reviewed text/panel masks plus structural source ink."""
     rgb = _source_rgb(source)
     if supplied.shape != rgb.shape[:2]:
         raise ValueError("protection dimensions do not match source")
-    return supplied.astype(bool) | _structural_ink_mask(source)
+    return supplied.astype(bool) | structural_ink_mask(source)
+
+
+def decompose_source(source: Image.Image, supplied: np.ndarray) -> SourceDecomposition:
+    """Separate ink, broad tone and print texture before colour is applied.
+
+    The broad tone controls cel-shade levels. High-frequency residuals are
+    retained only as an achromatic diagnostic layer, so screentone dots cannot
+    become local hue changes or coloured water stains.
+    """
+    rgb = _source_rgb(source)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    protected = protection_mask(source, supplied)
+    structural = structural_ink_mask(source)
+    median = cv2.medianBlur(gray, 7)
+    broad = cv2.GaussianBlur(median, (0, 0), 2.2)
+    residual = cv2.absdiff(gray, broad)
+    local_variance = cv2.GaussianBlur(
+        (gray.astype(np.float32) - broad.astype(np.float32)) ** 2,
+        (0, 0),
+        1.2,
+    )
+    screentone = (residual >= 16) & (local_variance >= 40.0) & ~structural
+    return SourceDecomposition(
+        gray=gray,
+        broad_tone=broad,
+        structural_ink=structural,
+        screentone=screentone,
+        protected=protected,
+    )
 
 
 def _accepted_masks(plan: MaterialPlan, protected: np.ndarray):
@@ -306,38 +379,104 @@ def _region_tone_layers(
     return (slice(y0, y1), slice(x0, x1)), shade, highlight, residual
 
 
-def render_material_flats(source: Image.Image, plan: MaterialPlan) -> Image.Image:
-    """Render an inspectable colour-guidance preview.
+def _scene_light_field(shape: tuple[int, int], light: SceneLight) -> np.ndarray:
+    light.validate()
+    height, width = shape
+    if light.direction == "flat" or light.ambient_strength == 0.0:
+        return np.zeros(shape, dtype=np.float32)
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    x = xx / max(width - 1, 1)
+    y = yy / max(height - 1, 1)
+    if light.direction == "upper-left":
+        field = 1.0 - (x + y) * 0.5
+    elif light.direction == "upper-right":
+        field = 1.0 - ((1.0 - x) + y) * 0.5
+    else:
+        field = 1.0 - y
+    return (field - 0.5) * (2.0 * light.ambient_strength)
 
-    This output proves that accepted regions and palette slots are coherent,
-    but it is not the final illustrated page. The production colourizer must
-    consume sparse hints derived from this plan and create the actual material,
-    shadow and highlight rendering. Unknown or proposed pixels remain source
-    gray and make publishable QA fail.
+
+def render_material_layers(
+    source: Image.Image,
+    plan: MaterialPlan,
+    *,
+    scene_light: SceneLight | None = None,
+) -> MaterialRenderLayers:
+    """Render flats and cel shading without accepting candidate image pixels.
+
+    The palette comes from reviewed slots, geometry and tone come from the
+    source, and lighting is a bounded page-wide transform. Unknown or proposed
+    pixels remain source gray and are reported as unpublishable.
     """
     plan.validate(source)
     rgb = _source_rgb(source)
-    protected = protection_mask(source, plan.protected)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    decomposition = decompose_source(source, plan.protected)
+    protected = decomposition.protected
+    gray = decomposition.gray
+    light = scene_light or SceneLight()
+    light_field = _scene_light_field(gray.shape, light)
     result = rgb.copy()
+    flats = rgb.copy()
+    shadow_layer = np.full_like(rgb, 255)
+    shade_index = np.zeros(gray.shape, dtype=np.uint8)
+    covered = protected.copy()
     for _, slot, mask in _accepted_masks(plan, protected):
         if not mask.any():
             continue
+        covered |= mask
         base, shadow, highlight_colour = _derived_layers(slot)
         bounds, shade, highlight, detail = _region_tone_layers(
             gray,
             mask,
             preserve_pattern=slot.material == "patterned",
         )
+        local_light = light_field[bounds]
+        shade = np.clip(shade - local_light, 0.0, 1.0)
+        # Scene temperature is deliberately small and applied to illumination,
+        # never written back to the stored base colour
+        temperature = np.asarray(
+            [light.temperature, 0.0, -light.temperature], dtype=np.float32
+        )
+        lit_base = np.clip(base + temperature * np.maximum(local_light[..., None], 0), 0, 1)
         painted = base[None, None, :] * (1.0 - shade[..., None])
         painted += shadow[None, None, :] * shade[..., None]
+        if light.temperature:
+            painted = np.clip(
+                painted + temperature[None, None, :] * np.maximum(local_light[..., None], 0),
+                0,
+                1,
+            )
         painted = painted * (1.0 - highlight[..., None])
         painted += highlight_colour[None, None, :] * highlight[..., None]
         painted *= detail[..., None]
         local_mask = mask[bounds]
+        flat_local = np.broadcast_to(lit_base, painted.shape)
+        flats[bounds][local_mask] = _encode(flat_local[local_mask])
         result[bounds][local_mask] = _encode(painted[local_mask])
+        shadow_visual = np.broadcast_to(shadow, painted.shape)
+        shadow_layer[bounds][local_mask] = _encode(shadow_visual[local_mask])
+        local_steps = np.select(
+            (shade < 0.19, shade < 0.55, shade < 0.86),
+            (0, 1, 2),
+            default=3,
+        ).astype(np.uint8)
+        shade_index[bounds][local_mask] = local_steps[local_mask]
     result[protected] = rgb[protected]
-    return Image.fromarray(result)
+    flats[protected] = rgb[protected]
+    shadow_layer[protected] = rgb[protected]
+    return MaterialRenderLayers(
+        flats=Image.fromarray(flats),
+        shadows=Image.fromarray(shadow_layer),
+        final=Image.fromarray(result),
+        shade_index=shade_index,
+        screentone=decomposition.screentone,
+        unknown=~covered,
+    )
+
+
+def render_material_flats(source: Image.Image, plan: MaterialPlan) -> Image.Image:
+    """Compatibility entry point returning the deterministic final layer."""
+    return render_material_layers(source, plan).final
 
 
 def build_sparse_color_hint(

@@ -19,6 +19,7 @@ from PIL import Image
 from .color import (
     apply_render_profile,
     classify_source_page,
+    composite_cel_locked_colorization,
     composite_geometry_locked_colorization,
     composite_protected,
     composite_reference_locked_colorization,
@@ -1187,14 +1188,12 @@ class ProjectManager:
                 # scene when the generation service invents structure.
                 final = source_rgb
             else:
-                # Cobra is a reference-guided line-art colourizer: its material,
-                # shadow and highlight rendering is the actual product, not a
-                # palette mask. Restore reviewed source ink over that render and
-                # let geometry QA reject shifted or invented structure. Generic
-                # generators remain colour-hint providers because their spatial
-                # output is not reliably aligned to manga line art.
+                # Cobra is a reference-guided line-art colourizer, but its RGB,
+                # redraws and local texture remain proposals. The cel-locked
+                # compositor extracts only cleaned low-frequency albedo and
+                # rebuilds geometry, tone, ink and protection from the source.
                 if spec.engine == "cobra-candidate":
-                    compositor = composite_strict_colorization
+                    compositor = composite_cel_locked_colorization
                 elif spec.mode == JobMode.COLORIZE and spec.engine != "palette":
                     compositor = composite_reference_locked_colorization
                 else:
@@ -1209,7 +1208,11 @@ class ProjectManager:
                     ink_core_threshold=64,
                     **(
                         {"ink_edge_threshold": 128}
-                        if compositor is composite_strict_colorization
+                        if compositor
+                        in {
+                            composite_strict_colorization,
+                            composite_cel_locked_colorization,
+                        }
                         else {}
                     ),
                     **(
@@ -1240,6 +1243,7 @@ class ProjectManager:
             if compositor in {
                 composite_reference_locked_colorization,
                 composite_strict_colorization,
+                composite_cel_locked_colorization,
             }:
                 # The reference compositor intentionally keeps the barrier as
                 # a diagnostic boundary, not a broad source-pixel restore. A
@@ -2138,6 +2142,20 @@ class ProjectManager:
             self._job_dir(job_id)
             / "quality-candidates"
             / "cobra"
+            / "display"
+            / f"page_{page_index:05d}.webp"
+        )
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+
+    def material_candidate_asset(self, job_id: str, page_index: int) -> Path:
+        """Return the deterministic material-cel review image, never live output."""
+        self._manifest(job_id).page_by_index(job_id, page_index)
+        path = (
+            self._job_dir(job_id)
+            / "quality-candidates"
+            / "material-cel-v4"
             / "display"
             / f"page_{page_index:05d}.webp"
         )

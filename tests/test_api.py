@@ -114,6 +114,26 @@ def test_api_create_run_and_download(tmp_path: Path, manga_pages: Path) -> None:
         assert client.get(
             f"/api/assets/jobs/{job_id}/pages/1/candidate.webp?v=missing"
         ).status_code == 404
+        material_dir = (
+            app.state.manager._job_dir(job_id)
+            / "quality-candidates"
+            / "material-cel-v4"
+            / "display"
+        )
+        material_dir.mkdir(parents=True, exist_ok=True)
+        material_path = material_dir / "page_00000.webp"
+        Image.new("RGB", (48, 64), "peachpuff").save(material_path, "WEBP")
+        pages_with_material = client.get(f"/api/jobs/{job_id}/pages").json()
+        material_url = pages_with_material[0]["material_candidate_url"]
+        assert material_url.startswith(
+            f"/api/assets/jobs/{job_id}/pages/0/material.webp?v="
+        )
+        material = client.get(material_url)
+        assert material.status_code == 200
+        assert material.headers["content-type"] == "image/webp"
+        assert material.headers["cache-control"] == (
+            "private, max-age=31536000, immutable"
+        )
         response = client.get(f"/api/jobs/{job_id}/download")
         assert response.status_code == 200
         assert response.headers["content-type"] in {

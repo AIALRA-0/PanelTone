@@ -340,6 +340,159 @@ def composite_strict_colorization(
     return Image.fromarray(result, mode="RGB")
 
 
+def composite_cel_locked_colorization(
+    source: Image.Image,
+    generated: Image.Image,
+    protected_mask: np.ndarray,
+    chroma_strength: float = 1.0,
+    ink_core_threshold: int = 64,
+    ink_edge_threshold: int = 128,
+) -> Image.Image:
+    """Render clean cel colour while keeping the source as geometry owner.
+
+    The candidate contributes a low-frequency albedo proposal: hue,
+    saturation, and smoothly varying material brightness. Its edges, texture,
+    local highlights, shadows, and RGB pixels never enter the output directly.
+    Broad source tone selects cel-shadow levels, then source ink and reviewed
+    protection are restored exactly.
+    """
+    if source.size != generated.size:
+        raise ValueError("source and generated dimensions must match exactly")
+    if not 0.0 <= chroma_strength <= 2.5:
+        raise ValueError("Chroma strength must be between 0.0 and 2.5")
+    if not 0 <= ink_core_threshold <= ink_edge_threshold <= 255:
+        raise ValueError("Ink thresholds must be between 0 and 255")
+
+    source_rgb = _composited_rgb(source)
+    candidate_rgb = _composited_rgb(generated)
+    height, width = source_rgb.shape[:2]
+    if protected_mask.shape != (height, width):
+        raise ValueError("protection mask shape does not match source image")
+
+    source_gray = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2GRAY)
+    descreened = cv2.medianBlur(source_gray, 7)
+    broad_tone = cv2.GaussianBlur(descreened, (0, 0), 2.2)
+    guide = broad_tone.astype(np.float32) / 255.0
+
+    candidate_hsv = cv2.cvtColor(candidate_rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hue_angle = candidate_hsv[..., 0] * (np.pi / 90.0)
+    candidate_sat = candidate_hsv[..., 1]
+    candidate_value = candidate_hsv[..., 2]
+    usable = candidate_value >= 48.0
+    chromatic = usable & (candidate_sat >= 12.0)
+    colour_weight = chromatic.astype(np.float32)
+    sigma = max(2.4, min(height, width) / 220.0)
+
+    def normalized_blur(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        numerator = cv2.GaussianBlur(values * weights, (0, 0), sigma)
+        denominator = cv2.GaussianBlur(weights, (0, 0), sigma)
+        return numerator / np.maximum(denominator, 1e-4)
+
+    filtered_cos = normalized_blur(np.cos(hue_angle), colour_weight)
+    filtered_sin = normalized_blur(np.sin(hue_angle), colour_weight)
+    filtered_sat = normalized_blur(candidate_sat, colour_weight)
+
+    if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
+        radius = max(6, round(min(height, width) / 120))
+        filtered_cos = cv2.ximgproc.guidedFilter(
+            guide, filtered_cos.astype(np.float32), radius, 0.01
+        )
+        filtered_sin = cv2.ximgproc.guidedFilter(
+            guide, filtered_sin.astype(np.float32), radius, 0.01
+        )
+        filtered_sat = cv2.ximgproc.guidedFilter(
+            guide, filtered_sat.astype(np.float32), radius, 0.01
+        )
+
+    filtered_hue = (np.arctan2(filtered_sin, filtered_cos) * 90.0 / np.pi) % 180.0
+
+    neutral = usable & (candidate_sat < 12.0)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        neutral.astype(np.uint8), 8
+    )
+    preserve_neutral = np.zeros_like(neutral)
+    large_neutral = max(96, int(height * width * 0.0015))
+    for component in range(1, count):
+        if int(stats[component, cv2.CC_STAT_AREA]) >= large_neutral:
+            preserve_neutral |= labels == component
+    colour_support = cv2.GaussianBlur(colour_weight, (0, 0), sigma)
+    output_sat = np.where(
+        preserve_neutral | (colour_support < 0.08),
+        0.0,
+        filtered_sat * chroma_strength,
+    )
+
+    tone = broad_tone.astype(np.float32) / 255.0
+    output_value = np.select(
+        (tone >= 0.90, tone >= 0.76, tone >= 0.52),
+        (244.0, 216.0, 172.0),
+        default=108.0,
+    ).astype(np.float32)
+
+    composed_hsv = np.empty((height, width, 3), dtype=np.uint8)
+    composed_hsv[..., 0] = np.clip(np.rint(filtered_hue), 0, 179).astype(np.uint8)
+    composed_hsv[..., 1] = np.clip(np.rint(output_sat), 0, 255).astype(np.uint8)
+    composed_hsv[..., 2] = np.clip(np.rint(output_value), 0, 255).astype(np.uint8)
+    result = cv2.cvtColor(composed_hsv, cv2.COLOR_HSV2RGB)
+
+    exact = protected_mask | ink_edge_mask(
+        Image.fromarray(source_rgb, mode="RGB"),
+        core_threshold=ink_core_threshold,
+        edge_threshold=ink_edge_threshold,
+    )
+    result[exact] = source_rgb[exact]
+    return Image.fromarray(result, mode="RGB")
+
+
+def merge_candidate_albedo(
+    page_candidate: Image.Image,
+    refinements: list[tuple[tuple[int, int, int, int], Image.Image]],
+    *,
+    feather: int = 12,
+) -> Image.Image:
+    """Blend high-resolution panel colour proposals into a page proposal."""
+    if feather < 0:
+        raise ValueError("feather must be non-negative")
+    page = np.asarray(page_candidate.convert("RGB"))
+    page_hsv = cv2.cvtColor(page, cv2.COLOR_RGB2HSV).astype(np.float32)
+    width, height = page_candidate.size
+    for (left, top, right, bottom), refinement in refinements:
+        if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+            raise ValueError("refinement box falls outside page candidate")
+        target_size = (right - left, bottom - top)
+        refined = np.asarray(
+            refinement.convert("RGB").resize(target_size, Image.Resampling.LANCZOS)
+        )
+        refined_hsv = cv2.cvtColor(refined, cv2.COLOR_RGB2HSV).astype(np.float32)
+        local = page_hsv[top:bottom, left:right]
+        local_height, local_width = local.shape[:2]
+        if feather == 0:
+            alpha = np.ones((local_height, local_width), dtype=np.float32)
+        else:
+            yy, xx = np.mgrid[0:local_height, 0:local_width]
+            distance = np.minimum.reduce(
+                (xx + 1, local_width - xx, yy + 1, local_height - yy)
+            ).astype(np.float32)
+            alpha = np.clip(distance / max(feather, 1), 0.0, 1.0)
+        support = np.clip((refined_hsv[..., 1] - 8.0) / 28.0, 0.0, 1.0)
+        alpha *= support
+        local_angle = local[..., 0] * np.pi / 90.0
+        refined_angle = refined_hsv[..., 0] * np.pi / 90.0
+        mixed_sin = (1.0 - alpha) * np.sin(local_angle) + alpha * np.sin(refined_angle)
+        mixed_cos = (1.0 - alpha) * np.cos(local_angle) + alpha * np.cos(refined_angle)
+        local[..., 0] = (
+            np.arctan2(mixed_sin, mixed_cos) * 90.0 / np.pi
+        ) % 180.0
+        local[..., 1] = (
+            (1.0 - alpha) * local[..., 1] + alpha * refined_hsv[..., 1]
+        )
+        local[..., 2] = (
+            (1.0 - alpha) * local[..., 2] + alpha * refined_hsv[..., 2]
+        )
+    encoded = np.clip(np.rint(page_hsv), 0, 255).astype(np.uint8)
+    return Image.fromarray(cv2.cvtColor(encoded, cv2.COLOR_HSV2RGB), mode="RGB")
+
+
 def composite_geometry_locked_colorization(
     source: Image.Image,
     generated: Image.Image,

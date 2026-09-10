@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 
 from manga_repaint.color import (
     classify_source_page,
+    composite_cel_locked_colorization,
     composite_geometry_locked_colorization,
     composite_protected,
     composite_reference_locked_colorization,
@@ -14,6 +15,7 @@ from manga_repaint.color import (
     geometry_barrier_mask,
     is_already_colorized,
     lab_l,
+    merge_candidate_albedo,
     preserve_ink_overlay,
     preserve_luminance_lab,
     replace_masked,
@@ -281,6 +283,69 @@ def test_geometry_locked_colorization_rejects_dimension_mismatch() -> None:
     generated = Image.new("RGB", (31, 32), "red")
     with pytest.raises(ValueError, match="dimensions"):
         composite_geometry_locked_colorization(source, generated, np.zeros((32, 32), dtype=bool))
+
+
+def test_cel_locked_colorization_rejects_candidate_edges_and_reduces_hue_noise() -> None:
+    source_pixels = np.full((128, 128, 3), 230, dtype=np.uint8)
+    source_pixels[:, 62:66] = 0
+    source = Image.fromarray(source_pixels, mode="RGB")
+    candidate_pixels = np.full((128, 128, 3), (220, 110, 75), dtype=np.uint8)
+    rng = np.random.default_rng(9)
+    candidate_pixels[:, :60, 1] = np.clip(
+        candidate_pixels[:, :60, 1].astype(np.int16)
+        + rng.integers(-24, 25, (128, 60)),
+        0,
+        255,
+    )
+    candidate_pixels[12:116, 92:98] = (30, 80, 230)
+    generated = Image.fromarray(candidate_pixels, mode="RGB")
+    protected = np.zeros((128, 128), dtype=bool)
+    protected[:, 62:66] = True
+
+    result = np.asarray(
+        composite_cel_locked_colorization(source, generated, protected)
+    )
+    result_hsv = cv2.cvtColor(result, cv2.COLOR_RGB2HSV)
+
+    assert np.array_equal(result[protected], source_pixels[protected])
+    assert float(result_hsv[:, :56, 0].std()) < 2.0
+    assert not np.array_equal(result[32, 94], candidate_pixels[32, 94])
+
+
+def test_cel_locked_colorization_preserves_large_neutral_material() -> None:
+    source = Image.new("RGB", (80, 80), (230, 230, 230))
+    candidate_pixels = np.full((80, 80, 3), (225, 120, 75), dtype=np.uint8)
+    candidate_pixels[:, 42:] = (245, 245, 245)
+    candidate = Image.fromarray(candidate_pixels, mode="RGB")
+
+    result = np.asarray(
+        composite_cel_locked_colorization(
+            source, candidate, np.zeros((80, 80), dtype=bool)
+        )
+    )
+    result_hsv = cv2.cvtColor(result, cv2.COLOR_RGB2HSV)
+
+    assert float(np.median(result_hsv[:, 56:, 1])) < 5
+    assert float(np.median(result_hsv[:, :30, 1])) > 30
+
+
+def test_candidate_albedo_merge_is_feathered_and_neutral_crop_does_not_erase_colour(
+) -> None:
+    page = Image.new("RGB", (80, 80), (220, 80, 40))
+    refinement = Image.new("RGB", (40, 40), (40, 90, 220))
+    neutral = Image.new("RGB", (20, 20), (245, 245, 245))
+    merged = np.asarray(
+        merge_candidate_albedo(
+            page,
+            [((20, 20, 60, 60), refinement), ((30, 30, 50, 50), neutral)],
+            feather=8,
+        )
+    )
+    hsv = cv2.cvtColor(merged, cv2.COLOR_RGB2HSV)
+    centre_hue = int(hsv[40, 40, 0])
+    assert 95 <= centre_hue <= 125
+    assert int(hsv[20, 20, 0]) < centre_hue
+    assert int(hsv[40, 40, 1]) > 80
 
 
 def test_clean_flats_reduce_stains_without_crossing_ink_or_changing_shading() -> None:
