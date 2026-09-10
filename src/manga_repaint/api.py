@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -1988,22 +1989,43 @@ def create_app(
             result: list[dict[str, Any]] = []
             job_dir = manager._job_dir(job_id)
 
-            def candidate_metadata(directory: Path) -> dict[str, tuple[int, int]]:
+            def directory_metadata(directory: Path) -> dict[str, tuple[int, int]]:
                 metadata: dict[str, tuple[int, int]] = {}
                 try:
-                    for candidate in directory.glob("page_*.webp"):
-                        stat = candidate.stat()
-                        metadata[candidate.name] = (stat.st_mtime_ns, stat.st_size)
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            try:
+                                if not entry.is_file():
+                                    continue
+                                stat = entry.stat()
+                                metadata[entry.name] = (stat.st_mtime_ns, stat.st_size)
+                            except OSError:
+                                continue
                 except OSError:
                     return {}
                 return metadata
 
-            quality_candidate_metadata = candidate_metadata(
-                job_dir / "quality-candidates" / "cobra" / "display"
-            )
-            material_candidate_metadata = candidate_metadata(
-                job_dir / "quality-candidates" / "material-cel-v4" / "display"
-            )
+            asset_directories = {
+                job_dir / "source",
+                job_dir / "final" / "pages",
+                job_dir / "final" / "thumbnails",
+                job_dir / "preview" / "pages",
+                job_dir / "preview" / "thumbnails",
+                job_dir / "display" / "source",
+                job_dir / "display" / "final",
+                job_dir / "quality-candidates" / "cobra" / "display",
+                job_dir / "quality-candidates" / "material-cel-v4" / "display",
+            }
+            for page in pages:
+                asset_directories.add(Path(page["source_path"]).parent)
+                if page["output_path"]:
+                    asset_directories.add(Path(page["output_path"]).parent)
+            metadata_by_directory = {
+                directory: directory_metadata(directory) for directory in asset_directories
+            }
+
+            def asset_metadata(path: Path) -> tuple[int, int] | None:
+                return metadata_by_directory.get(path.parent, {}).get(path.name)
 
             for page in pages:
                 units = units_by_page.get(int(page["page_index"]), [])
@@ -2053,28 +2075,31 @@ def create_app(
                     / f"page_{page['page_index']:05d}.webp"
                 )
                 output_path = Path(page["output_path"] or "")
-                quality_candidate_meta = quality_candidate_metadata.get(
-                    quality_candidate_path.name
-                )
-                material_candidate_meta = material_candidate_metadata.get(
-                    material_candidate_path.name
-                )
-                has_final = bool(page["output_path"] and output_path.is_file())
+                source_meta = asset_metadata(source_path)
+                output_meta = asset_metadata(output_path)
+                thumbnail_meta = asset_metadata(thumbnail_path)
+                preview_meta = asset_metadata(preview_path)
+                preview_thumbnail_meta = asset_metadata(preview_thumbnail_path)
+                source_display_meta = asset_metadata(source_display_path)
+                final_display_meta = asset_metadata(final_display_path)
+                quality_candidate_meta = asset_metadata(quality_candidate_path)
+                material_candidate_meta = asset_metadata(material_candidate_path)
+                has_final = bool(page["output_path"] and output_meta)
                 revision = page.get("asset_revision")
                 if not revision:
                     candidates = [
-                        candidate
-                        for candidate in (
-                            source_path,
-                            output_path,
-                            preview_path,
-                            thumbnail_path,
-                            preview_thumbnail_path,
+                        metadata
+                        for metadata in (
+                            source_meta,
+                            output_meta,
+                            preview_meta,
+                            thumbnail_meta,
+                            preview_thumbnail_meta,
                         )
-                        if candidate.is_file()
+                        if metadata
                     ]
                     revision = (
-                        str(max(candidate.stat().st_mtime_ns for candidate in candidates))
+                        str(max(metadata[0] for metadata in candidates))
                         if candidates
                         else None
                     )
@@ -2122,15 +2147,15 @@ def create_app(
                             f"/api/assets/jobs/{job_id}/pages/"
                             f"{page['page_index']}/source.webp?v={revision or 0}"
                         )
-                        if source_display_path.is_file()
+                        if source_display_meta
                         else None,
                         "thumbnail_url": (
                             derived_asset_url(thumbnail_path, thumbnail_base, revision)
-                            if has_final and thumbnail_path.is_file()
+                            if has_final and thumbnail_meta
                             else derived_asset_url(
                                 preview_thumbnail_path, preview_thumbnail_base, revision
                             )
-                            if preview_thumbnail_path.is_file()
+                            if preview_thumbnail_meta
                             else None
                         ),
                         "final_url": derived_asset_url(output_path, final_base, revision)
@@ -2139,7 +2164,7 @@ def create_app(
                         "final_display_url": (
                             f"/api/assets/jobs/{job_id}/pages/"
                             f"{page['page_index']}/final.webp?v={revision or 0}"
-                            if has_final and final_display_path.is_file()
+                            if has_final and final_display_meta
                             else None
                         ),
                         "quality_candidate_url": (
@@ -2157,9 +2182,9 @@ def create_app(
                             else None
                         ),
                         "preview_url": derived_asset_url(preview_path, preview_base, revision)
-                        if preview_path.is_file()
+                        if preview_meta
                         else None,
-                        "preview_only": bool(not has_final and preview_path.is_file()),
+                        "preview_only": bool(not has_final and preview_meta),
                         "mask_status": (
                             str(semantic_descriptor_payload.get("status") or "cached")
                             if semantic_descriptor_payload
